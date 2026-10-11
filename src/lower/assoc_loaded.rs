@@ -308,6 +308,17 @@ pub(crate) fn rewrite_node(
     *expr = rewritten;
 }
 
+/// True when at least one model synthesizes `<name>_loaded?`.
+fn any_model_declares(
+    by_model: &HashMap<ClassId, HashSet<Symbol>>,
+    name: &Symbol,
+) -> Option<ClassId> {
+    by_model
+        .iter()
+        .find(|(_, names)| names.contains(name))
+        .map(|(id, _)| id.clone())
+}
+
 /// `association(:creator).loaded?` → `creator_loaded?` (or
 /// `self.creator_loaded?` when implicit-self), for every association
 /// with a synthesized flat predicate on the receiver's model.
@@ -333,10 +344,29 @@ fn rewrite_association_loaded(
     let Some(name) = sym_lit(&assoc_args[0]) else {
         return false;
     };
-    let Some(owner_model) =
-        resolve_owner_model(owner.as_ref(), enclosing, sole_includer, flat_loaded, &name)
-    else {
-        return false;
+    // Unique-name is overly strict for this flatten: Message and
+    // Membership both `belongs_to :room` and both expose `room_loaded?`,
+    // so campfire's mentionee test (`message.association(:room).loaded?`
+    // with an untyped local) must still rewrite. Model methods keep the
+    // stricter resolve (untyped explicit receivers stay unre-written).
+    let owner_model = match resolve_owner_model(
+        owner.as_ref(),
+        enclosing,
+        sole_includer,
+        flat_loaded,
+        &name,
+    ) {
+        Some(id) => id,
+        None => {
+            let in_model = enclosing.is_some_and(|id| flat_loaded.contains_key(id));
+            if in_model || owner.is_none() {
+                return false;
+            }
+            match any_model_declares(flat_loaded, &name) {
+                Some(id) => id,
+                None => return false,
+            }
+        }
     };
     if !flat_loaded.get(&owner_model).is_some_and(|names| names.contains(&name)) {
         return false;
