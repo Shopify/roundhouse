@@ -10267,6 +10267,37 @@ raise "vf vs vframes" unless ActiveStorage.video_preview_vf_filter == "scale=320
         .assert_passes();
 }
 
+/// Conditional GET: `fresh_when etag:` sets ETag and answers 304 when
+/// `If-None-Match` matches (campfire CachedResponses native validators).
+#[test]
+fn fresh_when_etag_answers_not_modified() {
+    emit_and_run::real_blog()
+        .run_ruby(
+            r##"
+c = ActionController::Base.new
+c.request = ActionDispatch::Request.new({ "HTTP_IF_NONE_MATCH" => "W/\"abc123\"" })
+c.fresh_when(etag: "abc123", template: false)
+raise "status #{c.status}" unless c.status == 304
+raise "performed" unless c.performed?
+raise "etag #{c.headers["ETag"].inspect}" unless c.headers["ETag"] == "W/\"abc123\""
+
+fresh = ActionController::Base.new
+fresh.request = ActionDispatch::Request.new({ "REQUEST_METHOD" => "GET" })
+fresh.fresh_when(etag: "abc123", template: false)
+raise "fresh status #{fresh.status}" unless fresh.status == 200
+raise "fresh performed" if fresh.performed?
+raise "fresh etag" unless fresh.headers["ETag"] == "W/\"abc123\""
+
+other = ActionController::Base.new
+other.request = ActionDispatch::Request.new({ "HTTP_IF_NONE_MATCH" => "W/\"old\"" })
+other.fresh_when({ etag: "new" })
+raise "mismatch status" unless other.status == 200
+raise "mismatch etag" unless other.headers["ETag"] == "W/\"new\""
+"##
+        )
+        .assert_passes();
+}
+
 /// `Model.none` and `where(id: [])` are Rails NullRelations: empty
 /// terminals with zero adapter selects. Negation / `or` must not stick
 /// or invert nullness (thermos H1).

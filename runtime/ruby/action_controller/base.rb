@@ -949,44 +949,86 @@ module ActionController
       @body
     end
 
-    # ---- conditional GET: ALWAYS FRESH -----------------------------
+    # ---- conditional GET -------------------------------------------
     #
     # Rails' `fresh_when` / `stale?` compare the client's
-    # `If-None-Match` / `If-Modified-Since` against an ETag or
-    # timestamp and answer 304 on a match. Neither half of that
-    # comparison exists here: this controller has no request object
-    # (only `@request_format`), so there is nothing to read the
-    # conditional headers FROM. Although the extra-header store is sent
-    # with the response, `fresh_when` does not populate validators in it.
+    # `If-None-Match` against an ETag and answer 304 on a match.
+    # Campfire's `MessagesController#index` spells
+    # `fresh_when etag: Digest::SHA256.hexdigest(body), template: false`
+    # (Ruby 3 packs those keywords into one Hash argument), and
+    # `CachedResponsesTest` asserts the second GET with that ETag is
+    # `:not_modified`. Record-shaped `stale?(etag: record)` stays
+    # always-stale until a cache_key seam is modeled.
     #
-    # What IS available is the answer Rails gives when a client sends
-    # no conditional header at all: the response is stale, render it.
-    # That is this implementation, and it is a subset rather than a
-    # stub — always-render is semantically CORRECT for every request,
-    # it just never earns the 304. The cost is bandwidth, not
-    # behavior, which is why it can ship ahead of the plumbing.
-    #
-    # Monomorphic on the shapes the corpus writes — `fresh_when
-    # @messages` and `stale?(etag: record)`. Rails accepts several more
-    # (`fresh_when(etag:, last_modified:)`, `stale?(record)`); each
-    # would be its own method here when a call site asks, rather than
-    # one method with a union parameter no target can narrow.
-    # Empty body, not `nil`: the same no-op idiom
-    # `Base.preload_associations` uses. A body that is only a bare `nil`
-    # gives Rust an `Option` with nothing to infer its parameter from
-    # (`E0282: type annotations needed` on a lone `None;`), where an
-    # empty body is a plain `void`.
     # The parameter is NOT named `record`: the Elixir emitter prepends
     # the controller struct as an implicit first argument and calls it
     # `record`, so a same-named parameter of our own emits
-    # `def fresh_when(_record, _record)` — a duplicate match variable,
-    # which that target's `--warnings-as-errors` build rejects. Every
-    # other method here already avoids the name; this one found out why.
+    # `def fresh_when(_record, _record)`.
     def fresh_when(subject)
+      etag_src = fresh_when_etag_source(subject)
+      return if etag_src.nil?
+      tag = weak_etag_for(etag_src)
+      response.headers["ETag"] = tag
+      inm = request_if_none_match
+      return if inm.nil?
+      head(:not_modified) if if_none_match_matches?(inm, tag)
     end
 
     def stale?(etag: nil)
-      true
+      return true if etag.nil?
+      return true unless etag.is_a?(String)
+      tag = weak_etag_for(etag)
+      response.headers["ETag"] = tag
+      inm = request_if_none_match
+      return true if inm.nil?
+      !if_none_match_matches?(inm, tag)
+    end
+
+    def fresh_when_etag_source(subject)
+      return nil if subject.nil?
+      if subject.is_a?(Hash)
+        v = subject[:etag]
+        return v.to_s unless v.nil?
+        v = subject["etag"]
+        return v.to_s unless v.nil?
+        return nil
+      end
+      return subject if subject.is_a?(String)
+      nil
+    end
+
+    def weak_etag_for(src)
+      "W/\"" + src + "\""
+    end
+
+    def request_if_none_match
+      req = request
+      return nil if req.nil?
+      value = req.headers["If-None-Match"]
+      return nil if value.nil?
+      text = value.to_s
+      return nil if text.empty?
+      text
+    end
+
+    def if_none_match_matches?(inm, tag)
+      return true if inm.strip == "*"
+      want = normalize_etag(tag)
+      inm.split(",").each do |part|
+        return true if normalize_etag(part) == want
+      end
+      false
+    end
+
+    def normalize_etag(value)
+      s = value.to_s.strip
+      if s.length >= 2 && (s[0, 2] == "W/" || s[0, 2] == "w/")
+        s = s[2, s.length].to_s
+      end
+      if s.length >= 2 && s[0, 1] == "\"" && s[s.length - 1, 1] == "\""
+        s = s[1, s.length - 2].to_s
+      end
+      s
     end
 
     # `expires_in 1.year, public: true` — Rails' Cache-Control writer,
