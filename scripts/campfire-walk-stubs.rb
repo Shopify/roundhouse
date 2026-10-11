@@ -154,11 +154,11 @@ WALK_LATE_PATCHES << lambda do
   end
 end
 
-# RETIRED: `pluck` on a folded association (`room.memberships.pluck(:user_id)`).
-# `lower::assoc_pluck` expands the site to a row projection in app bodies
-# and (as of the suite-floor reclaim) in test bodies too — campfire's
-# `RoomsControllerTest` destroy assertion. The walk-stub `Array#pluck`
-# reopen is gone; a gap closed in the compiler is an entry deleted here.
+# RETIRED: `pluck` on a folded *association* (`room.memberships.pluck(:user_id)`).
+# That site is a record Array; `lower::assoc_pluck` expands it to a reader
+# projection in app bodies and (suite-floor reclaim) test bodies. Hash /
+# untyped `Array#pluck` is a different slice — upstream #793
+# (`indexed_pluck` + `enumerable_ext`); do not re-add a reopen here for it.
 
 # RETIRED, all six on 2026-08-23, and the diff of this file over that
 # session IS the progress report the header promises. Each was a
