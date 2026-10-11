@@ -1250,6 +1250,39 @@ pub(in crate::lower::model_to_library) fn loaded_ivar(name: &Symbol) -> Symbol {
     Symbol::from(format!("{}_loaded", name.as_str()))
 }
 
+/// `@<assoc>_loaded = false` assigns for every association that owns a
+/// load-once flag — same kinds as [`assoc_cache_ivar_bindings`]' loaded
+/// half. Adapter reload prefixes its body with these so Rails'
+/// association cache clears on `reload` (campfire mentionee /
+/// `association(:room).loaded?` after `create!.reload`).
+pub(in crate::lower::model_to_library) fn clear_loaded_flag_assigns(
+    model: &Model,
+) -> Vec<Expr> {
+    let mut out = Vec::new();
+    for assoc in model.associations() {
+        let name = match assoc {
+            Association::HasMany { name, .. }
+            | Association::HasOne { name, .. }
+            | Association::BelongsTo {
+                name,
+                polymorphic: false,
+                ..
+            } => name,
+            _ => continue,
+        };
+        out.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::Assign {
+                target: LValue::Ivar {
+                    name: loaded_ivar(name),
+                },
+                value: lit_bool(false),
+            },
+        ));
+    }
+    out
+}
+
 /// Body-typer ivar bindings for a model's has_many eager-load caches
 /// (issue #27): `@<assoc>_cache` is `Array<Target>`, `@<assoc>_loaded`
 /// is `Bool`. The reader reads both and the constructor

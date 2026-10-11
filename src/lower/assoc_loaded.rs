@@ -309,14 +309,13 @@ pub(crate) fn rewrite_node(
 }
 
 /// True when at least one model synthesizes `<name>_loaded?`.
-fn any_model_declares(
+/// Existence only — the ClassId pick is meaningless when Message and
+/// Membership both expose the same `room_loaded?` spelling.
+fn any_model_declares_name(
     by_model: &HashMap<ClassId, HashSet<Symbol>>,
     name: &Symbol,
-) -> Option<ClassId> {
-    by_model
-        .iter()
-        .find(|(_, names)| names.contains(name))
-        .map(|(id, _)| id.clone())
+) -> bool {
+    by_model.values().any(|names| names.contains(name))
 }
 
 /// `association(:creator).loaded?` → `creator_loaded?` (or
@@ -344,37 +343,53 @@ fn rewrite_association_loaded(
     let Some(name) = sym_lit(&assoc_args[0]) else {
         return false;
     };
-    // Test/view bodies: unique-name fails when Message and Membership both
-    // `belongs_to :room`, and `message.reload` often types as
-    // `ActiveRecord::Base` (not Message) so typed resolve returns a class
-    // with no flat `room_loaded?`. Every matching model exposes the same
-    // `<name>_loaded?` spelling — rewrite when any model declares it.
-    // Model methods keep the stricter resolve (untyped / wrong-class
-    // explicit receivers stay unre-written).
-    let resolved = resolve_owner_model(
+    let flat = Symbol::from(format!("{}_loaded?", name.as_str()));
+    let in_model = enclosing.is_some_and(|id| flat_loaded.contains_key(id));
+    // Test/view explicit receivers: unique-name fails when Message and
+    // Membership both `belongs_to :room`, and `message.reload` often
+    // types as `ActiveRecord::Base` so typed resolve has no flat
+    // `room_loaded?`. Every matching model exposes the same spelling —
+    // name existence is enough; keep the original receiver. Model
+    // methods and implicit-self keep the stricter resolve below.
+    if let Some(base) = owner {
+        if !in_model && any_model_declares_name(flat_loaded, &name) {
+            let mut rewritten = Expr::new(
+                expr.span,
+                ExprNode::Send {
+                    recv: Some(base.clone()),
+                    method: flat,
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            rewritten.ty = Some(Ty::Bool);
+            *expr = rewritten;
+            return true;
+        }
+    }
+    let Some(owner_model) = resolve_owner_model(
         owner.as_ref(),
         enclosing,
         sole_includer,
         flat_loaded,
         &name,
-    );
-    let owner_model = match resolved {
-        Some(id) if flat_loaded.get(&id).is_some_and(|names| names.contains(&name)) => id,
-        _ => {
-            let in_model = enclosing.is_some_and(|id| flat_loaded.contains_key(id));
-            if in_model || owner.is_none() {
-                return false;
-            }
-            match any_model_declares(flat_loaded, &name) {
-                Some(id) => id,
-                None => return false,
-            }
-        }
+    ) else {
+        return false;
     };
+    if !flat_loaded
+        .get(&owner_model)
+        .is_some_and(|names| names.contains(&name))
+    {
+        return false;
+    }
     let new_recv = match owner {
         None => {
             let mut s = Expr::new(inner.span, ExprNode::SelfRef);
-            s.ty = Some(Ty::Class { id: owner_model, args: vec![] });
+            s.ty = Some(Ty::Class {
+                id: owner_model,
+                args: vec![],
+            });
             Some(s)
         }
         Some(base) => Some(base.clone()),
@@ -383,7 +398,7 @@ fn rewrite_association_loaded(
         expr.span,
         ExprNode::Send {
             recv: new_recv,
-            method: Symbol::from(format!("{}_loaded?", name.as_str())),
+            method: flat,
             args: vec![],
             block: None,
             parenthesized: false,

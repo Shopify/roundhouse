@@ -73,10 +73,10 @@
 //!
 //! TEST BODIES too. campfire's `RoomsControllerTest` plucks member ids
 //! before `destroy` so it can assert the enqueued job's args — same
-//! `room.memberships.pluck(:user_id)` shape. Production lowering runs
-//! through `fused::apply_fused_context_rewrites` (hook walk only used
-//! to cover this); that fused test walk must call [`rewrite_node`] as
-//! well, or the suite stays one file short of the campfire floor.
+//! `room.memberships.pluck(:user_id)` shape. That surface lives only on
+//! the fused test walk (`fused::apply_fused_context_rewrites` →
+//! [`rewrite_node`]); this standalone entry covers hook bodies for
+//! direct callers. Do not re-add a second `for_each_test_body` here.
 
 use crate::app::App;
 use crate::expr::{BlockStyle, Expr, ExprNode, Literal};
@@ -84,12 +84,9 @@ use crate::ident::Symbol;
 
 pub fn apply_assoc_pluck_lowering(app: &mut App) {
     let materialized = materialized_assoc_names(app);
+    // Hooks only — test bodies are single-sourced through the fused
+    // context walk so surfaces cannot drift.
     super::for_each_hook_body(app, &mut |e| rewrite(e, &materialized));
-    // Same widening the fused context walk asks for on tests: hook
-    // bodies alone miss the suite's own `room.memberships.pluck` sites.
-    // Production lowering goes through `fused::apply_fused_context_rewrites`;
-    // this entry stays for direct callers and shape tests.
-    super::for_each_test_body(app, &mut |e| rewrite(e, &materialized));
 }
 
 /// Association names whose reader answers a MATERIALIZED Array on every

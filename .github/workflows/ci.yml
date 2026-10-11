@@ -1911,8 +1911,9 @@ jobs:
       # has no per-object method table — or until upstream takes
       # basecamp/once-campfire#280, #279's twin for this file.
         env:
-          # Tip Campfire suite floor — raised 550/69 → 551/70 with
-          # assoc_pluck test-walk + view.controller (#818 meta).
+          # Tip Campfire suite floor — 552/71 via #818 meta
+          # (assoc_pluck test walk, view.controller, assoc_loaded,
+          # adapter_reload clear, reflect_on_association, walk-stub wipe).
           FLOOR_TESTS: 552
           FLOOR_FILES: 71
         run: |

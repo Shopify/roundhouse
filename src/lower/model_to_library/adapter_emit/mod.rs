@@ -35,7 +35,7 @@
 //!   `_columns_sql` — the schema columns as a qualified SELECT list
 //!   `_hydrate_all(sql)` — run a SELECT over `_columns_sql`, typed rows
 
-use crate::dialect::{AccessorKind, Association, MethodDef, MethodReceiver, Model, Param};
+use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, Model, Param};
 use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, TableRef, VarId};
@@ -886,39 +886,9 @@ fn synth_adapter_reload(model: &Model, table: &Table) -> MethodDef {
     let db = ClassId(Symbol::from("Db"));
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
 
-    // Rails' `reload` clears the association cache. Without this,
-    // campfire's mentionee test (`create!.reload` then
-    // `association(:room).loaded?`) sees a stale `@room_loaded` from
-    // inverse/touch during create.
-    let mut clear_assoc: Vec<Expr> = Vec::new();
-    for assoc in model.associations() {
-        let name = match assoc {
-            Association::HasMany { name, .. }
-            | Association::HasOne { name, .. }
-            | Association::BelongsTo {
-                name,
-                polymorphic: false,
-                ..
-            } => name,
-            _ => continue,
-        };
-        let mut lit = Expr::new(
-            Span::synthetic(),
-            ExprNode::Lit {
-                value: Literal::Bool { value: false },
-            },
-        );
-        lit.ty = Some(Ty::Bool);
-        clear_assoc.push(Expr::new(
-            Span::synthetic(),
-            ExprNode::Assign {
-                target: LValue::Ivar {
-                    name: super::associations::loaded_ivar(name),
-                },
-                value: lit,
-            },
-        ));
-    }
+    // Rails' `reload` clears the association cache — owned by
+    // associations (same kinds as `assoc_cache_ivar_bindings`).
+    let clear_assoc = super::associations::clear_loaded_flag_assigns(model);
 
     // SQL: "SELECT <cols> FROM <table> WHERE id = " + Db.escape_int(@id) + " LIMIT 1"
     let cols_csv: String = table
