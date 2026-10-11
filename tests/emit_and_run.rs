@@ -10493,6 +10493,22 @@ raise "association(:article).loaded? answered #{got.inspect}" unless got == [fal
         .assert_passes();
 }
 
+/// Campfire's messages_count test: `Message.reflect_on_association(:room)`
+/// and `assert_not reflection.counter_cache_column` (trigger-backed count,
+/// not an AR `counter_cache:`).
+#[test]
+fn reflect_on_association_answers_without_counter_cache() {
+    emit_and_run::real_blog()
+        .run_ruby(r#"
+reflection = Comment.reflect_on_association(:article)
+raise "missing reflection" if reflection.nil?
+raise "expected Symbol name, got #{reflection.name.inspect}" unless reflection.name == :article
+raise "counter_cache_column should be nil, got #{reflection.counter_cache_column.inspect}" unless reflection.counter_cache_column.nil?
+raise "unknown assoc should be nil" unless Comment.reflect_on_association(:missing).nil?
+"#)
+        .assert_passes();
+}
+
 /// `owner.<has_many>.reload` reads the rows again (campfire's rooms
 /// test: `assert_empty room.memberships.reload`).
 #[test]

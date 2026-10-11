@@ -405,6 +405,62 @@ pub(super) fn push_association_methods(
             m.body.inherit_span(span);
         }
     }
+    push_association_names(methods, model);
+}
+
+/// `def self._association_names; [:room, :creator, …]; end` — the name
+/// table `ActiveRecord::Base.reflect_on_association` consults. Values
+/// are association names only; `counter_cache:` is unmodeled, so the
+/// reflection always answers `counter_cache_column == nil` (campfire's
+/// `Message.reflect_on_association(:room)` assertion).
+fn push_association_names(methods: &mut Vec<MethodDef>, model: &Model) {
+    let name = Symbol::from("_association_names");
+    if model.methods().any(|m| m.name == name && m.receiver == MethodReceiver::Class)
+        || methods
+            .iter()
+            .any(|m| m.name == name && m.receiver == MethodReceiver::Class)
+    {
+        return;
+    }
+    let elements: Vec<Expr> = model
+        .associations()
+        .map(|a| lit_sym(a.name().clone()))
+        .collect();
+    if elements.is_empty() {
+        return;
+    }
+    let mut body = Expr::new(
+        Span::synthetic(),
+        ExprNode::Array {
+            elements,
+            style: crate::expr::ArrayStyle::Brackets,
+        },
+    );
+    body.ty = Some(Ty::Array {
+        elem: Box::new(Ty::Sym),
+    });
+    methods.push(MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: Span::synthetic(),
+        name,
+        receiver: MethodReceiver::Class,
+        params: Vec::new(),
+        body,
+        signature: Some(fn_sig(
+            vec![],
+            Ty::Array {
+                elem: Box::new(Ty::Sym),
+            },
+        )),
+        effects: EffectSet::default(),
+        enclosing_class: Some(model.name.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    });
 }
 
 fn synth_has_many_reader(
