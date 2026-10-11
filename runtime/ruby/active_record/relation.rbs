@@ -59,6 +59,9 @@ module ActiveRecord
     # Rails NullRelation — `none` / empty IN. Kept across spawn/chain.
     @null: bool
     def unload_records: () -> void
+    def null_relation?: () -> bool
+    def mark_null!: () -> void
+    def hash_has_empty_in?: (Hash[untyped, untyped]) -> bool
     def with_recursive: (Hash[Symbol, Array[Relation]] ctes) -> Relation
     def from: (String source) -> Relation
     def cte_prefix: () -> String

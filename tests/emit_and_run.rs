@@ -10251,7 +10251,8 @@ ActiveStorage.paths[:ffmpeg] = "/tmp/fake-ffmpeg"
 raise "paths assign" unless ActiveStorage.paths[:ffmpeg] == "/tmp/fake-ffmpeg"
 ActiveStorage.paths[:ffmpeg] = previous
 
-# TIME_LIMIT on a registered previewer is what the class-side poster reads.
+# TIME_LIMIT → VideoPreviewer.preview_timeout → class-side poster.
+raise "preview_timeout" unless TimeLimitedVideoPreviewer.preview_timeout == 10
 raise "time limit" unless ActiveStorage::Previewer.poster_time_limit == 10
 
 # `-vf` must match as a whole option, not a prefix of `-vframes`.
@@ -10265,25 +10266,70 @@ raise "vf vs vframes" unless ActiveStorage.video_preview_vf_filter == "scale=320
 }
 
 /// `Model.none` and `where(id: [])` are Rails NullRelations: empty
-/// terminals without loading rows (campfire mentionees; suite proves
-/// the zero-query half against Notifications).
+/// terminals with zero adapter selects. Negation / `or` must not stick
+/// or invert nullness (thermos H1).
 #[test]
 fn relation_none_and_empty_in_do_not_query() {
     emit_and_run::real_blog()
         .run_ruby(
             r#"
+QUERIES = []
+adapter = ActiveRecord.adapter
+orig = adapter.method(:select_rows)
+adapter.define_singleton_method(:select_rows) do |sql|
+  QUERIES << sql
+  orig.call(sql)
+end
+
+def assert_no_query(label)
+  before = QUERIES.length
+  yield
+  raise "#{label}: #{QUERIES.length - before} queries (#{QUERIES[before..]})" if QUERIES.length > before
+end
+
+row = Article.create!(title: "N", body: "b")
+
 none = Article.none
 raise "klass" unless none.klass == Article
-raise "to_a" unless none.to_a.empty?
-raise "ids" unless none.ids.empty?
-raise "empty?" unless none.empty?
-raise "exists?" if none.exists?
-raise "any?" if none.any?
+assert_no_query("none.to_a") { raise "to_a" unless none.to_a.empty? }
+assert_no_query("none.ids") { raise "ids" unless none.ids.empty? }
+assert_no_query("none.empty?") { raise "empty?" unless none.empty? }
+assert_no_query("none.exists?") { raise "exists?" if none.exists? }
+assert_no_query("none.any?") { raise "any?" if none.any? }
+assert_no_query("none.count") { raise "count" unless none.count == 0 }
+assert_no_query("none.pluck") { raise "pluck" unless none.pluck(:id).empty? }
 
 empty_in = Article.where(id: [])
-raise "empty_in to_a" unless empty_in.to_a.empty?
-raise "empty_in ids" unless empty_in.ids.empty?
-raise "empty_in empty?" unless empty_in.empty?
+assert_no_query("empty_in.to_a") { raise "empty_in to_a" unless empty_in.to_a.empty? }
+assert_no_query("empty_in.ids") { raise "empty_in ids" unless empty_in.ids.empty? }
+assert_no_query("empty_in.empty?") { raise "empty_in empty?" unless empty_in.empty? }
+assert_no_query("empty_in.count") { raise "empty_in count" unless empty_in.count == 0 }
+
+# Negated empty IN is a tautology — must not be NullRelation.
+# (`where.not` lowers to Relation#not; call it directly in this MRI script.)
+not_empty = Article.all.not(id: [])
+raise "not null?" if not_empty.null_relation?
+raise "not to_a" unless not_empty.to_a.map(&:id).include?(row.id)
+
+excl = Article.excluding([])
+raise "excluding null?" if excl.null_relation?
+raise "excluding to_a" unless excl.to_a.map(&:id).include?(row.id)
+
+# Left-null OR productive side yields the other (Rails NullRelation#or).
+or_side = Article.none.or(Article.where(id: row.id))
+raise "or null?" if or_side.null_relation?
+raise "or to_a" unless or_side.to_a.map(&:id) == [row.id]
+
+# Temporary find_by(id: []) must not stick null on the receiver.
+rel = Article.where("1=1")
+raise "find_by empty" unless rel.find_by(id: []).nil?
+raise "find_by sticky" if rel.null_relation?
+raise "find_by still loads" unless rel.to_a.map(&:id).include?(row.id)
+
+# merge(none) adopts null.
+merged = Article.where("1=1").merge(Article.none)
+raise "merge null?" unless merged.null_relation?
+assert_no_query("merge.none.ids") { raise "merge ids" unless merged.ids.empty? }
 "#,
         )
         .assert_passes();

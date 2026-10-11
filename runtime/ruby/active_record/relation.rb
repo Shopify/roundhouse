@@ -89,6 +89,29 @@ module ActiveRecord
       @records = @null ? [] : nil
     end
 
+    # Rails NullRelation — set only from `none` / a lasting non-negated
+    # empty-IN `where`, never from the pure predicate builder.
+    def null_relation?
+      @null
+    end
+
+    def mark_null!
+      @null = true
+      unload_records
+    end
+
+    # True when a hash condition contains an empty IN list (`id: []`).
+    def hash_has_empty_in?(condition)
+      condition.each do |_key, val|
+        if val.is_a?(Array)
+          return true if val.empty?
+        elsif val.is_a?(Hash)
+          return true if hash_has_empty_in?(val)
+        end
+      end
+      false
+    end
+
     # Rails' `Relation#spawn`: a new relation that shares this one's
     # query state but not its accumulator arrays. Chain methods still
     # mutate in place; scopes call `spawn` on entry so a fork like
@@ -234,6 +257,9 @@ module ActiveRecord
       val = records.length == 1 ? records[0] : records
       own_lists
       unload_records
+      # Empty exclusion is a no-op (Rails). Never mark_null!: `NOT (1=0)`
+      # is always true — sticky null would invert the relation.
+      return self if val.is_a?(Array) && val.empty?
       pred = column_predicate(@model.primary_key.to_s, val)
       @wheres << "NOT (#{pred})" unless pred.empty?
       self
@@ -253,6 +279,17 @@ module ActiveRecord
     # the receiver's structural clauses are kept here. An empty side is
     # an always-true condition (matches Rails: no filter to OR against).
     def or(other)
+      # Rails NullRelation#or: left-null yields the other side; right-null
+      # leaves the receiver; both-null stays null.
+      if @null && !other.null_relation?
+        return other.spawn
+      end
+      if !@null && other.null_relation?
+        return self
+      end
+      if @null && other.null_relation?
+        return self
+      end
       unload_records
       mine = @wheres.length > 0 ? @wheres.join(" AND ") : "1=1"
       other_wheres = other.where_clauses
@@ -276,6 +313,11 @@ module ActiveRecord
       end
       return false if sql == ""
       @wheres << (negate ? "NOT (#{sql})" : "(#{sql})")
+      # Empty IN is NullRelation only on a lasting positive where — never
+      # under `not` / temporary find_by·exists? (those restore via caller).
+      if !negate && condition.is_a?(Hash) && hash_has_empty_in?(condition)
+        mark_null!
+      end
       true
     end
 
@@ -811,6 +853,7 @@ module ActiveRecord
       own_lists
       unload_records
       other.where_clauses.each { |w| @wheres << w }
+      mark_null! if other.null_relation?
       self
     end
 
@@ -829,9 +872,8 @@ module ActiveRecord
 
     def none
       own_lists
-      @null = true
       @wheres << "(1 = 0)"
-      unload_records
+      mark_null!
       self
     end
 
@@ -1344,6 +1386,7 @@ module ActiveRecord
     end
 
     def count
+      return 0 if @null
       rows = ActiveRecord.adapter.select_rows(count_sql)
       rows.length == 0 ? 0 : rows[0]["n"].to_i
     end
@@ -1353,6 +1396,7 @@ module ActiveRecord
     # (lobsters' hotness math); an Integer-column caller would want
     # column typing here, ledgered when one appears.
     def sum(expr)
+      return 0.0 if @null
       term = expr.is_a?(Symbol) ? "#{@table}.#{expr}" : expr.to_s
       sql = "SELECT COALESCE(SUM(#{term}), 0) AS n FROM #{@table}"
       sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
@@ -1373,6 +1417,7 @@ module ActiveRecord
     end
 
     def extreme(expr, function)
+      return nil if @null
       column = expr.to_s.to_sym
       raise ArgumentError, "unknown aggregate column: #{expr}" unless @model.schema_columns.include?(column)
       return grouped_extreme(column.to_s, function) if @groups.length > 0
@@ -1646,6 +1691,7 @@ module ActiveRecord
     # Rails contract: no callbacks, no per-row loads, returns the
     # affected-row count. ORDER/LIMIT don't apply to bulk ops.
     def delete_all
+      return 0 if @null
       sql = "DELETE FROM #{@table}#{scoped_write_where}"
       ActiveRecord.adapter.execute_ddl(sql)
       ActiveRecord.adapter.changes
@@ -1683,6 +1729,7 @@ module ActiveRecord
     # (`update_all("hits = hits + 1")`) is trusted verbatim, same as
     # Rails. Returns the affected-row count.
     def update_all(updates)
+      return 0 if @null
       set_sql = if updates.is_a?(Hash)
         parts = []
         updates.each do |key, val|
@@ -1900,10 +1947,18 @@ module ActiveRecord
     # condition pushes nothing — so the pop is guarded by that rather
     # than issued unconditionally.
     def find_by(conditions)
+      # Borrowed predicate — restore nullness and the load cache so a
+      # temporary `find_by(id: [])` cannot stick NullRelation on the chain.
+      prior_null = @null
+      prior_records = @records
       pushed = add_condition(conditions, [], false)
-      record = first
-      @wheres.pop if pushed
-      record
+      begin
+        first
+      ensure
+        @wheres.pop if pushed
+        @null = prior_null
+        @records = prior_records
+      end
     end
 
     # `find_by!` — `find_by` that raises `RecordNotFound` on no match.
@@ -2193,12 +2248,10 @@ module ActiveRecord
         # Record elements read their id — Rails' IN-of-records form
         # (`where(comment: comments)`, lobsters Vote.comments_flags);
         # scalar elements escape as-is. An empty list is Rails' none
-        # predicate (`1=0`): never `IN ()`, and never a database round-trip
-        # once `@null` is set (campfire mentionees / `User.none`).
+        # predicate (`1=0`): never `IN ()`. Pure — NullRelation is set by
+        # `mark_null!` from `none` / lasting positive `where` only.
         ids = val.map { |x| x.is_a?(Base) ? x.id : x }
         if ids.empty?
-          @null = true
-          unload_records
           "1=0"
         else
           "#{qcol} IN (#{escape_list(ids)})"

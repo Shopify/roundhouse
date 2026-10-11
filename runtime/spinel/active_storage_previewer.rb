@@ -3,7 +3,6 @@
 # which raises. Rails' nested `Previewer::VideoPreviewer` is the
 # inheritance target apps subclass; drawing still goes through this
 # class-side `poster` with the same ffmpeg command Rails uses.
-# Campfire's Dockerfile installs ffmpeg for it, and so does the archive's.
 #
 # The binary comes from `ActiveStorage.paths[:ffmpeg]` when set (Rails'
 # config / test override); otherwise `"ffmpeg"` on PATH.
@@ -13,15 +12,15 @@
 # that adds `gte(t,5)` (campfire) draws the same frame Rails would.
 # Default is Rails' select/keyframe/scene filter.
 #
-# When a registered previewer defines `TIME_LIMIT` (campfire's
-# `TimeLimitedVideoPreviewer`), the draw is wrapped in `Timeout` and a
-# stuck ffmpeg is killed — same contract as Rails' instance `capture`
-# override, lifted onto the class-side poster this runtime uses.
+# Timeout comes from `VideoPreviewer.preview_timeout` on a registered
+# previewer (subclasses may define `TIME_LIMIT`; the base reads it).
+# When set, `Timeout` wraps the draw and a stuck ffmpeg is killed —
+# same contract as Rails' instance `capture` override, on the class-side
+# poster this runtime uses.
 #
 # A tree without ffmpeg raises here, as Rails raises (`Errno::ENOENT`
 # out of `IO.popen`): the honest answer is the missing program, not a
-# blank poster. `IO.popen` rather than bare `system` so a timed-out
-# child can be `Process.kill`'d.
+# blank poster.
 require "timeout"
 
 module ActiveStorage
@@ -36,10 +35,13 @@ module ActiveStorage
       path.nil? || path.to_s.empty? ? "ffprobe" : path.to_s
     end
 
-    # Wall-clock limit from a previewer that defines `TIME_LIMIT`, or nil.
+    # Wall-clock limit from a registered video previewer's
+    # `preview_timeout`, or nil (no limit).
     def self.poster_time_limit
       ActiveStorage.previewers.each do |previewer|
-        return previewer::TIME_LIMIT if previewer.const_defined?(:TIME_LIMIT)
+        next unless previewer.respond_to?(:preview_timeout)
+        limit = previewer.preview_timeout
+        return limit unless limit.nil?
       end
       nil
     end
@@ -52,27 +54,27 @@ module ActiveStorage
       limit = poster_time_limit
       ok = false
       begin
-        if limit.nil?
-          ok = system(*argv)
-        else
-          IO.popen(argv, err: File::NULL) do |io|
-            begin
+        IO.popen(argv, err: File::NULL) do |io|
+          begin
+            if limit.nil?
+              IO.copy_stream(io, File::NULL)
+            else
               Timeout.timeout(limit) { IO.copy_stream(io, File::NULL) }
-            rescue Timeout::Error
-              Process.kill(:KILL, io.pid) if io.pid
-              raise ActiveStorage::PreviewError,
-                    "#{bin} took longer than #{limit} seconds"
             end
+          rescue Timeout::Error
+            Process.kill(:KILL, io.pid) if io.pid
+            raise ActiveStorage::PreviewError,
+                  "#{bin} took longer than #{limit} seconds"
           end
-          ok = $?.success?
         end
+        ok = $?.success?
       rescue Errno::ENOENT
         raise "ActiveStorage::Previewer: ffmpeg could not draw a poster for " + path +
-              " — is ffmpeg installed? (campfire's Dockerfile installs it)"
+              " — is ffmpeg installed?"
       end
       if !ok || !File.exist?(out)
         raise "ActiveStorage::Previewer: ffmpeg could not draw a poster for " + path +
-              " — is ffmpeg installed? (campfire's Dockerfile installs it)"
+              " — is ffmpeg installed?"
       end
       png = File.binread(out)
       File.delete(out)

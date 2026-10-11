@@ -128,6 +128,7 @@ module ActiveStorage
     def self.poster: (String path) -> String
 
     class VideoPreviewer < ActiveStorage::Previewer
+      def self.preview_timeout: () -> (Integer | Float | nil)
     end
   end
 
