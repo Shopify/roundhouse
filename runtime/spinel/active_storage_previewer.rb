@@ -35,13 +35,20 @@ module ActiveStorage
       path.nil? || path.to_s.empty? ? "ffprobe" : path.to_s
     end
 
-    # Wall-clock limit from a registered video previewer's
-    # `preview_timeout`, or nil (no limit).
+    # Wall-clock limit from a registered *video* previewer: prefer
+    # `preview_timeout`, else a subclass-local `TIME_LIMIT` (campfire /
+    # stub_const). Never scan non-video previewers for TIME_LIMIT.
     def self.poster_time_limit
+      video = ActiveStorage::Previewer::VideoPreviewer
       ActiveStorage.previewers.each do |previewer|
-        next unless previewer.respond_to?(:preview_timeout)
-        limit = previewer.preview_timeout
-        return limit unless limit.nil?
+        next unless previewer == video || previewer < video
+        if previewer.respond_to?(:preview_timeout)
+          limit = previewer.preview_timeout
+          return limit unless limit.nil?
+        end
+        if previewer.const_defined?(:TIME_LIMIT, false)
+          return previewer.const_get(:TIME_LIMIT)
+        end
       end
       nil
     end

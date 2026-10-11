@@ -307,13 +307,12 @@ module ActiveStorage
     # that constant) resolve. Poster drawing on this runtime goes
     # through `Previewer.poster`, not the Rails instance `capture` path.
     #
-    # Subclasses may define `TIME_LIMIT` (campfire's TimeLimitedVideoPreviewer);
-    # the class-side poster asks `preview_timeout` rather than scanning
-    # arbitrary constants on every registered previewer.
+    # Override `preview_timeout` to cap the class-side poster (seconds),
+    # or define `TIME_LIMIT` on the subclass — the spinel poster reads
+    # either (campfire's TimeLimitedVideoPreviewer + suite stub_const).
     class VideoPreviewer < Previewer
       def self.preview_timeout
-        return nil unless const_defined?(:TIME_LIMIT, false)
-        const_get(:TIME_LIMIT)
+        nil
       end
     end
   end

@@ -10251,8 +10251,10 @@ ActiveStorage.paths[:ffmpeg] = "/tmp/fake-ffmpeg"
 raise "paths assign" unless ActiveStorage.paths[:ffmpeg] == "/tmp/fake-ffmpeg"
 ActiveStorage.paths[:ffmpeg] = previous
 
-# TIME_LIMIT → VideoPreviewer.preview_timeout → class-side poster.
-raise "preview_timeout" unless TimeLimitedVideoPreviewer.preview_timeout == 10
+# TIME_LIMIT on the video subclass → class-side poster (preview_timeout
+# override is the typed API; TIME_LIMIT is the campfire/stub_const path).
+raise "TIME_LIMIT" unless TimeLimitedVideoPreviewer::TIME_LIMIT == 10
+raise "preview_timeout default" unless TimeLimitedVideoPreviewer.preview_timeout.nil?
 raise "time limit" unless ActiveStorage::Previewer.poster_time_limit == 10
 
 # `-vf` must match as a whole option, not a prefix of `-vframes`.
@@ -10272,7 +10274,7 @@ raise "vf vs vframes" unless ActiveStorage.video_preview_vf_filter == "scale=320
 fn relation_none_and_empty_in_do_not_query() {
     emit_and_run::real_blog()
         .run_ruby(
-            r#"
+            r##"
 QUERIES = []
 adapter = ActiveRecord.adapter
 orig = adapter.method(:select_rows)
@@ -10284,10 +10286,11 @@ end
 def assert_no_query(label)
   before = QUERIES.length
   yield
-  raise "#{label}: #{QUERIES.length - before} queries (#{QUERIES[before..]})" if QUERIES.length > before
+  n = QUERIES.length - before
+  raise "#{label}: #{n} queries" if n > 0
 end
 
-row = Article.create!(title: "N", body: "b")
+row = Article.create!(title: "NullRel", body: "long enough body")
 
 none = Article.none
 raise "klass" unless none.klass == Article
@@ -10311,7 +10314,7 @@ not_empty = Article.all.not(id: [])
 raise "not null?" if not_empty.null_relation?
 raise "not to_a" unless not_empty.to_a.map(&:id).include?(row.id)
 
-excl = Article.excluding([])
+excl = Article.all.excluding([])
 raise "excluding null?" if excl.null_relation?
 raise "excluding to_a" unless excl.to_a.map(&:id).include?(row.id)
 
@@ -10321,16 +10324,16 @@ raise "or null?" if or_side.null_relation?
 raise "or to_a" unless or_side.to_a.map(&:id) == [row.id]
 
 # Temporary find_by(id: []) must not stick null on the receiver.
-rel = Article.where("1=1")
+rel = Article.all.where("1=1")
 raise "find_by empty" unless rel.find_by(id: []).nil?
 raise "find_by sticky" if rel.null_relation?
 raise "find_by still loads" unless rel.to_a.map(&:id).include?(row.id)
 
 # merge(none) adopts null.
-merged = Article.where("1=1").merge(Article.none)
+merged = Article.all.where("1=1").merge(Article.none)
 raise "merge null?" unless merged.null_relation?
 assert_no_query("merge.none.ids") { raise "merge ids" unless merged.ids.empty? }
-"#,
+"##,
         )
         .assert_passes();
 }
