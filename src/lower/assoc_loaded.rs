@@ -344,20 +344,23 @@ fn rewrite_association_loaded(
     let Some(name) = sym_lit(&assoc_args[0]) else {
         return false;
     };
-    // Unique-name is overly strict for this flatten: Message and
-    // Membership both `belongs_to :room` and both expose `room_loaded?`,
-    // so campfire's mentionee test (`message.association(:room).loaded?`
-    // with an untyped local) must still rewrite. Model methods keep the
-    // stricter resolve (untyped explicit receivers stay unre-written).
-    let owner_model = match resolve_owner_model(
+    // Test/view bodies: unique-name fails when Message and Membership both
+    // `belongs_to :room`, and `message.reload` often types as
+    // `ActiveRecord::Base` (not Message) so typed resolve returns a class
+    // with no flat `room_loaded?`. Every matching model exposes the same
+    // `<name>_loaded?` spelling — rewrite when any model declares it.
+    // Model methods keep the stricter resolve (untyped / wrong-class
+    // explicit receivers stay unre-written).
+    let resolved = resolve_owner_model(
         owner.as_ref(),
         enclosing,
         sole_includer,
         flat_loaded,
         &name,
-    ) {
-        Some(id) => id,
-        None => {
+    );
+    let owner_model = match resolved {
+        Some(id) if flat_loaded.get(&id).is_some_and(|names| names.contains(&name)) => id,
+        _ => {
             let in_model = enclosing.is_some_and(|id| flat_loaded.contains_key(id));
             if in_model || owner.is_none() {
                 return false;
@@ -368,9 +371,6 @@ fn rewrite_association_loaded(
             }
         }
     };
-    if !flat_loaded.get(&owner_model).is_some_and(|names| names.contains(&name)) {
-        return false;
-    }
     let new_recv = match owner {
         None => {
             let mut s = Expr::new(inner.span, ExprNode::SelfRef);

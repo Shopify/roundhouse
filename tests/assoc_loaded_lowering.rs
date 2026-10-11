@@ -591,3 +591,84 @@ end
         "association(:room).loaded? must not survive test emit:\n{src}"
     );
 }
+
+#[test]
+fn association_loaded_rewrites_after_reload_typed_as_base() {
+    // Campfire mentionee: `message = ….create!(…).reload` then
+    // `message.association(:room).loaded?`. `reload` types as Base, which
+    // does not declare `:room` — must still flatten in test bodies.
+    let mut app = ingest_app_from_tree(tree(&[
+        (
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define do
+  create_table "messages", force: :cascade do |t|
+    t.integer "room_id"
+  end
+  create_table "memberships", force: :cascade do |t|
+    t.integer "room_id"
+  end
+  create_table "rooms", force: :cascade do |t|
+    t.string "name"
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        (
+            "config/routes.rb",
+            "Rails.application.routes.draw do\nend\n",
+        ),
+        (
+            "app/models/message.rb",
+            r#"class Message < ApplicationRecord
+  belongs_to :room
+end
+"#,
+        ),
+        (
+            "app/models/membership.rb",
+            r#"class Membership < ApplicationRecord
+  belongs_to :room
+end
+"#,
+        ),
+        (
+            "app/models/room.rb",
+            r#"class Room < ApplicationRecord
+  has_many :messages
+end
+"#,
+        ),
+        (
+            "test/models/message_room_loaded_test.rb",
+            r#"require "test_helper"
+
+class MessageRoomLoadedTest < ActiveSupport::TestCase
+  test "room starts unloaded after reload" do
+    message = Message.create!(room_id: 1).reload
+    assert_not message.association(:room).loaded?
+  end
+end
+"#,
+        ),
+    ]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let files = ruby::emit_spinel(&app);
+    let src = files
+        .iter()
+        .find(|f| f.path.to_string_lossy().contains("message_room_loaded"))
+        .map(|f| f.content.as_str())
+        .unwrap_or("");
+    assert!(
+        src.contains("room_loaded?"),
+        "Base-typed reload receiver must still flatten association(:room).loaded?:\n{src}"
+    );
+    assert!(
+        !src.contains("association(:room)"),
+        "association(:room).loaded? must not survive after reload:\n{src}"
+    );
+}
