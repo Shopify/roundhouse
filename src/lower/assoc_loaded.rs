@@ -309,13 +309,25 @@ pub(crate) fn rewrite_node(
 }
 
 /// True when at least one model synthesizes `<name>_loaded?`.
-/// Existence only — the ClassId pick is meaningless when Message and
-/// Membership both expose the same `room_loaded?` spelling.
 fn any_model_declares_name(
     by_model: &HashMap<ClassId, HashSet<Symbol>>,
     name: &Symbol,
 ) -> bool {
     by_model.values().any(|names| names.contains(name))
+}
+
+/// A ClassId that synthesizes `<name>_loaded?`, for stamping the
+/// rewritten send's receiver type on strict targets. When several
+/// models share the name (Message and Membership both `:room`), any
+/// declaring class is enough — the spelling is identical.
+fn a_model_declaring(
+    by_model: &HashMap<ClassId, HashSet<Symbol>>,
+    name: &Symbol,
+) -> Option<ClassId> {
+    by_model
+        .iter()
+        .find(|(_, names)| names.contains(name))
+        .map(|(id, _)| id.clone())
 }
 
 /// `association(:creator).loaded?` → `creator_loaded?` (or
@@ -349,14 +361,19 @@ fn rewrite_association_loaded(
     // Membership both `belongs_to :room`, and `message.reload` often
     // types as `ActiveRecord::Base` so typed resolve has no flat
     // `room_loaded?`. Every matching model exposes the same spelling —
-    // name existence is enough; keep the original receiver. Model
+    // name existence gates the rewrite; stamp a declaring ClassId on
+    // the kept receiver so strict targets see the flat method. Model
     // methods and implicit-self keep the stricter resolve below.
     if let Some(base) = owner {
         if !in_model && any_model_declares_name(flat_loaded, &name) {
+            let mut recv = base.clone();
+            if let Some(id) = a_model_declaring(flat_loaded, &name) {
+                recv.ty = Some(Ty::Class { id, args: vec![] });
+            }
             let mut rewritten = Expr::new(
                 expr.span,
                 ExprNode::Send {
-                    recv: Some(base.clone()),
+                    recv: Some(recv),
                     method: flat,
                     args: vec![],
                     block: None,

@@ -160,12 +160,15 @@ module ActiveRecord
 
       # Catalog also types `.klass` / `.macro`; presence-only callers get
       # nil rather than a NameError until those halves are synthesized.
+      # Read-tail locals: strict targets drop a bare `nil` method body.
       def klass
-        nil
+        result = nil
+        result
       end
 
       def macro
-        nil
+        result = nil
+        result
       end
     end
   end
