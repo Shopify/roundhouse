@@ -72,11 +72,21 @@ module ActiveRecord
       @offset = nil
       @includes = []
       @skip_preloading = false
+      # Rails' NullRelation flag: `Model.none` and `where(id: [])` must not
+      # hit the database. Chain methods call `unload_records`, which keeps
+      # an empty loaded cache when `@null` is set so terminals stay quiet.
+      @null = false
       @records = nil
       @scope_attributes = {}
       @from = nil
       @ctes = []
       @shared_lists = false
+    end
+
+    # Drop the loaded-records memo. A null relation keeps `[]` so a later
+    # `to_a` / `ids` / `exists?` does not re-query through `(1 = 0)`.
+    def unload_records
+      @records = @null ? [] : nil
     end
 
     # Rails' `Relation#spawn`: a new relation that shares this one's
@@ -153,7 +163,7 @@ module ActiveRecord
     # page (`Comment#parents`).
     def with_recursive(ctes)
       own_lists
-      @records = nil
+      unload_records
       ctes.each do |name, parts|
         # Build the UNION list with pushes rather than `map.join`: the
         # body typer's Array#map still returns Untyped, so the join
@@ -169,7 +179,7 @@ module ActiveRecord
     # table. The String form only: Rails also takes a relation (a
     # subquery) there, which no corpus call writes.
     def from(source)
-      @records = nil
+      unload_records
       @from = source
       self
     end
@@ -223,7 +233,7 @@ module ActiveRecord
     def excluding(*records)
       val = records.length == 1 ? records[0] : records
       own_lists
-      @records = nil
+      unload_records
       pred = column_predicate(@model.primary_key.to_s, val)
       @wheres << "NOT (#{pred})" unless pred.empty?
       self
@@ -243,7 +253,7 @@ module ActiveRecord
     # the receiver's structural clauses are kept here. An empty side is
     # an always-true condition (matches Rails: no filter to OR against).
     def or(other)
-      @records = nil
+      unload_records
       mine = @wheres.length > 0 ? @wheres.join(" AND ") : "1=1"
       other_wheres = other.where_clauses
       theirs = other_wheres.length > 0 ? other_wheres.join(" AND ") : "1=1"
@@ -257,7 +267,7 @@ module ActiveRecord
     # know whether there is one to pop. The chain methods ignore it.
     def add_condition(condition, args, negate)
       own_lists
-      @records = nil
+      unload_records
       return false if condition.nil?
       sql = if condition.is_a?(Hash)
         hash_conditions(condition)
@@ -305,7 +315,7 @@ module ActiveRecord
       if sort_in_place!(sorted, terms)
         @records = sorted
       else
-        @records = nil
+        unload_records
       end
       self
     end
@@ -319,7 +329,7 @@ module ActiveRecord
     def order_sql(fragment)
       own_lists
       @orders << fragment
-      @records = nil
+      unload_records
       self
     end
 
@@ -365,7 +375,7 @@ module ActiveRecord
       if sort_in_place!(sorted, terms)
         @records = sorted
       else
-        @records = nil
+        unload_records
       end
       self
     end
@@ -496,7 +506,7 @@ module ActiveRecord
     # not an integer) and `offset` is `build_arel`'s `to_i`. nil clears
     # either, as in Rails.
     def limit(n)
-      @records = nil
+      unload_records
       # Split rather than `n.nil? ? nil : sql_limit(n)`: Spinel cannot
       # unify nil with Integer in a conditional expression.
       if n.nil?
@@ -508,7 +518,7 @@ module ActiveRecord
     end
 
     def offset(n)
-      @records = nil
+      unload_records
       if n.nil?
         @offset = nil
       else
@@ -624,7 +634,7 @@ module ActiveRecord
 
     def group(*parts)
       own_lists
-      @records = nil
+      unload_records
       # Symbols qualify against this relation's table (Rails renders
       # `GROUP BY "tags"."id"`), so a grouped column stays unambiguous
       # once a join brings in a second table carrying the same column
@@ -638,7 +648,7 @@ module ActiveRecord
 
     def having(condition, *args)
       own_lists
-      @records = nil
+      unload_records
       @havings << substitute_binds(condition.to_s, args)
       self
     end
@@ -667,7 +677,7 @@ module ActiveRecord
     # table as ambiguous.
     def joins(spec)
       own_lists
-      @records = nil
+      unload_records
       frag = join_fragment(spec)
       @joins << frag unless @joins.include?(frag)
       self
@@ -675,7 +685,7 @@ module ActiveRecord
 
     def left_outer_joins(spec)
       own_lists
-      @records = nil
+      unload_records
       frag = join_fragment(spec)
       @joins << frag unless @joins.include?(frag)
       self
@@ -724,7 +734,7 @@ module ActiveRecord
     # the query. Raise instead.
     def select(*specs)
       raise ArgumentError, "select: no columns (a block form reached the projection)" if specs.empty?
-      @records = nil
+      unload_records
       cols = []
       specs.each do |spec|
         cols << (spec.is_a?(Symbol) ? "#{@table}.#{spec}" : spec.to_s)
@@ -734,7 +744,7 @@ module ActiveRecord
     end
 
     def distinct
-      @records = nil
+      unload_records
       @distinct = true
       self
     end
@@ -747,14 +757,14 @@ module ActiveRecord
     # override inherit Base's no-op and stay lazy (correct, just N+1).
     def includes(*names)
       own_lists
-      @records = nil
+      unload_records
       names.each { |n| @includes << n }
       self
     end
 
     def preload(*names)
       own_lists
-      @records = nil
+      unload_records
       names.each { |n| @includes << n }
       self
     end
@@ -765,7 +775,7 @@ module ActiveRecord
     # `preload_associations`. campfire's message pages load this way and
     # preload only the messages its fragment cache missed.
     def skip_preloading!
-      @records = nil
+      unload_records
       @skip_preloading = true
       self
     end
@@ -780,7 +790,7 @@ module ActiveRecord
 
     def eager_load(*names)
       own_lists
-      @records = nil
+      unload_records
       names.each { |n| @includes << n }
       self
     end
@@ -799,7 +809,7 @@ module ActiveRecord
     # common case (merging a same-table scope's conditions).
     def merge(other)
       own_lists
-      @records = nil
+      unload_records
       other.where_clauses.each { |w| @wheres << w }
       self
     end
@@ -819,15 +829,16 @@ module ActiveRecord
 
     def none
       own_lists
-      @records = nil
+      @null = true
       @wheres << "(1 = 0)"
+      unload_records
       self
     end
 
     # `reload` — drop the loaded records; the next terminal re-queries and
     # reflects committed changes.
     def reload
-      @records = nil
+      unload_records
       self
     end
 
@@ -898,6 +909,7 @@ module ActiveRecord
     # fixed at compile time, so no String-keyed Hash per row. An
     # explicit `select` can project anything, and keeps the Hash path.
     def load_records
+      return [] if @null
       records = if @select_sql.nil?
         @model._hydrate_all(select_sql_with(@model._columns_sql))
       else
@@ -1188,7 +1200,7 @@ module ActiveRecord
       # loaded-relation cache a later `each`/`map` reads, and a cache
       # holding the single row `first` asked for would answer those with
       # one row out of many. Same terminal rule as `pluck`.
-      @records = nil
+      unload_records
       rows.length == 0 ? nil : rows[0]
     end
 
@@ -1232,7 +1244,7 @@ module ActiveRecord
       @limit = n
       rows = to_a
       @limit = prior
-      @records = nil
+      unload_records
       rows
     end
 
@@ -1271,7 +1283,7 @@ module ActiveRecord
       rows = to_a
       @limit = prior_limit
       @orders = prior_orders
-      @records = nil
+      unload_records
       out = []
       i = rows.length - 1
       while i >= 0
@@ -1502,11 +1514,13 @@ module ActiveRecord
 
     # Loaded: cache length. Unloaded: exists? (SELECT 1 LIMIT 1).
     def empty?
+      return true if @null
       r = @records
       r.nil? ? !exists? : r.length == 0
     end
 
     def any?
+      return false if @null
       r = @records
       r.nil? ? exists? : r.length > 0
     end
@@ -1556,6 +1570,7 @@ module ActiveRecord
     # Hash conditions share where's predicate builder; scalar conditions
     # select the primary key. Unloaded: exists_sql (SELECT 1 LIMIT 1).
     def exists?(id = nil)
+      return false if @null
       return false if @limit == 0
       if id.nil?
         r = @records
@@ -1582,6 +1597,7 @@ module ActiveRecord
     # How many probe rows `exists_sql(n)` returns. Shared by `exists?`,
     # `one?`, and `many?` so cardinality questions never hydrate.
     def probe_existence(n)
+      return 0 if @null
       return 0 if @limit == 0
       ActiveRecord.adapter.select_rows(exists_sql(n)).length
     end
@@ -1742,6 +1758,7 @@ module ActiveRecord
     # plucks the user ids, then hands the SAME relation to `grant_to`,
     # which built memberships for user 0.
     def pluck(col)
+      return [] if @null
       prior = @select_sql
       @select_sql = "#{@table}.#{col} AS v"
       rows = ActiveRecord.adapter.select_rows(to_sql)
@@ -1764,6 +1781,9 @@ module ActiveRecord
     # `@model.primary_key` (not a hard-coded `id` column) and casts the
     # way `find` does, so uuid / string keys survive (#310).
     def ids
+      return [] if @null
+      cached = @records
+      return cached.map { |row| row.id } unless cached.nil?
       prior = @select_sql
       key = @model.primary_key
       @select_sql = "#{@table}.#{key} AS v"
@@ -1928,7 +1948,7 @@ module ActiveRecord
       @limit = sole_probe_limit(prior_limit)
       rows = to_a
       @limit = prior_limit
-      @records = nil
+      unload_records
       raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if rows.length == 0
       raise SoleRecordExceeded, "Wanted only one #{@model.name}" if rows.length > 1
       rows[0]
@@ -2172,9 +2192,17 @@ module ActiveRecord
       elsif val.is_a?(Array)
         # Record elements read their id — Rails' IN-of-records form
         # (`where(comment: comments)`, lobsters Vote.comments_flags);
-        # scalar elements escape as-is.
+        # scalar elements escape as-is. An empty list is Rails' none
+        # predicate (`1=0`): never `IN ()`, and never a database round-trip
+        # once `@null` is set (campfire mentionees / `User.none`).
         ids = val.map { |x| x.is_a?(Base) ? x.id : x }
-        "#{qcol} IN (#{escape_list(ids)})"
+        if ids.empty?
+          @null = true
+          unload_records
+          "1=0"
+        else
+          "#{qcol} IN (#{escape_list(ids)})"
+        end
       elsif val.nil?
         "#{qcol} IS NULL"
       elsif val.is_a?(Base)

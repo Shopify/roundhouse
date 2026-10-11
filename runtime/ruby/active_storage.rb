@@ -80,6 +80,19 @@ module ActiveStorage
     variable_content_types.include?(content_type)
   end
 
+  # Rails' `ActiveStorage.paths` — executable locations for previewers /
+  # analyzers (`:ffmpeg`, `:ffprobe`, `:mutool`). Default `{}` means
+  # PATH lookup. Tests and config assign `paths[:ffmpeg] = "/bin/…"`.
+  def self.paths
+    @paths = {} if @paths.nil?
+    @paths
+  end
+
+  def self.paths=(value)
+    @paths = value
+    value
+  end
+
   # Rails' `config.active_storage.video_preview_arguments` — the ffmpeg
   # argv fragment after `-i <path>`. Default matches the filter the
   # ruby-family poster reopen draws with; an initializer override

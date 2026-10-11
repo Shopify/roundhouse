@@ -10244,11 +10244,46 @@ raise "filter" unless ActiveStorage.video_preview_vf_filter.include?("gte(t\\,5)
 raise "previewers include" unless ActiveStorage.previewers.include?(TimeLimitedVideoPreviewer)
 raise "previewers exclude" if ActiveStorage.previewers.include?(ActiveStorage::Previewer::VideoPreviewer)
 
+# Rails' ActiveStorage.paths — mutable executable locations.
+raise "paths default" unless ActiveStorage.paths.is_a?(Hash)
+previous = ActiveStorage.paths[:ffmpeg]
+ActiveStorage.paths[:ffmpeg] = "/tmp/fake-ffmpeg"
+raise "paths assign" unless ActiveStorage.paths[:ffmpeg] == "/tmp/fake-ffmpeg"
+ActiveStorage.paths[:ffmpeg] = previous
+
+# TIME_LIMIT on a registered previewer is what the class-side poster reads.
+raise "time limit" unless ActiveStorage::Previewer.poster_time_limit == 10
+
 # `-vf` must match as a whole option, not a prefix of `-vframes`.
 def ActiveStorage.video_preview_arguments
   "-vframes 1 -vf 'scale=320:240' -f image2"
 end
 raise "vf vs vframes" unless ActiveStorage.video_preview_vf_filter == "scale=320:240"
+"#,
+        )
+        .assert_passes();
+}
+
+/// `Model.none` and `where(id: [])` are Rails NullRelations: empty
+/// terminals without loading rows (campfire mentionees; suite proves
+/// the zero-query half against Notifications).
+#[test]
+fn relation_none_and_empty_in_do_not_query() {
+    emit_and_run::real_blog()
+        .run_ruby(
+            r#"
+none = Article.none
+raise "klass" unless none.klass == Article
+raise "to_a" unless none.to_a.empty?
+raise "ids" unless none.ids.empty?
+raise "empty?" unless none.empty?
+raise "exists?" if none.exists?
+raise "any?" if none.any?
+
+empty_in = Article.where(id: [])
+raise "empty_in to_a" unless empty_in.to_a.empty?
+raise "empty_in ids" unless empty_in.ids.empty?
+raise "empty_in empty?" unless empty_in.empty?
 "#,
         )
         .assert_passes();
