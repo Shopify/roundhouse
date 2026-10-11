@@ -1913,8 +1913,8 @@ jobs:
         env:
           # Tip Campfire suite floor — raised 550/69 → 551/70 with
           # assoc_pluck test-walk + view.controller (#818 meta).
-          FLOOR_TESTS: 551
-          FLOOR_FILES: 70
+          FLOOR_TESTS: 552
+          FLOOR_FILES: 71
         run: |
           set -euo pipefail
           tests=$(awk -F'|' '{p += $3} END {print p+0}' /tmp/campfire-tally.txt)
