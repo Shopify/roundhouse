@@ -1911,8 +1911,8 @@ jobs:
       # has no per-object method table — or until upstream takes
       # basecamp/once-campfire#280, #279's twin for this file.
         env:
-          FLOOR_TESTS: 550
-          FLOOR_FILES: 69
+          FLOOR_TESTS: 551
+          FLOOR_FILES: 70
         run: |
           set -euo pipefail
           tests=$(awk -F'|' '{p += $3} END {print p+0}' /tmp/campfire-tally.txt)
