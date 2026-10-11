@@ -672,3 +672,84 @@ end
         "association(:room).loaded? must not survive after reload:\n{src}"
     );
 }
+
+#[test]
+fn association_loaded_keeps_poly_receiver_when_sibling_declares_name() {
+    // Message has polymorphic `:room` (no flat `room_loaded?`); Membership
+    // has a supported `belongs_to :room`. The any-model gate must not rewrite
+    // a Message-typed receiver onto a predicate it does not own.
+    let mut app = ingest_app_from_tree(tree(&[
+        (
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define do
+  create_table "messages", force: :cascade do |t|
+    t.integer "room_id"
+    t.string "room_type"
+  end
+  create_table "memberships", force: :cascade do |t|
+    t.integer "room_id"
+  end
+  create_table "rooms", force: :cascade do |t|
+    t.string "name"
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        (
+            "config/routes.rb",
+            "Rails.application.routes.draw do\nend\n",
+        ),
+        (
+            "app/models/message.rb",
+            r#"class Message < ApplicationRecord
+  belongs_to :room, polymorphic: true
+end
+"#,
+        ),
+        (
+            "app/models/membership.rb",
+            r#"class Membership < ApplicationRecord
+  belongs_to :room
+end
+"#,
+        ),
+        (
+            "app/models/room.rb",
+            r#"class Room < ApplicationRecord
+end
+"#,
+        ),
+        (
+            "test/models/message_poly_room_loaded_test.rb",
+            r#"require "test_helper"
+
+class MessagePolyRoomLoadedTest < ActiveSupport::TestCase
+  test "poly room stays on association.loaded?" do
+    message = Message.new
+    assert_not message.association(:room).loaded?
+  end
+end
+"#,
+        ),
+    ]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let files = ruby::emit_spinel(&app);
+    let src = files
+        .iter()
+        .find(|f| f.path.to_string_lossy().contains("message_poly_room_loaded"))
+        .map(|f| f.content.as_str())
+        .unwrap_or("");
+    assert!(
+        src.contains("association(:room)"),
+        "polymorphic Message must keep association(:room).loaded?:\n{src}"
+    );
+    assert!(
+        !src.contains("room_loaded?"),
+        "must not flatten onto Membership's room_loaded? for a Message recv:\n{src}"
+    );
+}

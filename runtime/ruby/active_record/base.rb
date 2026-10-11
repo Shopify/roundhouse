@@ -338,7 +338,9 @@ module ActiveRecord
           return ActiveRecord::Reflection::AssociationReflection.new(assoc, nil)
         end
       end
-      nil
+      # Read-tail: strict targets drop a bare `nil` method body.
+      result = nil
+      result
     end
 
     # Finder casting runs in connection.rb (Relation is ruby-family

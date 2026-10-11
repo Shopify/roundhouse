@@ -360,29 +360,49 @@ fn rewrite_association_loaded(
     // Test/view explicit receivers: unique-name fails when Message and
     // Membership both `belongs_to :room`, and `message.reload` often
     // types as `ActiveRecord::Base` so typed resolve has no flat
-    // `room_loaded?`. Every matching model exposes the same spelling —
-    // name existence gates the rewrite; stamp a declaring ClassId on
-    // the kept receiver so strict targets see the flat method. Model
-    // methods and implicit-self keep the stricter resolve below.
+    // `room_loaded?`. Name existence on *some* model gates the widen,
+    // but a known receiver model that itself lacks the flat predicate
+    // (polymorphic `belongs_to`) keeps the dynamic path. Stamp a
+    // declaring ClassId on the kept receiver for strict targets.
+    // Model methods and implicit-self keep the stricter resolve below.
     if let Some(base) = owner {
-        if !in_model && any_model_declares_name(flat_loaded, &name) {
-            let mut recv = base.clone();
-            if let Some(id) = a_model_declaring(flat_loaded, &name) {
-                recv.ty = Some(Ty::Class { id, args: vec![] });
+        if !in_model {
+            let typed = owner_from_typed_recv(base, flat_loaded, &name);
+            let allow = match &typed {
+                // `owner_from_typed_recv` only returns Some when every
+                // class alt declares `name` — or a single Class id. A
+                // concrete model key that omits the name (poly assoc)
+                // must not rewrite.
+                Some(id) if flat_loaded.contains_key(id) => {
+                    flat_loaded.get(id).is_some_and(|n| n.contains(&name))
+                }
+                // Base / untyped / unknown: any declaring model is enough.
+                _ => any_model_declares_name(flat_loaded, &name),
+            };
+            if allow {
+                let mut recv = base.clone();
+                let stamp = typed
+                    .filter(|id| {
+                        flat_loaded.get(id).is_some_and(|n| n.contains(&name))
+                    })
+                    .or_else(|| a_model_declaring(flat_loaded, &name));
+                if let Some(id) = stamp {
+                    recv.ty = Some(Ty::Class { id, args: vec![] });
+                }
+                let mut rewritten = Expr::new(
+                    expr.span,
+                    ExprNode::Send {
+                        recv: Some(recv),
+                        method: flat,
+                        args: vec![],
+                        block: None,
+                        parenthesized: false,
+                    },
+                );
+                rewritten.ty = Some(Ty::Bool);
+                *expr = rewritten;
+                return true;
             }
-            let mut rewritten = Expr::new(
-                expr.span,
-                ExprNode::Send {
-                    recv: Some(recv),
-                    method: flat,
-                    args: vec![],
-                    block: None,
-                    parenthesized: false,
-                },
-            );
-            rewritten.ty = Some(Ty::Bool);
-            *expr = rewritten;
-            return true;
         }
     }
     let Some(owner_model) = resolve_owner_model(
