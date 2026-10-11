@@ -1518,6 +1518,7 @@ module ActiveRecord
     # as `to_sql` so the Hash only contains surviving groups, and a
     # distinct projection counts distinct values per group (#343).
     def group_count
+      return {} if @null
       key = @groups.join(", ")
       # DISTINCT uses a subquery so a multi-column / aliased `select`
       # never lands inside SQLite's one-expression COUNT(DISTINCT …).
@@ -1652,6 +1653,7 @@ module ActiveRecord
     # Does not mutate the relation — `offset(n).exists?` would, and a
     # loaded `exists?` would ignore that offset.
     def more_than?(n)
+      return false if @null
       return true if n < 0
       sql = "#{cte_prefix}SELECT 1 AS one FROM #{from_source}"
       sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
@@ -1752,6 +1754,7 @@ module ActiveRecord
     # Rails' `*names`: that is every corpus call, and a splat of names
     # would reach the SQL untyped.
     def touch_all(name = nil)
+      return 0 if @null
       now = ActiveRecord.adapter.escape_value(ActiveSupport.db_now)
       parts = []
       parts.push("updated_at = #{now}") if @model.schema_columns.include?(:updated_at)
@@ -2024,15 +2027,18 @@ module ActiveRecord
     # relation's records are intact afterward whether `sole` returns or
     # raises.
     def find_sole_by(conditions)
+      # Same borrowed-predicate restore as `find_by` — empty IN must not
+      # stick NullRelation on the receiver after the sole probe.
+      prior_null = @null
       prior_records = @records
       pushed = add_condition(conditions, [], false)
       begin
-        record = sole
+        sole
       ensure
         @wheres.pop if pushed
+        @null = prior_null
         @records = prior_records
       end
-      record
     end
 
     # NO `new` HERE, AND NOT BY OVERSIGHT. Rails builds records through

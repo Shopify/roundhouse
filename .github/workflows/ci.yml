@@ -1911,11 +1911,11 @@ jobs:
       # has no per-object method table — or until upstream takes
       # basecamp/once-campfire#280, #279's twin for this file.
         env:
-          # Tip Campfire suite floor — 554/73 via hygiene greens
+          # Tip Campfire suite floor — 555/74 via hygiene + conditional GET
           # (strict suite emit, ActiveStorage.paths + timed poster,
-          # Relation#none / empty-IN null relation for mentionees).
-          FLOOR_TESTS: 554
-          FLOOR_FILES: 73
+          # NullRelation, fresh_when ETag → 304).
+          FLOOR_TESTS: 555
+          FLOOR_FILES: 74
         run: |
           set -euo pipefail
           tests=$(awk -F'|' '{p += $3} END {print p+0}' /tmp/campfire-tally.txt)

@@ -10354,11 +10354,17 @@ or_side = Article.none.or(Article.where(id: row.id))
 raise "or null?" if or_side.null_relation?
 raise "or to_a" unless or_side.to_a.map(&:id) == [row.id]
 
-# Temporary find_by(id: []) must not stick null on the receiver.
+# Temporary find_by / find_sole_by(id: []) must not stick null on the receiver.
 rel = Article.all.where("1=1")
 raise "find_by empty" unless rel.find_by(id: []).nil?
 raise "find_by sticky" if rel.null_relation?
 raise "find_by still loads" unless rel.to_a.map(&:id).include?(row.id)
+begin
+  rel.find_sole_by(id: [])
+  raise "find_sole_by should raise"
+rescue ActiveRecord::RecordNotFound
+end
+raise "find_sole_by sticky" if rel.null_relation?
 
 # merge(none) adopts null.
 merged = Article.all.where("1=1").merge(Article.none)
