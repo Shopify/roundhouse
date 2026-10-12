@@ -324,4 +324,42 @@ pub const GEM_CATALOG: &[GemClass] = &[
         class_methods: &[("authorize_request", GemTy::Untyped)],
         instance_methods: &[],
     },
+    // pay — Stripe/Braintree/Paddle billing (Jumpstart Pro). First slice:
+    // exception classes for `rescue Pay::Error` / `Pay::ActionRequired`,
+    // and the model class constants for `is_a?(Pay::Charge)` /
+    // `is_a?(Pay::Subscription)`. Not ActiveRecord: `.all` / scopes /
+    // `payment_processor` stay refused. The gem stays **Unknown** in the
+    // census so other Pay::* dispatches (Currency, PaddleClassic, …)
+    // remain gap-attributed notes rather than invented errors. Runtime:
+    // `runtime/ruby/pay.rb` façade (see `apply_pay_demand`).
+    GemClass {
+        name: "Pay",
+        class_methods: &[],
+        instance_methods: &[],
+    },
+    GemClass {
+        name: "Pay::Error",
+        class_methods: &[],
+        instance_methods: &[("message", GemTy::Str), ("to_s", GemTy::Str)],
+    },
+    GemClass {
+        name: "Pay::ActionRequired",
+        class_methods: &[],
+        instance_methods: &[("message", GemTy::Str), ("to_s", GemTy::Str)],
+    },
+    GemClass {
+        name: "Pay::Charge",
+        class_methods: &[],
+        instance_methods: &[],
+    },
+    GemClass {
+        name: "Pay::Subscription",
+        class_methods: &[],
+        instance_methods: &[],
+    },
+    GemClass {
+        name: "Pay::Customer",
+        class_methods: &[],
+        instance_methods: &[],
+    },
 ];

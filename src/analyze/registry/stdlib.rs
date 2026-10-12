@@ -762,7 +762,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // The request family. CRuby builds these as `Net::HTTP::Post.new(…)`
     // and the surface lives on a shared parent; the registry does no
     // inheritance for stdlib classes, so each verb carries it.
-    for verb in ["Get", "Post", "Put", "Delete", "Head"] {
+    // `Patch` is in CRuby's net/http and Spinel's packages/net (same
+    // request-family surface as Put). Jumpstart Pro's ApplicationClient
+    // and every JSON API client that mirrors Rails' patch routes name it.
+    for verb in ["Get", "Post", "Put", "Patch", "Delete", "Head"] {
         register_stdlib_class(classes, &format!("Net::HTTP::{verb}"), &[], &[
             ("body=", Ty::Str), ("body", Ty::Str),
             ("[]=", Ty::Str), ("[]", str_or_nil.clone()),
@@ -770,6 +773,18 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             ("set_form_data", Ty::Str),
             ("method", Ty::Str), ("path", Ty::Str),
         ]);
+    }
+    // Exception classes `rescue *NET_HTTP_ERRORS` names beside Timeout /
+    // Errno / EOFError. CRuby defines them under Net; Spinel's net
+    // package recognizes the same spellings. Registering them clears the
+    // constant refusal without inventing a method surface beyond the
+    // shared exception readers above.
+    for exc in [
+        "Net::HTTPBadResponse",
+        "Net::HTTPHeaderSyntaxError",
+        "Net::ProtocolError",
+    ] {
+        register_stdlib_class(classes, exc, &[], &exception_surface);
     }
     // `Mime::Type` — the class `runtime/ruby/mime.rb` ports from
     // actionpack. `lookup` is deliberately NON-nilable: upstream answers

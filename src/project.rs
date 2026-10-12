@@ -3391,6 +3391,10 @@ fn ruby_family_runtime_files(
     if app_uses_date(app) {
         inject_cruby_date_calendar_boot_requires(&mut files)?;
     }
+    // Re-apply after the gem_facades rewrite above: the CRuby/JRuby
+    // content replaces the spinel-tree file that `apply_pay_demand`
+    // already annotated in `spinel_files`.
+    apply_pay_demand(&mut files, app)?;
     Ok(files)
 }
 
@@ -5778,6 +5782,10 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         // previewer capture. Port for Spinel; CRuby/JRuby swap to the
         // default gem below. BUNDLED also lists Timeout → "timeout".
         "timeout",
+        // `Pay::Error` / `Pay::ActionRequired` + Charge/Subscription/
+        // Customer class constants — Jumpstart Pro / pay gem first slice.
+        // Stripped when the lock has no `pay` (see `apply_pay_demand`).
+        "pay",
         // `I18n.locale` / `default_locale` — the locale campfire folds
         // into its cache keys. Rails' default, `:en`; setting one is
         // not modeled (see the file's header).
@@ -5976,6 +5984,7 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
     apply_spinel_sql_functions(&mut files, app)?;
     apply_pagination_demand(&mut files)?;
     apply_pagy_demand(&mut files, app)?;
+    apply_pay_demand(&mut files, app)?;
     Ok((files, test_stems))
 }
 
@@ -6008,6 +6017,57 @@ fn apply_pagination_demand(files: &mut Vec<(String, String)>) -> Result<(), Stri
             && p != "runtime/action_controller/pagination.rbs"
             && p != "sig/runtime/action_controller/pagination.rbs"
     });
+    Ok(())
+}
+
+/// `runtime/ruby/pay.rb` rides the tree only for an app whose
+/// Gemfile.lock carries `pay`. Without the gem the façade would still
+/// define `Pay::Error`, which is fine for name resolution but wrong for
+/// an app that never asked for billing — strip it the same way pagy is.
+/// With the gem, ensure `gem_facades.rb` loads it (the CRuby/JRuby
+/// rewrite of that file drops the source-tree `require_relative`), and
+/// drop any `require "pay"` that locked-external wiring added: the
+/// gem stays **Unknown** in the census (so Pay::Currency dispatches
+/// stay notes, not invented errors), and the façade is the runtime
+/// half of the first-slice claim (`Pay::Error` / `is_a?(Pay::Charge)`).
+fn apply_pay_demand(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
+    const REQUIRE: &str = "require_relative \"pay\"\n";
+    let has_pay = app.gem_lock.as_ref().is_some_and(|l| l.has("pay"));
+    if !has_pay {
+        if let Some((_, facades)) = files.iter_mut().find(|(p, _)| p == "runtime/gem_facades.rb") {
+            if facades.contains(REQUIRE) {
+                *facades = facades.replacen(REQUIRE, "", 1);
+            }
+        }
+        files.retain(|(p, _)| {
+            p != "runtime/pay.rb"
+                && p != "runtime/pay.rbs"
+                && p != "sig/runtime/pay.rbs"
+        });
+        return Ok(());
+    }
+    if let Some((_, facades)) = files.iter_mut().find(|(p, _)| p == "runtime/gem_facades.rb") {
+        if !facades.contains(REQUIRE) {
+            facades.push_str(REQUIRE);
+        }
+    }
+    // Prefer the façade over Bundler's `pay` gem for this slice.
+    for (path, content) in files.iter_mut() {
+        if path != "boot.rb" && path != "Gemfile" {
+            continue;
+        }
+        let filtered: Vec<&str> = content
+            .lines()
+            .filter(|line| {
+                let t = line.trim();
+                t != "require \"pay\"" && !t.starts_with("gem \"pay\"")
+            })
+            .collect();
+        *content = filtered.join("\n");
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+    }
     Ok(())
 }
 

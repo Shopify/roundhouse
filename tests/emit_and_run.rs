@@ -9,6 +9,8 @@
 mod emit_and_run;
 #[path = "emit_and_run/discard.rs"]
 mod discard;
+#[path = "emit_and_run/pay_exceptions.rs"]
+mod pay_exceptions;
 #[path = "emit_and_run/temporal_index_assign.rs"]
 mod temporal_index_assign;
 #[path = "support/class_attribute.rs"]
