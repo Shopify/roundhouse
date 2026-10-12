@@ -7,6 +7,7 @@ a terminal and a CI job: one command, one exit code.
 
 ```sh
 roundhouse check --continue /path/to/your/rails/app
+roundhouse check --continue --inventory /tmp/app-inventory.json /path/to/your/rails/app
 ```
 
 Nothing is booted and nothing is installed. The analyzer reads
@@ -308,6 +309,21 @@ roundhouse check --unknown-sends /path/to/your/rails/app
 ingest skipped, bucketed by kind, most frequent first, with the files
 it occurred in. This is roundhouse's own to-do list for your app.
 Nothing in it is a problem with your code.
+
+**The hotspot report** — printed with `--continue` by default (opt out
+with `--no-hotspots`, force on with `--hotspots`): ranked error buckets
+for the peel loop. Each bucket has a stable wall identity (for example
+`billing-ivar-@subscription`, `pay-unmodeled`, `engine-route-mount`),
+a count, and up to five examples with `path:line:col`, the diagnostic
+message, and a short source snippet. Survey gaps that name a peel shape
+join the ranking. Warnings stay out: they are the coverage ledger, not
+the worklist.
+
+**`--inventory PATH`** — write the same findings as machine-readable
+JSON (`schema: 1`): summary counts, unknown gems, every diagnostic with
+path/line/code/message/snippet/wall, survey gaps, and the ranked
+`hotspots` array. Personal apps and agents should cluster this file
+instead of scraping stderr.
 
 **The gem census** — printed when there is a `Gemfile.lock`: each
 direct dependency classified as *framework* (Rails and its plumbing),

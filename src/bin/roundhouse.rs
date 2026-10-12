@@ -38,7 +38,7 @@ fn usage() -> &'static str {
 Usage: roundhouse --target LANG [INPUT] [-o OUT]
        roundhouse --site [INPUT] [-o OUT]
        roundhouse --archives LANG,LANG [INPUT] [-o OUT]
-       roundhouse check [--continue] [APP]
+       roundhouse check [--continue] [--inventory PATH] [--hotspots] [APP]
        roundhouse lsp
        roundhouse mcp [APP]
        roundhouse --help | --version
@@ -49,7 +49,8 @@ the multi-target Pages site.
 Subcommands (each takes --help):
   check                Analyze APP (default .) and print the diagnostics;
                        exit 1 on errors. --continue keeps going past
-                       unsupported constructs and prints a punch list.
+                       unsupported constructs, prints a punch list and a
+                       ranked hotspot report. --inventory PATH writes JSON.
   lsp                  Serve the Language Server over stdio.
   mcp                  Serve the MCP tools over stdio for APP (default .).
 
@@ -85,7 +86,8 @@ Examples:
   roundhouse --site                                   # → ./_site/
   roundhouse -t ruby --survey --allow-unsupported ~/git/mastodon
                                                       # partly-covered app
-  roundhouse check --continue ~/git/mastodon          # diagnostics + punch list
+  roundhouse check --continue ~/git/mastodon          # diagnostics + hotspots
+  roundhouse check --continue --inventory /tmp/i.json ~/git/jsp  # JSON worklist
   roundhouse mcp ~/git/campfire                       # an agent's MCP server
 "
 }

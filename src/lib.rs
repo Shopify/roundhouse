@@ -10,6 +10,8 @@ pub mod app;
 pub mod builder;
 pub mod bytecode;
 pub mod catalog;
+/// Machine-readable `roundhouse check` inventory + ranked hotspot report.
+pub mod check_report;
 pub mod diagnostic;
 pub mod dialect;
 pub mod effect;
