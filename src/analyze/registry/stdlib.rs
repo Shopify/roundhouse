@@ -774,18 +774,12 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             ("method", Ty::Str), ("path", Ty::Str),
         ]);
     }
-    // Exception classes `rescue *NET_HTTP_ERRORS` names beside Timeout /
-    // Errno / EOFError. CRuby defines them under Net; Spinel's net
-    // package recognizes the same spellings. Registering them clears the
-    // constant refusal without inventing a method surface beyond the
-    // shared exception readers above.
-    for exc in [
-        "Net::HTTPBadResponse",
-        "Net::HTTPHeaderSyntaxError",
-        "Net::ProtocolError",
-    ] {
-        register_stdlib_class(classes, exc, &[], &exception_surface);
-    }
+    // `Net::ProtocolError` — Spinel's packages/net defines it (with
+    // OpenTimeout / ReadTimeout). `Net::HTTPBadResponse` and
+    // `Net::HTTPHeaderSyntaxError` are CRuby-only; registering them
+    // would quiet `check` and NameError on Spinel (invariant 6). Leave
+    // those as honest constant gaps until Spinel grows them.
+    register_stdlib_class(classes, "Net::ProtocolError", &[], &exception_surface);
     // `Mime::Type` — the class `runtime/ruby/mime.rb` ports from
     // actionpack. `lookup` is deliberately NON-nilable: upstream answers
     // a Type for any well-formed string (symbol nil when unregistered)

@@ -25,7 +25,7 @@ fn net_http_patch_and_error_classes_check_clean() {
         ),
         (
             "app/controllers/homes_controller.rb",
-            "class HomesController < ApplicationController\n  NET_HTTP_ERRORS = [Net::HTTPBadResponse, Net::HTTPHeaderSyntaxError, Net::ProtocolError]\n\n  def show\n    klass = Net::HTTP::Patch\n    begin\n      raise Net::HTTPBadResponse, \"bad\"\n    rescue *NET_HTTP_ERRORS => e\n      render plain: \"#{klass.name}:#{e.class.name}\"\n    end\n  end\nend\n",
+            "class HomesController < ApplicationController\n  def show\n    klass = Net::HTTP::Patch\n    begin\n      raise Net::ProtocolError, \"bad\"\n    rescue Net::ProtocolError => e\n      render plain: \"#{klass.name}:#{e.class.name}\"\n    end\n  end\nend\n",
         ),
     ] {
         let file = root.join(path);
@@ -43,7 +43,63 @@ fn net_http_patch_and_error_classes_check_clean() {
         .collect();
     assert!(
         errors.is_empty(),
-        "Net::HTTP::Patch and Net HTTP exceptions must resolve:\n{errors:#?}"
+        "Net::HTTP::Patch and Net::ProtocolError must resolve:\n{errors:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cruby_only_net_http_exceptions_stay_refused() {
+    let root = std::env::temp_dir().join(format!(
+        "roundhouse-net-http-cruby-only-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    for (path, source) in [
+        (
+            "db/schema.rb",
+            "ActiveRecord::Schema[8.1].define do\n  create_table :articles do |t|\n    t.string :title\n  end\nend\n",
+        ),
+        (
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  get \"/\", to: \"homes#show\"\nend\n",
+        ),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        (
+            "app/clients/application_client.rb",
+            "class ApplicationClient\n  NET_HTTP_ERRORS = [Timeout::Error, Net::HTTPBadResponse, Net::HTTPHeaderSyntaxError, Net::ProtocolError]\nend\n",
+        ),
+        (
+            "app/controllers/homes_controller.rb",
+            "class HomesController < ApplicationController\n  def show\n    render plain: ApplicationClient::NET_HTTP_ERRORS.size.to_s\n  end\nend\n",
+        ),
+    ] {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, source).unwrap();
+    }
+
+    let mut app = ingest_app(&root).expect("ingest");
+    Analyzer::new(&app).analyze(&mut app);
+    let diags = diagnose(&app);
+    let errors: Vec<_> = diags
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        errors.iter().any(|e| e.contains("HTTPBadResponse")),
+        "CRuby-only Net::HTTPBadResponse must stay refused:\n{errors:#?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("HTTPHeaderSyntaxError")),
+        "CRuby-only Net::HTTPHeaderSyntaxError must stay refused:\n{errors:#?}"
     );
     std::fs::remove_dir_all(root).ok();
 }
