@@ -440,8 +440,17 @@ module ActiveRecord
       @where_null = kept_null
       # Clear NullRelation when no forcing clause remains (Thermos M1).
       # Tracked structurally — never by searching SQL text for `1=0`.
-      if @null && !@where_null.any? { |n| n }
-        @null = false
+      # Index walk (not Enumerable#any?) so strict targets keep one
+      # counter while, matching the rest of this file.
+      if @null
+        forced = false
+        wi = 0
+        wn = @where_null.length
+        while wi < wn
+          forced = true if @where_null[wi]
+          wi += 1
+        end
+        @null = false unless forced
       end
       # Retained null must keep the empty cache (`[]`), not `nil`, or a
       # limited `size` path would query again (CodeRabbit).

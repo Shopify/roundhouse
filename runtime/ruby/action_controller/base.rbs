@@ -213,7 +213,9 @@ module ActionController
     def weak_etag_for: (String src) -> String
     def request_if_none_match: () -> String?
     def if_none_match_matches?: (String inm, String tag) -> bool
-    def each_if_none_match_member: (String inm) { (String part) -> void } -> void
+    def if_none_match_parts_match?: (Array[String] parts, Integer i, String want) -> bool
+    def if_none_match_members: (String inm) -> Array[String]
+    def if_none_match_members_at: (String s, Integer i, String buf, bool in_quote, Array[String] out) -> Array[String]
     def normalize_etag: (String value) -> String?
     # Integer SECONDS on every duration-shaped keyword —
     # `lower::duration::rewrite_expires_in` grounds the corpus' `1.year`

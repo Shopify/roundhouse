@@ -1021,37 +1021,45 @@ module ActionController
     def if_none_match_matches?(inm, tag)
       want = normalize_etag(tag)
       return false if want.nil?
-      each_if_none_match_member(inm) do |part|
-        return true if part == "*"
-        got = normalize_etag(part)
-        return true if !got.nil? && got == want
-      end
-      false
+      parts = if_none_match_members(inm)
+      if_none_match_parts_match?(parts, 0, want)
+    end
+
+    def if_none_match_parts_match?(parts, i, want)
+      return false if i >= parts.length
+      part = parts[i]
+      return true if part == "*"
+      got = normalize_etag(part)
+      return true if !got.nil? && got == want
+      if_none_match_parts_match?(parts, i + 1, want)
     end
 
     # Split an If-None-Match list on commas that sit outside quotes so
-    # an opaque-tag like `"a,b"` stays one member.
-    def each_if_none_match_member(inm)
-      s = inm.to_s
-      buf = ""
-      in_quote = false
-      i = 0
-      while i < s.length
-        ch = s[i, 1]
-        if ch == "\""
-          in_quote = !in_quote
-          buf += ch
-        elsif ch == "," && !in_quote
-          part = buf.strip
-          yield part unless part.empty?
-          buf = ""
-        else
-          buf += ch
-        end
-        i += 1
+    # an opaque-tag like `"a,b"` stays one member. Recursion — not a
+    # counter `while`: Elixir while_to_recursion rejects this body's
+    # quote-state / buffer shape (headers are short).
+    def if_none_match_members(inm)
+      if_none_match_members_at(inm.to_s, 0, "", false, [])
+    end
+
+    def if_none_match_members_at(s, i, buf, in_quote, out)
+      if i >= s.length
+        part = buf.strip
+        out << part unless part.empty?
+        return out
       end
-      part = buf.strip
-      yield part unless part.empty?
+      ch = s[i, 1]
+      if ch == "\""
+        nxt = false
+        nxt = true unless in_quote
+        return if_none_match_members_at(s, i + 1, buf + ch, nxt, out)
+      end
+      if ch == "," && !in_quote
+        part = buf.strip
+        out << part unless part.empty?
+        return if_none_match_members_at(s, i + 1, "", false, out)
+      end
+      if_none_match_members_at(s, i + 1, buf + ch, in_quote, out)
     end
 
     # Entity-tag → opaque-tag for weak comparison. Unquoted tokens are
