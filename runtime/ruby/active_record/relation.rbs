@@ -158,6 +158,7 @@ module ActiveRecord
     def merge: (Relation other) -> Relation
     def where_clauses: () -> Array[String]
     def unscope: (?where: Symbol | String | Array[Symbol | String]?) -> Relation
+    def always_false_where?: (String clause) -> bool
     def arel: () -> Arel::SelectManager
     def none: () -> Relation
     def reload: () -> Relation

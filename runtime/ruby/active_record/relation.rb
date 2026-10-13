@@ -422,7 +422,20 @@ module ActiveRecord
       end
       @wheres = kept
       @where_cols = kept_cols
+      # Empty-IN NullRelation is sticky only while its `1=0` contradiction
+      # remains. `none`'s unattributed `(1 = 0)` survives unscope(where:)
+      # (empty where_cols), so `@null` stays; dropping the empty-IN clause
+      # must clear `@null` or terminals stay empty forever (Thermos M1).
+      if @null && !@wheres.any? { |clause| always_false_where?(clause) }
+        @null = false
+      end
       self
+    end
+
+    # `none` / empty-IN contradictions the NullRelation flag tracks.
+    def always_false_where?(clause)
+      s = clause.to_s.gsub(/\s+/, "")
+      s == "1=0" || s == "(1=0)"
     end
 
     # `order` on a LOADED relation sorts the loaded records in memory

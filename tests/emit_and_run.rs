@@ -11117,6 +11117,16 @@ raise "find_sole_by sticky" if rel.null_relation?
 merged = Article.all.where("1=1").merge(Article.none)
 raise "merge null?" unless merged.null_relation?
 assert_no_query("merge.none.ids") { raise "merge ids" unless merged.ids.empty? }
+
+# Empty-IN NullRelation must clear when unscope drops the contradiction
+# (Thermos M1). `none.unscope(where: :id)` stays null — none's (1 = 0)
+# is unattributed.
+restored = Article.where(id: []).unscope(where: :id)
+raise "unscope sticky null?" if restored.null_relation?
+raise "unscope restores rows" unless restored.to_a.map(&:id).include?(row.id)
+still_none = Article.none.unscope(where: :id)
+raise "none unscope null?" unless still_none.null_relation?
+assert_no_query("none.unscope.ids") { raise "none unscope ids" unless still_none.ids.empty? }
 "##,
         )
         .assert_passes();
