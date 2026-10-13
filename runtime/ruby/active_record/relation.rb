@@ -443,6 +443,9 @@ module ActiveRecord
       if @null && !@where_null.any? { |n| n }
         @null = false
       end
+      # Retained null must keep the empty cache (`[]`), not `nil`, or a
+      # limited `size` path would query again (CodeRabbit).
+      unload_records
       self
     end
 

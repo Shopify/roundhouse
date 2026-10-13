@@ -11135,6 +11135,10 @@ raise "unscope restores rows" unless restored.to_a.map(&:id).include?(row.id)
 still_none = Article.none.unscope(where: :id)
 raise "none unscope null?" unless still_none.null_relation?
 assert_no_query("none.unscope.ids") { raise "none unscope ids" unless still_none.ids.empty? }
+assert_no_query("none.limit.unscope.size") {
+  n = Article.none.limit(1).unscope(where: :id).size
+  raise "none limit size #{n}" unless n == 0
+}
 
 # Compound empty-IN keeps null when a sibling where is unscoped away.
 compound = Article.where(id: []).where(title: "NullRel")
