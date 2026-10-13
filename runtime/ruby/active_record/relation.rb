@@ -309,16 +309,9 @@ module ActiveRecord
     # an always-true condition (matches Rails: no filter to OR against).
     def or(other)
       # Rails NullRelation#or: left-null yields the other side; right-null
-      # leaves the receiver; both-null stays null.
-      if @null && !other.null_relation?
-        return other.spawn
-      end
-      if !@null && other.null_relation?
-        return self
-      end
-      if @null && other.null_relation?
-        return self
-      end
+      # (including both-null) leaves the receiver.
+      return other.spawn if @null && !other.null_relation?
+      return self if other.null_relation?
       unload_records
       mine = @wheres.length > 0 ? @wheres.join(" AND ") : "1=1"
       other_wheres = other.where_clauses
@@ -2165,22 +2158,28 @@ module ActiveRecord
     # back 200, complete and well-formed, with an empty message list —
     # which is exactly the failure the app's own tests cannot see.
     #
-    # `add_condition` answers whether it pushed — a nil or empty
-    # condition pushes nothing — so the pop is guarded by that rather
-    # than issued unconditionally.
-    def find_by(conditions)
-      # Borrowed predicate — restore nullness and the load cache so a
-      # temporary `find_by(id: [])` cannot stick NullRelation on the chain.
+    # Borrow a predicate for a terminal (`find_by` / `find_sole_by`):
+    # push via `add_condition`, run the body, then restore `@wheres`,
+    # `@null`, and `@records` so empty IN cannot stick NullRelation and
+    # a loaded relation keeps its memo whether the body returns or raises.
+    def with_borrowed_condition(conditions)
       prior_null = @null
       prior_records = @records
       pushed = add_condition(conditions, [], false)
       begin
-        first
+        yield
       ensure
         pop_where if pushed
         @null = prior_null
         @records = prior_records
       end
+    end
+
+    # `add_condition` answers whether it pushed — a nil or empty
+    # condition pushes nothing — so the pop is guarded by that rather
+    # than issued unconditionally.
+    def find_by(conditions)
+      with_borrowed_condition(conditions) { first }
     end
 
     # `find_by!` — `find_by` that raises `RecordNotFound` on no match.
@@ -2231,33 +2230,11 @@ module ActiveRecord
       rows[0]
     end
 
-    # `find_sole_by(conditions)` — Rails' `where(conditions).sole`. A
-    # terminal, so its predicate is popped as in `find_by`; popped in an
-    # `ensure` because `sole` raises on the two answers that are not one
-    # record, and a caller that rescues must get the relation back as
-    # it was.
-    #
-    # `add_condition` unconditionally clears `@records` — it has no way
-    # to know in advance whether the new predicate still matches a
-    # loaded set — so a relation that was loaded before this call loses
-    # its memo the moment the temporary condition is pushed. The
-    # `ensure` restores the ORIGINAL `@records` saved before that push,
-    # not whatever `sole`'s own probe leaves behind, so a loaded
-    # relation's records are intact afterward whether `sole` returns or
-    # raises.
+    # `find_sole_by(conditions)` — Rails' `where(conditions).sole`.
+    # Shares `with_borrowed_condition` with `find_by` so empty IN cannot
+    # sticky-null the receiver after the sole probe (which may raise).
     def find_sole_by(conditions)
-      # Same borrowed-predicate restore as `find_by` — empty IN must not
-      # stick NullRelation on the receiver after the sole probe.
-      prior_null = @null
-      prior_records = @records
-      pushed = add_condition(conditions, [], false)
-      begin
-        sole
-      ensure
-        pop_where if pushed
-        @null = prior_null
-        @records = prior_records
-      end
+      with_borrowed_condition(conditions) { sole }
     end
 
     # NO `new` HERE, AND NOT BY OVERSIGHT. Rails builds records through

@@ -285,6 +285,7 @@ module ActiveRecord
     def friendly_first: (?String id) -> Base?
     def friendly_history_first: (?String id) -> Base?
     def find_ids: (Array[Integer | Float | String] ids) -> Array[Base]
+    def with_borrowed_condition: (Hash[Symbol, untyped] | String | nil conditions) { () -> untyped } -> untyped
     def find_by: (Hash[Symbol, untyped] | String | nil conditions) -> Base?
     def find_by!: (Hash[Symbol, untyped] | String | nil conditions) -> Base
     def sole: () -> Base
