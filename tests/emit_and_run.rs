@@ -11040,6 +11040,14 @@ post.fresh_when(etag: "abc123", template: false)
 raise "post status #{post.status}" unless post.status == 200
 raise "post etag" unless post.headers["ETag"] == "W/\"abc123\""
 raise "post performed" if post.performed?
+
+# stale? on POST stays stale (true) so `if stale?` still runs the body.
+stale_post = ActionController::Base.new
+stale_post.request = ActionDispatch::Request.new({
+  "REQUEST_METHOD" => "POST",
+  "HTTP_IF_NONE_MATCH" => "W/\"abc123\"",
+})
+raise "stale? post" unless stale_post.stale?(etag: "abc123") == true
 "##
         )
         .assert_passes();
@@ -11127,7 +11135,20 @@ raise "unscope restores rows" unless restored.to_a.map(&:id).include?(row.id)
 still_none = Article.none.unscope(where: :id)
 raise "none unscope null?" unless still_none.null_relation?
 assert_no_query("none.unscope.ids") { raise "none unscope ids" unless still_none.ids.empty? }
-"##,
+
+# Compound empty-IN keeps null when a sibling where is unscoped away.
+compound = Article.where(id: [], title: "NullRel").where("1=1")
+# Cannot unscope :id alone (multi-column hash) — unscope the raw sibling.
+compound2 = Article.where(id: []).where(title: "NullRel")
+raise "compound null?" unless compound2.null_relation?
+kept = compound2.unscope(where: :title)
+raise "compound unscope cleared null?" unless kept.null_relation?
+assert_no_query("compound.unscope.ids") { raise "compound ids" unless kept.ids.empty? }
+
+# preloaded integer ids must not call .id on Fixnum.
+pre = Article.all.preloaded([row.id], true)
+raise "preloaded ids" unless pre.ids == [row.id]
+"##
         )
         .assert_passes();
 }

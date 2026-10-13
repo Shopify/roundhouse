@@ -982,6 +982,10 @@ module ActionController
       return true unless etag.is_a?(String)
       tag = weak_etag_for(etag)
       response.headers["ETag"] = tag
+      # Same GET/HEAD gate as fresh_when — a matching INM on POST must
+      # not report fresh and skip the action body.
+      req = request
+      return true if !req.nil? && req.request_method != "GET" && req.request_method != "HEAD"
       inm = request_if_none_match
       return true if inm.nil?
       !if_none_match_matches?(inm, tag)

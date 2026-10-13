@@ -433,9 +433,10 @@ module ActiveRecord
     end
 
     # `none` / empty-IN contradictions the NullRelation flag tracks.
+    # Empty IN may share a hash clause with other predicates
+    # (`1=0 AND status = …`), so look for the atom rather than exact text.
     def always_false_where?(clause)
-      s = clause.to_s.gsub(/\s+/, "")
-      s == "1=0" || s == "(1=0)"
+      clause.to_s.gsub(/\s+/, "").include?("1=0")
     end
 
     # `order` on a LOADED relation sorts the loaded records in memory
@@ -1973,7 +1974,10 @@ module ActiveRecord
     def ids
       return [] if @null
       cached = @records
-      return cached.map { |row| row.id } unless cached.nil?
+      unless cached.nil?
+        # `preloaded` may seed integer primary keys, not only records.
+        return cached.map { |row| row.is_a?(Base) ? row.id : row }
+      end
       prior = @select_sql
       key = @model.primary_key
       @select_sql = "#{@table}.#{key} AS v"

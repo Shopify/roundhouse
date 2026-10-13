@@ -69,27 +69,21 @@ module ActiveStorage
       out = path + ".poster.png"
       filter = ActiveStorage.video_preview_vf_filter
       bin = ffmpeg_bin
-      # Poster lands in `out`; stdout is unused — redirect it so the
-      # timeout covers process wait, not a copy_stream that can finish
-      # while the child is still alive.
+      # Poster lands in `out`. Use Process.spawn (not IO.popen + out:) so
+      # stdout can be discarded without "fd 1 specified twice", and the
+      # timeout covers the full wait with a killable pid.
       argv = [bin, "-y", "-loglevel", "error", "-i", path, "-vf", filter, "-frames:v", "1", "-f", "image2", out]
       limit = poster_time_limit
       ok = false
-      # Mutable box so a Timeout that fires during popen's wait still
-      # sees the child pid that was written when the process started.
       held = [0]
       begin
         if limit.nil?
-          IO.popen(argv, out: File::NULL, err: File::NULL) do |io|
-            held[0] = io.pid.nil? ? 0 : io.pid
-          end
+          held[0] = Process.spawn(*argv, out: File::NULL, err: File::NULL)
+          Process.wait(held[0])
         else
-          # Cover the full process lifetime, including the wait that
-          # finishes when the IO.popen block returns.
           Timeout.timeout(limit) do
-            IO.popen(argv, out: File::NULL, err: File::NULL) do |io|
-              held[0] = io.pid.nil? ? 0 : io.pid
-            end
+            held[0] = Process.spawn(*argv, out: File::NULL, err: File::NULL)
+            Process.wait(held[0])
           end
         end
         ok = $?.success?
