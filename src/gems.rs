@@ -315,6 +315,7 @@ const FATES: &[(&str, GemFate)] = &[
     ("acts_as_votable", GemFate::Modeled), // ingest/acts_as_votable: ActsAsVotable::Vote on `votes`; acts_as_votable/acts_as_voter macros -> votes_for/votes + vote_by/liked_by/unvote_by/update_cached_votes (not vote_up_for/get_voted/association extensions)
     ("addressable", GemFate::Modeled), // catalog/gems: Addressable::URI
     ("bcrypt", GemFate::Modeled),      // catalog/gems: BCrypt::*; has_secure_password
+    ("commonmarker", GemFate::Modeled), // catalog/gems: Commonmarker, Commonmarker::Node
     ("devise", GemFate::Modeled), // helpers; devise_for = static 4 mappings (not model-module-driven); no Warden route guards
     ("discard", GemFate::Modeled),     // ingest/discard: include Discard::Model -> scopes + predicates + discard/undiscard (not discard_all/undiscard_all); Relation#unscope(where:)
     ("faker", GemFate::Modeled),       // catalog/gems: Faker::*
@@ -322,6 +323,7 @@ const FATES: &[(&str, GemFate)] = &[
     ("geared_pagination", GemFate::Modeled), // registry/controllers: set_page_and_extract_portion_from
     ("htmlentities", GemFate::Modeled), // catalog/gems: HTMLEntities
     ("image_processing", GemFate::Modeled), // active_storage variants seam
+    ("inertia_rails", GemFate::Modeled), // ingest/inertia: render inertia:, inertia_share; runtime action_controller/inertia
     ("invisible_captcha", GemFate::Modeled), // before_action + spam? on subtitle honeypot only
     ("kaminari", GemFate::Modeled),    // Relation#page / per / paginate
     ("mail", GemFate::Modeled),        // catalog/gems: Mail::Address; ActionMailer
@@ -994,6 +996,7 @@ BUNDLED WITH
         assert_eq!(fate_of("rubocop-rails"), GemFate::Infrastructure);
         assert_eq!(fate_of("opentelemetry-instrumentation-pg"), GemFate::Infrastructure);
         assert_eq!(fate_of("never-heard-of-it"), GemFate::Unknown);
+        assert_eq!(fate_of("inertia_rails"), GemFate::Modeled);
         assert_eq!(namespace_of("front_matter_parser"), "FrontMatterParser");
         assert_eq!(namespace_of("aws-sdk-s3"), "Aws");
         assert_eq!(namespace_of("rubyzip"), "Zip");

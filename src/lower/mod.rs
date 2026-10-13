@@ -94,6 +94,7 @@ pub mod attachable;
 pub mod attachables_grep;
 pub mod errors_index;
 pub mod job_class_side;
+pub mod job_payload;
 pub mod mailer_class_side;
 pub mod as_json_shape;
 pub mod as_json_writer;
