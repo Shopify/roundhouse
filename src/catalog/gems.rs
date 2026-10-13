@@ -359,12 +359,12 @@ pub const GEM_CATALOG: &[GemClass] = &[
     // exception classes for `rescue Pay::Error` / `Pay::ActionRequired`,
     // and the model class constants for `is_a?(Pay::Charge)` /
     // `is_a?(Pay::Subscription)`. Not ActiveRecord: `.all` / scopes /
-    // `payment_processor` stay **errors** (attribution must not
-    // downgrade sends on these façades — see `partial_pay_model_facade`).
-    // The gem stays **Unknown** in the census so *other* Pay::* names
-    // (Currency, PaddleClassic, …) remain gap-attributed notes rather
-    // than invented errors. Runtime: `runtime/ruby/pay.rb` façade
-    // (see `apply_pay_demand`).
+    // `payment_processor` stay **errors** (attribution skips
+    // unknown-gem downgrade for any `GEM_CATALOG` receiver — see
+    // `catalogued_class_receiver`). The gem stays **Unknown** in the
+    // census so *other* Pay::* names (Currency, PaddleClassic, …)
+    // remain gap-attributed notes rather than invented errors.
+    // Runtime: `runtime/ruby/pay.rb` façade (see `apply_pay_demand`).
     GemClass {
         name: "Pay",
         class_methods: &[],

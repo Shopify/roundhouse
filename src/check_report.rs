@@ -23,10 +23,11 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::diagnostic::{Diagnostic, Severity};
+use crate::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 use crate::gems::GemCensus;
 use crate::ingest::IngestError;
 use crate::span::SourceFile;
+use crate::ty::Ty;
 
 const HOTSPOT_EXAMPLE_LIMIT: usize = 5;
 const SNIPPET_MAX_CHARS: usize = 160;
@@ -211,7 +212,7 @@ pub fn render_hotspots(inventory: &CheckInventory) -> String {
 fn item_from_diagnostic(d: &Diagnostic, sources: &[SourceFile], app_root: &Path) -> InventoryItem {
     let (path, line, column, snippet) = resolve_location(d, sources, app_root);
     let message = strip_app_prefix(&d.message, app_root);
-    let wall = suggested_wall(d.code(), &message, &path);
+    let wall = wall_for_diagnostic(d, &path);
     InventoryItem {
         severity: severity_name(d.severity),
         code: d.code().to_string(),
@@ -233,7 +234,7 @@ fn item_from_survey(gap: &IngestError, app_root: &Path) -> InventoryItem {
     };
     let path = relative_path(app_root, &file);
     let message = strip_app_prefix(&message, app_root);
-    let wall = suggested_wall("survey_gap", &message, &path);
+    let wall = wall_for_survey(&message, &path);
     InventoryItem {
         severity: "survey",
         code: "survey_gap".into(),
@@ -354,114 +355,148 @@ fn rank_hotspots(errors: Vec<InventoryItem>, survey_gaps: &[InventoryItem]) -> V
     hotspots
 }
 
-/// Suggested wall slug for a diagnostic. Prefer recurring JSP / personal-app
-/// shapes; fall back to code + a short message shape.
-pub fn suggested_wall(code: &str, message: &str, path: &str) -> Option<String> {
-    if code == "ivar_unresolved" {
-        if let Some(name) = ivar_name(message) {
-            let billing = matches!(
-                name.as_str(),
-                "@subscription"
-                    | "@subscriptions"
-                    | "@plan"
-                    | "@current_plan"
-                    | "@invoice"
-                    | "@stripe_invoice"
-                    | "@payment_processor"
-                    | "@charge"
-                    | "@charges"
-                    | "@checkout_session"
-            );
-            if billing {
-                return Some(format!("billing-ivar-{name}"));
-            }
-            return Some(format!("ivar-{name}"));
+/// Wall identity from structured [`DiagnosticKind`] fields. Analyze
+/// diagnostics must not scrape `message` — peels grow kinds, not English.
+fn wall_for_diagnostic(d: &Diagnostic, path: &str) -> Option<String> {
+    match &d.kind {
+        DiagnosticKind::IvarUnresolved { name } => Some(ivar_wall(name.as_str())),
+        DiagnosticKind::Unsupported { construct, detail, .. } => {
+            wall_from_unsupported(construct.as_str(), detail, path)
         }
+        DiagnosticKind::SendDispatchFailed { method, recv_ty } => {
+            wall_from_send(method.as_str(), recv_ty, path)
+        }
+        _ => None,
     }
-    if code == "unsupported" || code == "survey_gap" {
-        if message.contains("unmodeled gem `pay`") || message.contains("Pay::") {
-            return Some("pay-unmodeled".into());
+}
+
+/// Survey gaps have no [`DiagnosticKind`] — message heuristics only here.
+fn wall_for_survey(message: &str, path: &str) -> Option<String> {
+    wall_from_unsupported_text(message, path).or_else(|| {
+        if let Some(name) = constant_fqn_from_text(message) {
+            Some(unsupported_constant_wall(&name))
+        } else {
+            None
         }
-        if message.contains("route mount") || message.contains("only top-level literal engine mounts")
-        {
-            return Some("engine-route-mount".into());
-        }
-        if path.contains("application_client")
-            || message.contains("Net::HTTP")
-            || message.contains("Net::Protocol")
-        {
-            return Some("application-client-net-http".into());
-        }
-        if message.contains("generated column") || message.contains("PostgreSQL cast") {
-            return Some("schema-generated-cast".into());
-        }
-        if message.contains("rate_limit") {
-            return Some("controller-macro-rate-limit".into());
-        }
-        if let Some(name) = unsupported_constant_name(message) {
-            // Keep `::` as `-` so the slug stays path-safe / URL-safe
-            // while preserving the full nested constant identity
-            // (`Net::HTTP::Patch` → `unsupported-constant-Net-HTTP-Patch`).
-            let slug = name.replace("::", "-");
-            return Some(format!("unsupported-constant-{slug}"));
-        }
+    })
+}
+
+fn ivar_wall(name: &str) -> String {
+    let at = if name.starts_with('@') {
+        name.to_string()
+    } else {
+        format!("@{name}")
+    };
+    let billing = matches!(
+        at.as_str(),
+        "@subscription"
+            | "@subscriptions"
+            | "@plan"
+            | "@current_plan"
+            | "@invoice"
+            | "@stripe_invoice"
+            | "@payment_processor"
+            | "@charge"
+            | "@charges"
+            | "@checkout_session"
+    );
+    if billing {
+        format!("billing-ivar-{at}")
+    } else {
+        format!("ivar-{at}")
     }
-    if code == "send_dispatch_failed" {
-        if message.contains("Noticed::") || path.contains("notification") {
-            return Some("noticed-relation-api".into());
-        }
-        if message.contains("payment_processor") {
-            return Some("pay-payment-processor".into());
+}
+
+fn wall_from_unsupported(construct: &str, detail: &str, path: &str) -> Option<String> {
+    if let Some(wall) = wall_from_unsupported_text(construct, path)
+        .or_else(|| wall_from_unsupported_text(detail, path))
+    {
+        return Some(wall);
+    }
+    if construct == "constant" {
+        if let Some(name) = constant_fqn_from_detail(detail) {
+            return Some(unsupported_constant_wall(&name));
         }
     }
     None
 }
 
-fn ivar_name(message: &str) -> Option<String> {
-    // "@subscription has no known type"
-    let trimmed = message.trim_start();
-    if let Some(rest) = trimmed.strip_prefix('@') {
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if !name.is_empty() {
-            return Some(format!("@{name}"));
-        }
+/// Shared peel-shaped heuristics over free text (unsupported construct /
+/// detail, or survey-gap messages).
+fn wall_from_unsupported_text(text: &str, path: &str) -> Option<String> {
+    if text.contains("unmodeled gem `pay`") || text.contains("Pay::") {
+        return Some("pay-unmodeled".into());
+    }
+    if text.contains("route mount") || text.contains("only top-level literal engine mounts") {
+        return Some("engine-route-mount".into());
+    }
+    if path.contains("application_client")
+        || text.contains("Net::HTTP")
+        || text.contains("Net::Protocol")
+    {
+        return Some("application-client-net-http".into());
+    }
+    if text.contains("generated column") || text.contains("PostgreSQL cast") {
+        return Some("schema-generated-cast".into());
+    }
+    if text.contains("rate_limit") {
+        return Some("controller-macro-rate-limit".into());
     }
     None
 }
 
-/// Extract a fully-qualified constant from
-/// `constant not supported (all targets): Net::HTTP::Patch — …`.
-/// Prefer the longest `A::B::C` token after the last `): `, not a raw
-/// `:`-split that collapses nested constants to the last segment.
-fn unsupported_constant_name(message: &str) -> Option<String> {
-    if !message.starts_with("constant not supported") {
-        return None;
+fn wall_from_send(method: &str, recv_ty: &Ty, path: &str) -> Option<String> {
+    let recv = match recv_ty {
+        Ty::Class { id, .. } => id.0.as_str(),
+        _ => "",
+    };
+    if recv.starts_with("Noticed::") || path.contains("notification") {
+        return Some("noticed-relation-api".into());
     }
-    let after_paren = message
-        .rsplit_once("): ")
-        .map(|(_, rest)| rest)
-        .unwrap_or_else(|| {
-            message
-                .strip_prefix("constant not supported")
-                .unwrap_or(message)
-                .trim_start_matches([' ', ':', '-'])
-        });
-    let candidate = after_paren
+    if method == "payment_processor" || recv.contains("payment_processor") {
+        return Some("pay-payment-processor".into());
+    }
+    None
+}
+
+fn unsupported_constant_wall(name: &str) -> String {
+    // Keep `::` as `-` so the slug stays path-safe / URL-safe while
+    // preserving nested constant identity
+    // (`Net::HTTP::Patch` → `unsupported-constant-Net-HTTP-Patch`).
+    format!("unsupported-constant-{}", name.replace("::", "-"))
+}
+
+/// FQN from an unsupported-constant *detail* (`Pay::Error — …`).
+fn constant_fqn_from_detail(detail: &str) -> Option<String> {
+    let candidate = detail
         .split(" — ")
         .next()
-        .unwrap_or(after_paren)
+        .unwrap_or(detail)
         .split_whitespace()
         .next()
         .unwrap_or("")
         .trim()
         .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != ':' && c != '_');
+    normalize_constant_fqn(candidate)
+}
+
+/// FQN from a full survey / legacy message
+/// (`constant not supported (all targets): Net::HTTP::Patch — …`).
+fn constant_fqn_from_text(message: &str) -> Option<String> {
+    if !message.contains("constant not supported") {
+        return None;
+    }
+    let after_paren = message
+        .rsplit_once("): ")
+        .map(|(_, rest)| rest)
+        .unwrap_or(message);
+    constant_fqn_from_detail(after_paren)
+}
+
+fn normalize_constant_fqn(candidate: &str) -> Option<String> {
     if candidate.is_empty() {
         return None;
     }
-    // Require at least one CamelCase segment; allow nested `Foo::Bar`.
     if !candidate
         .split("::")
         .all(|part| !part.is_empty() && part.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
@@ -489,22 +524,43 @@ mod tests {
 
     #[test]
     fn billing_ivar_gets_a_stable_wall_slug() {
+        let d = Diagnostic {
+            span: Span {
+                file: FileId(1),
+                start: 0,
+                end: 1,
+            },
+            kind: DiagnosticKind::IvarUnresolved {
+                name: Symbol::from("subscription"),
+            },
+            severity: Severity::Error,
+            message: "@subscription has no known type".into(),
+        };
         assert_eq!(
-            suggested_wall("ivar_unresolved", "@subscription has no known type", "x.rb")
-                .as_deref(),
+            wall_for_diagnostic(&d, "x.rb").as_deref(),
             Some("billing-ivar-@subscription")
         );
     }
 
     #[test]
     fn pay_constant_maps_to_pay_unmodeled() {
+        let d = Diagnostic {
+            span: Span {
+                file: FileId(1),
+                start: 0,
+                end: 1,
+            },
+            kind: DiagnosticKind::Unsupported {
+                target: None,
+                construct: Symbol::from("constant"),
+                detail: "Pay::Error — unmodeled gem `pay`".into(),
+            },
+            severity: Severity::Error,
+            message: "constant not supported (all targets): Pay::Error — unmodeled gem `pay`"
+                .into(),
+        };
         assert_eq!(
-            suggested_wall(
-                "unsupported",
-                "constant not supported (all targets): Pay::Error — unmodeled gem `pay`",
-                "app/controllers/checkouts_controller.rb"
-            )
-            .as_deref(),
+            wall_for_diagnostic(&d, "app/controllers/checkouts_controller.rb").as_deref(),
             Some("pay-unmodeled")
         );
     }
@@ -512,22 +568,37 @@ mod tests {
     #[test]
     fn nested_unsupported_constant_keeps_fqn_in_wall_slug() {
         // Net::HTTP* still maps to the application-client wall when the
-        // message names the family; use an unrelated nested constant so
+        // detail names the family; use an unrelated nested constant so
         // the FQN slug path is what we assert.
+        let d = Diagnostic {
+            span: Span {
+                file: FileId(1),
+                start: 0,
+                end: 1,
+            },
+            kind: DiagnosticKind::Unsupported {
+                target: None,
+                construct: Symbol::from("constant"),
+                detail: "OmniAuth::Strategies::Developer — unmodeled gem `omniauth`".into(),
+            },
+            severity: Severity::Error,
+            message:
+                "constant not supported (all targets): OmniAuth::Strategies::Developer — unmodeled gem `omniauth`"
+                    .into(),
+        };
         assert_eq!(
-            suggested_wall(
-                "unsupported",
-                "constant not supported (all targets): OmniAuth::Strategies::Developer — unmodeled gem `omniauth`",
-                "app/controllers/sessions_controller.rb"
-            )
-            .as_deref(),
+            wall_for_diagnostic(&d, "app/controllers/sessions_controller.rb").as_deref(),
             Some("unsupported-constant-OmniAuth-Strategies-Developer")
         );
         assert_eq!(
-            unsupported_constant_name(
+            constant_fqn_from_text(
                 "constant not supported (all targets): Net::HTTP::Patch — missing stdlib surface"
             )
             .as_deref(),
+            Some("Net::HTTP::Patch")
+        );
+        assert_eq!(
+            constant_fqn_from_detail("Net::HTTP::Patch — missing stdlib surface").as_deref(),
             Some("Net::HTTP::Patch")
         );
     }
