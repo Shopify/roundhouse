@@ -8,7 +8,7 @@ module ActiveStorage
   def self.variable_content_types: () -> Array[String]
   def self.variable_content_type?: (String content_type) -> bool
   # Executable locations (`:ffmpeg`, `:ffprobe`, …). Values are path strings.
-  @paths: Hash[Symbol, String]?
+  self.@paths: Hash[Symbol, String]?
   def self.paths: () -> Hash[Symbol, String]
   def self.paths=: (Hash[Symbol, String] value) -> Hash[Symbol, String]
   def self.video_preview_arguments: () -> String

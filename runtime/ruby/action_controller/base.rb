@@ -969,6 +969,9 @@ module ActionController
       return if etag_src.nil?
       tag = weak_etag_for(etag_src)
       response.headers["ETag"] = tag
+      # RFC 9110 §15.4.5: 304 is only for conditional GET/HEAD.
+      req = request
+      return if !req.nil? && req.request_method != "GET" && req.request_method != "HEAD"
       inm = request_if_none_match
       return if inm.nil?
       head(:not_modified) if if_none_match_matches?(inm, tag)
@@ -1012,23 +1015,51 @@ module ActionController
     end
 
     def if_none_match_matches?(inm, tag)
-      return true if inm.strip == "*"
       want = normalize_etag(tag)
-      inm.split(",").each do |part|
-        return true if normalize_etag(part) == want
+      return false if want.nil?
+      each_if_none_match_member(inm) do |part|
+        return true if part == "*"
+        got = normalize_etag(part)
+        return true if !got.nil? && got == want
       end
       false
     end
 
+    # Split an If-None-Match list on commas that sit outside quotes so
+    # an opaque-tag like `"a,b"` stays one member.
+    def each_if_none_match_member(inm)
+      s = inm.to_s
+      buf = ""
+      in_quote = false
+      i = 0
+      while i < s.length
+        ch = s[i, 1]
+        if ch == "\""
+          in_quote = !in_quote
+          buf += ch
+        elsif ch == "," && !in_quote
+          part = buf.strip
+          yield part unless part.empty?
+          buf = ""
+        else
+          buf += ch
+        end
+        i += 1
+      end
+      part = buf.strip
+      yield part unless part.empty?
+    end
+
+    # Entity-tag → opaque-tag for weak comparison. Unquoted tokens are
+    # not validators and never match.
     def normalize_etag(value)
       s = value.to_s.strip
+      return "*" if s == "*"
       if s.length >= 2 && (s[0, 2] == "W/" || s[0, 2] == "w/")
-        s = s[2, s.length].to_s
+        s = s[2, s.length].to_s.strip
       end
-      if s.length >= 2 && s[0, 1] == "\"" && s[s.length - 1, 1] == "\""
-        s = s[1, s.length - 2].to_s
-      end
-      s
+      return nil unless s.length >= 2 && s[0, 1] == "\"" && s[s.length - 1, 1] == "\""
+      s[1, s.length - 2].to_s
     end
 
     # `expires_in 1.year, public: true` — Rails' Cache-Control writer,

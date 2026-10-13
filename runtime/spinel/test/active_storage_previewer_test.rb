@@ -48,7 +48,7 @@ class ActiveStoragePreviewerTest < Minitest::Test
     skip "ffmpeg not installed" unless FFMPEG
     path = File.join(Dir.tmpdir, "roundhouse-previewer-#{$$}.txt")
     File.write(path, "not a video")
-    e = assert_raises(RuntimeError) { ActiveStorage::Previewer.poster(path) }
+    e = assert_raises(ActiveStorage::PreviewError) { ActiveStorage::Previewer.poster(path) }
     assert_match(/could not draw a poster/, e.message)
   ensure
     File.delete(path) if File.exist?(path)

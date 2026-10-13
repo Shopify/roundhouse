@@ -113,7 +113,7 @@ module ActionController
     def self.allow_forgery_protection=: (bool) -> void
     # `attr_accessor` produces getter+setter pairs for each name.
     # `params` is a String-keyed Hash whose values are recursive
-    # `Roundhouse::ParamValue` — String leaves, nested Hashes, and
+    # `Roundhouse::ParamValue` — JSON scalar leaves, nested Hashes, and
     # Arrays (Rails-shape `comment[author][name]=x`, `tags[]=a`).
     # Each target's runtime declares its own recursive realization
     # (`runtime/crystal/param_value.cr`, `runtime/typescript/
@@ -213,7 +213,8 @@ module ActionController
     def weak_etag_for: (String src) -> String
     def request_if_none_match: () -> String?
     def if_none_match_matches?: (String inm, String tag) -> bool
-    def normalize_etag: (String value) -> String
+    def each_if_none_match_member: (String inm) { (String part) -> void } -> void
+    def normalize_etag: (String value) -> String?
     # Integer SECONDS on every duration-shaped keyword —
     # `lower::duration::rewrite_expires_in` grounds the corpus' `1.year`
     # / `1.week` / `stale_while_revalidate: 30.seconds` /

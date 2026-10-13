@@ -53,34 +53,58 @@ module ActiveStorage
       nil
     end
 
+    def self.reap_ffmpeg(pid)
+      return if pid == 0
+      begin
+        Process.kill(:KILL, pid)
+      rescue Errno::ESRCH
+      end
+      begin
+        Process.wait(pid)
+      rescue Errno::ECHILD
+      end
+    end
+
     def self.poster(path)
       out = path + ".poster.png"
       filter = ActiveStorage.video_preview_vf_filter
       bin = ffmpeg_bin
+      # Poster lands in `out`; stdout is unused — redirect it so the
+      # timeout covers process wait, not a copy_stream that can finish
+      # while the child is still alive.
       argv = [bin, "-y", "-loglevel", "error", "-i", path, "-vf", filter, "-frames:v", "1", "-f", "image2", out]
       limit = poster_time_limit
       ok = false
+      # Mutable box so a Timeout that fires during popen's wait still
+      # sees the child pid that was written when the process started.
+      held = [0]
       begin
-        IO.popen(argv, err: File::NULL) do |io|
-          begin
-            if limit.nil?
-              IO.copy_stream(io, File::NULL)
-            else
-              Timeout.timeout(limit) { IO.copy_stream(io, File::NULL) }
+        if limit.nil?
+          IO.popen(argv, out: File::NULL, err: File::NULL) do |io|
+            held[0] = io.pid.nil? ? 0 : io.pid
+          end
+        else
+          # Cover the full process lifetime, including the wait that
+          # finishes when the IO.popen block returns.
+          Timeout.timeout(limit) do
+            IO.popen(argv, out: File::NULL, err: File::NULL) do |io|
+              held[0] = io.pid.nil? ? 0 : io.pid
             end
-          rescue Timeout::Error
-            Process.kill(:KILL, io.pid) if io.pid
-            raise ActiveStorage::PreviewError,
-                  "#{bin} took longer than #{limit} seconds"
           end
         end
         ok = $?.success?
+      rescue Timeout::Error
+        reap_ffmpeg(held[0])
+        raise ActiveStorage::PreviewError,
+              "#{bin} took longer than #{limit} seconds"
       rescue Errno::ENOENT
-        raise "ActiveStorage::Previewer: ffmpeg could not draw a poster for " + path +
+        raise ActiveStorage::PreviewError,
+              "ActiveStorage::Previewer: ffmpeg could not draw a poster for " + path +
               " — is ffmpeg installed?"
       end
       if !ok || !File.exist?(out)
-        raise "ActiveStorage::Previewer: ffmpeg could not draw a poster for " + path +
+        raise ActiveStorage::PreviewError,
+              "ActiveStorage::Previewer: ffmpeg could not draw a poster for " + path +
               " — is ffmpeg installed?"
       end
       png = File.binread(out)
