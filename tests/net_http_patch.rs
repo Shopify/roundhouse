@@ -49,7 +49,11 @@ fn net_http_patch_and_error_classes_check_clean() {
 }
 
 #[test]
-fn cruby_only_net_http_exceptions_stay_refused() {
+fn cruby_only_http_header_syntax_error_stays_refused() {
+    // `Net::HTTPBadResponse` is registered on main (Lobsters / Sponge) and
+    // Spinel-ledgers via `unavailable_class_module_construct`. Header
+    // syntax stays an honest constant gap until Spinel grows it
+    // (invariant 6) — Jumpstart Pro still names it in NET_HTTP_ERRORS.
     let root = std::env::temp_dir().join(format!(
         "roundhouse-net-http-cruby-only-{}-{}",
         std::process::id(),
@@ -94,8 +98,8 @@ fn cruby_only_net_http_exceptions_stay_refused() {
         .map(|d| d.message.clone())
         .collect();
     assert!(
-        errors.iter().any(|e| e.contains("HTTPBadResponse")),
-        "CRuby-only Net::HTTPBadResponse must stay refused:\n{errors:#?}"
+        !errors.iter().any(|e| e.contains("HTTPBadResponse")),
+        "Net::HTTPBadResponse is registered (main) + Spinel-ledgers:\n{errors:#?}"
     );
     assert!(
         errors.iter().any(|e| e.contains("HTTPHeaderSyntaxError")),

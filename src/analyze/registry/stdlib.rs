@@ -794,10 +794,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ]);
     }
     // `Net::ProtocolError` — Spinel's packages/net defines it (with
-    // OpenTimeout / ReadTimeout). `Net::HTTPBadResponse` and
-    // `Net::HTTPHeaderSyntaxError` are CRuby-only; registering them
-    // would quiet `check` and NameError on Spinel (invariant 6). Leave
-    // those as honest constant gaps until Spinel grows them.
+    // OpenTimeout / ReadTimeout). `Net::HTTPBadResponse` is registered
+    // above for Lobsters and Spinel-ledgers via
+    // `unavailable_class_module_construct`. `Net::HTTPHeaderSyntaxError`
+    // stays a CRuby-only constant gap until Spinel grows it (invariant 6).
     register_stdlib_class(classes, "Net::ProtocolError", &[], &exception_surface);
     // `Mime::Type` — the class `runtime/ruby/mime.rb` ports from
     // actionpack. `lookup` is deliberately NON-nilable: upstream answers
