@@ -31,6 +31,7 @@ module ActiveRecord
     def take_query_lists: (
         Array[String] wheres,
         Array[Array[String]] where_cols,
+        Array[bool] where_null,
         Array[String] joins,
         Array[String] orders,
         Array[String] groups,
@@ -40,6 +41,7 @@ module ActiveRecord
         Hash[Symbol, untyped] attrs
       ) -> Relation
     def copy_string_list: (Array[String] xs) -> Array[String]
+    def copy_bool_list: (Array[bool] xs) -> Array[bool]
     def copy_cols_list: (Array[Array[String]] xs) -> Array[Array[String]]
     def copy_symbol_list: (Array[Symbol | Hash[Symbol, Symbol]] xs) -> Array[Symbol | Hash[Symbol, Symbol]]
     def copy_scope_attributes: (Hash[Symbol, untyped] attrs) -> Hash[Symbol, untyped]
@@ -77,6 +79,7 @@ module ActiveRecord
     # type — the same trap `Base`'s `@errors` documents.
     @scope_attributes: Hash[Symbol, untyped]
     @where_cols: Array[Array[String]]
+    @where_null: Array[bool]
     @hash_columns: Array[String]
     def hash_column_name: (String col) -> String
     @opaque_wheres: bool
@@ -88,7 +91,7 @@ module ActiveRecord
     def without: (*untyped records) -> Relation
     def or: (Relation other) -> Relation
     def push_where: (String sql) -> Relation
-    def push_where_cols: (String sql, Array[String] cols) -> Relation
+    def push_where_cols: (String sql, Array[String] cols, ?bool null_clause) -> Relation
     def pop_where: () -> String?
     def add_condition: (Hash[String | Symbol, untyped] | String | nil condition, Array[untyped] args, bool negate) -> bool
     def order: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation
@@ -158,7 +161,6 @@ module ActiveRecord
     def merge: (Relation other) -> Relation
     def where_clauses: () -> Array[String]
     def unscope: (?where: Symbol | String | Array[Symbol | String]?) -> Relation
-    def always_false_where?: (String clause) -> bool
     def arel: () -> Arel::SelectManager
     def none: () -> Relation
     def reload: () -> Relation

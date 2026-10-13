@@ -79,6 +79,10 @@ module ActiveRecord
       @records = nil
       @scope_attributes = {}
       @where_cols = []
+      # Parallel to `@wheres`: true when that clause forced NullRelation
+      # (`none` / empty IN). Unscope clears `@null` only when none remain —
+      # never by scanning SQL text (a value like title "1=0" must not stick).
+      @where_null = []
       @opaque_wheres = false
       @hash_columns = []
       @from = nil
@@ -140,6 +144,7 @@ module ActiveRecord
         take_query_lists(
           @wheres,
           @where_cols,
+          @where_null,
           @joins,
           @orders,
           @groups,
@@ -154,9 +159,10 @@ module ActiveRecord
 
     # List accumulators go through copy_* so inference types the
     # parameters. Scalars come from `clone` (shallow ivar copy).
-    def take_query_lists(wheres, where_cols, joins, orders, groups, havings, ctes, includes, attrs)
+    def take_query_lists(wheres, where_cols, where_null, joins, orders, groups, havings, ctes, includes, attrs)
       @wheres = copy_string_list(wheres)
       @where_cols = copy_cols_list(where_cols)
+      @where_null = copy_bool_list(where_null)
       @joins = copy_string_list(joins)
       @orders = copy_string_list(orders)
       @groups = copy_string_list(groups)
@@ -168,6 +174,12 @@ module ActiveRecord
     end
 
     def copy_string_list(xs)
+      out = []
+      xs.each { |x| out << x }
+      out
+    end
+
+    def copy_bool_list(xs)
       out = []
       xs.each { |x| out << x }
       out
@@ -319,6 +331,7 @@ module ActiveRecord
       @opaque_wheres = true
       @wheres = ["((#{mine}) OR (#{theirs}))"]
       @where_cols = [[]]
+      @where_null = [false]
       self
     end
 
@@ -338,32 +351,32 @@ module ActiveRecord
       end
       return false if sql == ""
       clause = negate ? "NOT (#{sql})" : "(#{sql})"
-      push_where_cols(clause, @hash_columns)
+      empty_in = !negate && condition.is_a?(Hash) && hash_has_empty_in?(condition)
+      push_where_cols(clause, @hash_columns, empty_in)
       # Empty IN is NullRelation only on a lasting positive where — never
       # under `not` / temporary find_by·exists? (those restore via caller).
-      if !negate && condition.is_a?(Hash) && hash_has_empty_in?(condition)
-        mark_null!
-      end
+      mark_null! if empty_in
       true
     end
 
-    # `@wheres` and `@where_cols` are parallel lists: entry i of the
-    # second names the columns a hash-built clause i constrains (empty
-    # for raw SQL, `or` composites, merged clauses). Every push and pop
-    # goes through these two so the lists cannot drift apart, and
-    # `unscope(where:)` reads the columns by position -- never by
-    # matching clause text, which a raw string can equal.
+    # `@wheres`, `@where_cols`, and `@where_null` are parallel lists:
+    # entry i of cols names the columns a hash-built clause i constrains
+    # (empty for raw SQL / `or` / merge); `@where_null[i]` is true when
+    # that clause forced NullRelation. Every push and pop goes through
+    # these so the lists cannot drift apart.
     def push_where(sql)
-      push_where_cols(sql, [])
+      push_where_cols(sql, [], false)
     end
 
-    def push_where_cols(sql, cols)
+    def push_where_cols(sql, cols, null_clause = false)
       @wheres << sql
       @where_cols << cols.map { |c| c }
+      @where_null << null_clause
       self
     end
 
     def pop_where
+      @where_null.pop
       @where_cols.pop
       @wheres.pop
     end
@@ -399,6 +412,7 @@ module ActiveRecord
       end
       kept = []
       kept_cols = []
+      kept_null = []
       @wheres.each_with_index do |clause, idx|
         cols = @where_cols[idx]
         hit = false
@@ -418,25 +432,18 @@ module ActiveRecord
         unless hit
           kept << clause
           kept_cols << cols
+          kept_null << @where_null[idx]
         end
       end
       @wheres = kept
       @where_cols = kept_cols
-      # Empty-IN NullRelation is sticky only while its `1=0` contradiction
-      # remains. `none`'s unattributed `(1 = 0)` survives unscope(where:)
-      # (empty where_cols), so `@null` stays; dropping the empty-IN clause
-      # must clear `@null` or terminals stay empty forever (Thermos M1).
-      if @null && !@wheres.any? { |clause| always_false_where?(clause) }
+      @where_null = kept_null
+      # Clear NullRelation when no forcing clause remains (Thermos M1).
+      # Tracked structurally — never by searching SQL text for `1=0`.
+      if @null && !@where_null.any? { |n| n }
         @null = false
       end
       self
-    end
-
-    # `none` / empty-IN contradictions the NullRelation flag tracks.
-    # Empty IN may share a hash clause with other predicates
-    # (`1=0 AND status = …`), so look for the atom rather than exact text.
-    def always_false_where?(clause)
-      clause.to_s.gsub(/\s+/, "").include?("1=0")
     end
 
     # `order` on a LOADED relation sorts the loaded records in memory
@@ -1004,7 +1011,7 @@ module ActiveRecord
     def none
       own_lists
       unload_records
-      push_where("(1 = 0)")
+      push_where_cols("(1 = 0)", [], true)
       mark_null!
       self
     end

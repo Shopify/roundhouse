@@ -11137,13 +11137,18 @@ raise "none unscope null?" unless still_none.null_relation?
 assert_no_query("none.unscope.ids") { raise "none unscope ids" unless still_none.ids.empty? }
 
 # Compound empty-IN keeps null when a sibling where is unscoped away.
-compound = Article.where(id: [], title: "NullRel").where("1=1")
-# Cannot unscope :id alone (multi-column hash) — unscope the raw sibling.
-compound2 = Article.where(id: []).where(title: "NullRel")
-raise "compound null?" unless compound2.null_relation?
-kept = compound2.unscope(where: :title)
+compound = Article.where(id: []).where(title: "NullRel")
+raise "compound null?" unless compound.null_relation?
+kept = compound.unscope(where: :title)
 raise "compound unscope cleared null?" unless kept.null_relation?
 assert_no_query("compound.unscope.ids") { raise "compound ids" unless kept.ids.empty? }
+
+# A value that literally contains "1=0" must not stick @null after the
+# empty-IN clause is unscoped (structural tracking, not SQL text search).
+titled = Article.create!(title: "1=0", body: "long enough body for pin")
+sticky = Article.where(id: []).where(title: "1=0").unscope(where: :id)
+raise "title 1=0 sticky null?" if sticky.null_relation?
+raise "title 1=0 row" unless sticky.to_a.map(&:id).include?(titled.id)
 
 # preloaded integer ids must not call .id on Fixnum.
 pre = Article.all.preloaded([row.id], true)
