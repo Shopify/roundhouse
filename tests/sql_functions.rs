@@ -11,8 +11,9 @@
 //! the CRuby tree installs them through the sqlite3 gem on every pooled
 //! connection (`runtime/sql_functions.rb`, called from `Db.open_pool`).
 
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use roundhouse::analyze::Analyzer;
 use roundhouse::ingest::ingest_app;
@@ -110,18 +111,51 @@ fn installer() -> String {
     assert_eq!(names, [("regexp", 2), ("if", 3), ("stddev", 1)]);
     let files = roundhouse::project::target_files(&app, &dir, BuildTarget::Ruby).expect("files");
     std::fs::remove_dir_all(&dir).expect("clean up fixture");
-    let db = files.iter().find(|(p, _)| p == "runtime/db.rb").expect("db.rb");
-    // First thing after the magic comment: above it, the require would
-    // switch the file's `frozen_string_literal` off.
-    assert!(
-        db.1.starts_with("# frozen_string_literal: true\nrequire_relative \"sql_functions\""),
-        "db.rb loads it, below its magic comment"
-    );
     files
         .into_iter()
         .find(|(p, _)| p == "runtime/sql_functions.rb")
         .map(|(_, c)| c)
         .expect("runtime/sql_functions.rb")
+}
+
+#[test]
+fn generated_database_literals_are_frozen() {
+    if Command::new("ruby").arg("--version").output().is_err() {
+        eprintln!("skipping: Ruby is not available");
+        return;
+    }
+    let dir = fixture();
+    let mut app = ingest_app(&dir).expect("ingest");
+    Analyzer::new(&app).analyze(&mut app);
+    for target in [BuildTarget::Ruby, BuildTarget::Jruby, BuildTarget::Spinel] {
+        let files = roundhouse::project::target_files(&app, &dir, target).expect("files");
+        let db = files.iter().find(|(p, _)| p == "runtime/db.rb").expect("db.rb");
+        // Parse the entire generated file, but stop before its target-only
+        // requires run. The BEGIN block uses this file's literal semantics.
+        let mut ruby = Command::new("ruby")
+            .args(["--disable-gems", "-e", r#"
+result = catch(:database_literal_probe) do
+  eval(STDIN.read + "\nBEGIN { throw :database_literal_probe, \"database probe\".frozen? }\n",
+       TOPLEVEL_BINDING, "runtime/db.rb")
+end
+puts result
+"#])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("invoke Ruby");
+        ruby.stdin.take().expect("Ruby stdin")
+            .write_all(db.1.as_bytes()).expect("write generated db.rb");
+        let output = ruby.wait_with_output().expect("Ruby result");
+        assert!(
+            output.status.success(),
+            "{target:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout.as_slice(), b"true\n", "{target:?}: database literals are not frozen");
+    }
+    std::fs::remove_dir_all(dir).expect("clean up fixture");
 }
 
 #[test]

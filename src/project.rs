@@ -3236,12 +3236,10 @@ fn ruby_family_runtime_files(
             // `db_jruby.rb` is excluded from `spinel_files`' base set,
             // so read it from disk and inject it here.
             files.retain(|(p, _)| p != "runtime/db_cruby.rb");
-            let db_jruby = crate::runtime_files::read_to_string("runtime/spinel/db_jruby.rb")
+            let mut db_jruby = crate::runtime_files::read_to_string("runtime/spinel/db_jruby.rb")
                 .map_err(|e| format!("read runtime/spinel/db_jruby.rb: {e}"))?;
-            files.push((
-                "runtime/db.rb".to_string(),
-                format!("{TIME_PARSING_REQUIRE}{db_jruby}"),
-            ));
+            insert_require_line(&mut db_jruby, TIME_PARSING_REQUIRE.trim_end());
+            files.push(("runtime/db.rb".to_string(), db_jruby));
             apply_jruby_gemfile(&mut files)?;
         }
     }
@@ -6609,10 +6607,8 @@ fn apply_spinel_sql_functions(files: &mut Vec<(String, String)>, app: &App) -> R
     if !db.1.contains(ANCHOR) {
         return Err("runtime/db.rb: the connection-open anchor for SqlFunctions.install moved".into());
     }
-    db.1 = format!(
-        "require_relative \"sql_functions\"\n{}",
-        db.1.replacen(ANCHOR, &format!("{ANCHOR}      SqlFunctions.install(dbh)\n"), 1)
-    );
+    db.1 = db.1.replacen(ANCHOR, &format!("{ANCHOR}      SqlFunctions.install(dbh)\n"), 1);
+    insert_require_line(&mut db.1, "require_relative \"sql_functions\"");
     files.push(("runtime/sql_functions.rb".to_string(), src));
     Ok(())
 }
