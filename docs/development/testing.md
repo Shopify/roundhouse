@@ -80,6 +80,7 @@ contract tests are [`bin/rh`](../../bin/rh) and
 ## Direct Cargo checks
 
 ```sh
+cargo check --locked --all-targets  # Rust compiler warnings, including tests
 cargo test --locked --lib
 cargo test --locked --test ingest
 cargo test --locked --test framework_tests_ruby -- --ignored --nocapture

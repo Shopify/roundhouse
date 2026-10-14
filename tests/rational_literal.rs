@@ -9,8 +9,6 @@
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
-use roundhouse::project::BuildTarget;
-
 const RAT: &str = r#"module Ratlab
   class Limits
     MAX = 999999.9r

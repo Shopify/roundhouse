@@ -186,7 +186,7 @@ impl<'a> Specializer<'a> {
 
     fn specialize(&self, e: &Expr, recv: &Expr, method: &Symbol, args: &[Expr], cx: &Cx) -> Result<Site, String> {
         let chain = self.chain(recv, cx)?;
-        let (mut chain, terminal) = self.apply(chain, method, args, cx)?;
+        let (chain, terminal) = self.apply(chain, method, args, cx)?;
         if self.default_scoped.iter().any(|m| m == chain.model.0.as_str()) {
             return Err(format!("{} may have a default_scope", chain.model.0.as_str()));
         }
