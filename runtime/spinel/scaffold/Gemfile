@@ -41,7 +41,7 @@ gem "rack"
 # via rack.hijack; websocket-driver owns the protocol. Spinel-target
 # builds get the equivalent surface via sphttp's upgrade path
 # (deferred). Pinned to 0.8.x — the API stabilized in that line.
-gem "websocket-driver", "~> 0.8.0"
+gem "websocket-driver", "~> 0.8.2"
 
 # The cable reactor's selector. Already in the bundle as a Puma
 # dependency; named here because cable.rb requires it directly, so the
