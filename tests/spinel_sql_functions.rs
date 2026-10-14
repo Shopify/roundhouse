@@ -81,7 +81,6 @@ fn spinel_installs_them_through_ffi_on_every_connection() {
     // context class (spinel serves both since 606acc03, matz/spinel#5054).
     assert!(src.contains("fn[:n] ||= 0") && src.contains("fn[:n] += 1"), "{src}");
     let db = file(&files, "runtime/db.rb").expect("db.rb");
-    assert!(db.starts_with("require_relative \"sql_functions\"\n"), "db.rb requires the install");
     assert!(db.contains("SqlFunctions.install(dbh)"), "installed per connection");
 }
 

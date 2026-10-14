@@ -33,6 +33,8 @@ Every Ruby file under `runtime/ruby/` and `runtime/spinel/` uses
 `# frozen_string_literal: true`. The directive follows an optional shebang
 and precedes generated requires. `tests/runtime_frozen_string_literal.rs`
 checks all runtime Ruby files.
+`tests/sql_functions.rs` also checks literal freezing in generated database
+files for Ruby, JRuby, and Spinel.
 
 Other entry points: `src/bin/` (CLI/debug tools), `wasm/` (browser compiler),
 `editors/vscode/` (LSP client), `tools/compare/` (standalone differential oracle).
