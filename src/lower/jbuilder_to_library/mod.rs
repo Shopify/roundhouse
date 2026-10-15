@@ -1981,7 +1981,7 @@ fn emit_array_block(collection: &Expr, item_var: &Symbol, body: &Expr, ctx: &Ctx
     };
     // Whether every element sets a pair: a partial may set nothing,
     // unless its template always does.
-    let mut filled = false;
+    let filled;
     let element = match single_partial {
         Some((partial_path, locals)) => {
             filled = partial_always_filled(&partial_path, ctx);

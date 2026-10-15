@@ -539,9 +539,6 @@ fn parse_args(args: &[Expr], view: Option<&str>, template: bool) -> Result<Call,
     Ok(call)
 }
 
-/// Fold every resolvable translate call in hook bodies, test bodies and
-/// templates. A controller's instance methods (its actions and the
-/// private methods they call) take the controller's `t`.
 thread_local! {
     /// The sites this lowering wrote to the table, by their records, and the records in order.
     static TABLE: std::cell::RefCell<(std::collections::HashMap<u64, Vec<usize>>, Vec<TableSite>)> =
@@ -553,6 +550,9 @@ thread_local! {
     static RUNTIME_SITES: std::cell::RefCell<(Vec<Span>, Vec<Span>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
+/// Fold every resolvable translate call in hook bodies, test bodies and
+/// templates. A controller's instance methods (its actions and the
+/// private methods they call) take the controller's `t`.
 pub fn apply_i18n_translate_lowering(app: &mut App) {
     TABLE.with(|t| *t.borrow_mut() = Default::default());
     RUNTIME_SITES.with(|r| *r.borrow_mut() = Default::default());
