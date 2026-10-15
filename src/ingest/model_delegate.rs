@@ -31,16 +31,18 @@ pub(crate) fn lower_model_delegates(app: &mut crate::App) {
     let mut params_specs =
         crate::lower::controller_to_library::params::collect_specs(&app.controllers);
     params_specs.mark_file_fields(&app.models);
+    let body_names = crate::lower::model_to_library::schema::ModelBodyNames::new(&app.models);
     let blocked_names: HashMap<_, _> = app
         .models
         .iter()
         .filter(|model| delegated_models.contains(&model.name))
         .map(|model| {
-            let names = crate::lower::model_to_library::method_names(
+            let names = crate::lower::model_to_library::method_names_with_body_names(
                 model,
                 &app.models,
                 &app.schema,
                 &params_specs,
+                &body_names,
             );
             (model.name.clone(), names)
         })
@@ -92,6 +94,7 @@ pub(crate) fn lower_model_delegates(app: &mut crate::App) {
                     &concerns_by_name,
                     &app.schema,
                     &params_specs,
+                    &body_names,
                     &mut method_cache,
                 ),
             ))
@@ -201,6 +204,7 @@ fn model_zero_argument_surface(
     library_classes: &HashMap<ClassId, &LibraryClass>,
     schema: &crate::schema::Schema,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
+    body_names: &crate::lower::model_to_library::schema::ModelBodyNames,
     cache: &mut HashMap<ClassId, MethodSurface>,
 ) -> MethodSurface {
     if let Some(surface) = cache.get(&model.name) {
@@ -217,6 +221,7 @@ fn model_zero_argument_surface(
                 library_classes,
                 schema,
                 params_specs,
+                body_names,
                 cache,
             );
         }
@@ -225,8 +230,13 @@ fn model_zero_argument_surface(
     // Use the same synthesized model methods that the emitter will lower;
     // hand-building fields and association accessors here can silently drift
     // from the real model surface as Rails support grows.
-    let model_methods =
-        crate::lower::model_to_library::build_methods(model, all_models, schema, params_specs);
+    let model_methods = crate::lower::model_to_library::build_methods_with_body_names(
+        model,
+        all_models,
+        schema,
+        params_specs,
+        body_names,
+    );
     add_method_definitions(model_methods.iter(), &mut surface);
 
     let mut seen = HashSet::new();

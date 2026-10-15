@@ -271,8 +271,11 @@ pub(crate) fn lower_models_inner_with_ruby_values(
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
     let mut all_methods: Vec<(Vec<MethodDef>, ClassId, Option<&Table>, &Model)> = Vec::new();
     let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::new();
+    let body_names = schema::ModelBodyNames::new(models);
     for model in models {
-        let methods = build_methods_with_finder_inputs(model, models, schema, params_specs, finder_inputs, errors_readers);
+        let methods = build_methods_with_finder_inputs(
+            model, models, schema, params_specs, finder_inputs, errors_readers, &body_names,
+        );
         let table = schema.tables.get(&model.table.0);
         // Register actual production definitions, even for unselected
         // models and when source overrides hide framework ownership.
@@ -291,7 +294,10 @@ pub(crate) fn lower_models_inner_with_ruby_values(
                             if matches!(method.as_str(), "attr_accessor" | "attr_reader" | "attr_writer")),
                     _ => true,
                 });
-                let mut methods = build_methods_with_finder_inputs(&definitions, models, schema, params_specs, finder_inputs, errors_readers);
+                let mut methods = build_methods_with_finder_inputs(
+                    &definitions, models, schema, params_specs, finder_inputs, errors_readers,
+                    &body_names,
+                );
                 // Preserve original source inputs for late derivations
                 // (e.g. raw helpers) without treating them as framework
                 // claims. Both kinds traverse the canonical Arel/typer.
@@ -1085,18 +1091,40 @@ pub(crate) fn build_methods(
     schema: &Schema,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
 ) -> Vec<MethodDef> {
-    build_methods_with_finder_inputs(model, models, schema, params_specs, FinderInputs::Scalar, ErrorsReaders::FieldRead)
+    let body_names = schema::ModelBodyNames::new(models);
+    build_methods_with_body_names(model, models, schema, params_specs, &body_names)
 }
 
-/// Return the instance method surface synthesized for a model, for ingest
-/// passes that need collision checks without depending on `MethodDef` details.
-pub(crate) fn method_names(
+/// Build one model while sharing the whole slice's body-name demand with
+/// sibling models in the same lowering pass.
+pub(crate) fn build_methods_with_body_names(
     model: &Model,
     models: &[Model],
     schema: &Schema,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
+    body_names: &schema::ModelBodyNames,
+) -> Vec<MethodDef> {
+    build_methods_with_finder_inputs(
+        model,
+        models,
+        schema,
+        params_specs,
+        FinderInputs::Scalar,
+        ErrorsReaders::FieldRead,
+        body_names,
+    )
+}
+
+/// Return the instance method surface synthesized for a model while sharing
+/// the whole slice's body-name demand with sibling surface queries.
+pub(crate) fn method_names_with_body_names(
+    model: &Model,
+    models: &[Model],
+    schema: &Schema,
+    params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
+    body_names: &schema::ModelBodyNames,
 ) -> HashSet<String> {
-    build_methods(model, models, schema, params_specs)
+    build_methods_with_body_names(model, models, schema, params_specs, body_names)
         .into_iter()
         .filter(|method| method.receiver == MethodReceiver::Instance)
         .map(|method| method.name.as_str().to_string())
@@ -1111,6 +1139,7 @@ fn build_methods_with_finder_inputs(
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
     finder_inputs: FinderInputs,
     errors_readers: ErrorsReaders,
+    body_names: &schema::ModelBodyNames,
 ) -> Vec<MethodDef> {
     // No-op outside an emit diagnostics scope, so the many direct
     // test callers of the lowering entries are unaffected.
@@ -1136,7 +1165,7 @@ fn build_methods_with_finder_inputs(
         let writable_fields =
             permitted_fields.map(|fields| writable_permit_fields(model, table, fields));
         let permitted_fields = writable_fields.as_deref();
-        push_schema_methods(&mut methods, model, models, table);
+        push_schema_methods(&mut methods, model, models, table, body_names);
         // Per-model Level-3 adapter primitives (`_adapter_find_by_id`, etc.)
         // — typed methods that go directly from SQL composition to typed
         // model instances over the `Sqlite` primitive surface. See
@@ -2980,6 +3009,43 @@ mod tests {
             .find(|m| m.name.0.as_str() == "Article")
             .unwrap();
         build_class_info(model, methods, app.schema.tables.get(&model.table.0))
+    }
+
+    #[test]
+    fn whole_model_lowering_builds_body_name_demand_once() {
+        let app = app("  def dirty_probe\n    book_id_changed?\n  end");
+        let body_names = schema::ModelBodyNames::new(&app.models);
+        let specs = crate::lower::controller_to_library::params::ParamsSpecs::default();
+
+        let indexed: Vec<Vec<(Symbol, MethodReceiver)>> = app
+            .models
+            .iter()
+            .map(|model| {
+                build_methods_with_body_names(
+                    model,
+                    &app.models,
+                    &app.schema,
+                    &specs,
+                    &body_names,
+                )
+                .into_iter()
+                .map(|method| (method.name, method.receiver))
+                .collect()
+            })
+            .collect();
+        let scanned: Vec<Vec<(Symbol, MethodReceiver)>> = app
+            .models
+            .iter()
+            .map(|model| {
+                build_methods(model, &app.models, &app.schema, &specs)
+                    .into_iter()
+                    .map(|method| (method.name, method.receiver))
+                    .collect()
+            })
+            .collect();
+
+        assert_eq!(indexed, scanned);
+        assert_eq!(body_names.build_count(), 1);
     }
 
     #[test]

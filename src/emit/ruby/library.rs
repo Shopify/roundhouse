@@ -19,6 +19,119 @@ use crate::ident::{ClassId, Symbol, VarId};
 use crate::span::Span;
 use crate::ty::Ty;
 
+/// Name lookups whose old form scanned every library class for every
+/// emitted class. The index is scoped to one immutable `App`; nested emits
+/// of the same app reuse it, while a temporary transformed app gets its own
+/// entry and restores the outer one on drop.
+struct EmitLookupIndex {
+    first_module_bare: HashMap<String, usize>,
+    first_app_module_named: HashMap<String, usize>,
+}
+
+impl EmitLookupIndex {
+    fn new(app: &App) -> Self {
+        let mut first_module_bare = HashMap::new();
+        let mut first_app_module_named = HashMap::new();
+        for (index, class) in app.library_classes.iter().enumerate() {
+            if class.is_module {
+                first_module_bare
+                    .entry(class.name.0.as_str().trim_start_matches("::").to_string())
+                    .or_insert(index);
+                if class.origin.is_none() {
+                    first_app_module_named
+                        .entry(class.name.0.as_str().to_string())
+                        .or_insert(index);
+                }
+            }
+        }
+        Self { first_module_bare, first_app_module_named }
+    }
+}
+
+thread_local! {
+    static EMIT_LOOKUP_INDEXES: std::cell::RefCell<Vec<(usize, EmitLookupIndex)>> = const { std::cell::RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static EMIT_LOOKUP_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) struct EmitLookupGuard {
+    installed: bool,
+}
+
+impl Drop for EmitLookupGuard {
+    fn drop(&mut self) {
+        if self.installed {
+            EMIT_LOOKUP_INDEXES.with(|indexes| {
+                indexes.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+pub(crate) fn install_lookup_indexes(app: &App) -> EmitLookupGuard {
+    let key = app as *const App as usize;
+    let already_installed = EMIT_LOOKUP_INDEXES.with(|indexes| {
+        indexes.borrow().last().is_some_and(|(current, _)| *current == key)
+    });
+    if already_installed {
+        return EmitLookupGuard { installed: false };
+    }
+    let index = EmitLookupIndex::new(app);
+    EMIT_LOOKUP_INDEXES.with(|indexes| indexes.borrow_mut().push((key, index)));
+    #[cfg(test)]
+    EMIT_LOOKUP_INDEX_BUILDS.with(|builds| builds.set(builds.get() + 1));
+    EmitLookupGuard { installed: true }
+}
+
+fn first_module_bare_named<'a>(target: &str, app: &'a App) -> Option<&'a LibraryClass> {
+    let key = app as *const App as usize;
+    let indexed = EMIT_LOOKUP_INDEXES.with(|indexes| {
+        let indexes = indexes.borrow();
+        indexes.last().and_then(|(current, index)| {
+            (*current == key).then(|| index.first_module_bare.get(target).copied()).flatten()
+        })
+    });
+    indexed.and_then(|index| app.library_classes.get(index)).or_else(|| {
+        let active = EMIT_LOOKUP_INDEXES.with(|indexes| {
+            indexes.borrow().last().is_some_and(|(current, _)| *current == key)
+        });
+        (!active).then(|| {
+            app.library_classes.iter().find(|class| {
+                class.is_module && class.name.0.as_str().trim_start_matches("::") == target
+            })
+        }).flatten()
+    })
+}
+
+fn first_app_module_named_any<'a>(names: &[&str], app: &'a App) -> Option<&'a LibraryClass> {
+    let key = app as *const App as usize;
+    let indexed = EMIT_LOOKUP_INDEXES.with(|indexes| {
+        let indexes = indexes.borrow();
+        indexes.last().and_then(|(current, index)| {
+            (*current == key).then(|| {
+                names.iter().filter_map(|name| index.first_app_module_named.get(*name).copied()).min()
+            })
+        })
+    });
+    match indexed {
+        Some(hit) => hit.and_then(|index| app.library_classes.get(index)),
+        None => app.library_classes.iter().find(|class| {
+            class.is_module && class.origin.is_none()
+                && names.iter().any(|name| class.name.0.as_str() == *name)
+        }),
+    }
+}
+
+#[cfg(test)]
+fn reset_lookup_index_builds() {
+    EMIT_LOOKUP_INDEX_BUILDS.with(|builds| builds.set(0));
+}
+
+#[cfg(test)]
+fn lookup_index_builds() -> usize {
+    EMIT_LOOKUP_INDEX_BUILDS.with(std::cell::Cell::get)
+}
+
 /// Base's shared methods return Base in the runtime sidecar. A concrete
 /// forwarder discards that ABI result and returns its own `self`, so the
 /// model type promised by analysis is also true with Spinel's RBS seeds.
@@ -109,6 +222,7 @@ fn record_return_overridden(app: &App, classes: &HashMap<ClassId, ()>, class: &C
 /// participate in lowering but emit inside their owner's constant declaration,
 /// never as standalone class files.
 pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
+    let _lookup_indexes = install_lookup_indexes(app);
     let mut lcs: Vec<LibraryClass> = app.library_classes.clone();
     // A block-taking tag helper gains a `<name>_into(io, …)` variant
     // that writes around a yield into the caller's buffer; the view
@@ -7567,9 +7681,8 @@ fn emit_library_class_decl_inner(
 /// method 'store') at load. Such an include goes right after the last
 /// method of `lc`, of either side, the hook names. `None` keeps it first.
 fn hooked_include_position(lc: &LibraryClass, inc: &ClassId, app: &App) -> Option<usize> {
-    let bare = |c: &ClassId| c.0.as_str().trim_start_matches("::").to_string();
-    let target = bare(inc);
-    let module = app.library_classes.iter().find(|m| m.is_module && bare(&m.name) == target)?;
+    let target = inc.0.as_str().trim_start_matches("::");
+    let module = first_module_bare_named(target, app)?;
     let hook = module.methods.iter().find(|m| {
         m.receiver == MethodReceiver::Class && m.name.as_str() == "included" && m.params.len() == 1
     })?;
@@ -7912,9 +8025,7 @@ fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     let app_module = |path: &[Symbol]| -> Option<&LibraryClass> {
         let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
         let nested = format!("{}::{written}", lc.name.0.as_str());
-        app.library_classes.iter().find(|c| {
-            c.is_module && c.origin.is_none() && (c.name.0.as_str() == written || c.name.0.as_str() == nested)
-        })
+        first_app_module_named_any(&[written.as_str(), nested.as_str()], app)
     };
     let mut extended: Vec<&LibraryClass> = Vec::new();
     let mut out = Vec::new();
@@ -9694,6 +9805,84 @@ fn rewrite_raw_helper_calls(e: &mut Expr, sites: &BTreeSet<(Symbol, usize)>) {
         let i = *idx;
         *method = Symbol::from(format!("{}_raw", method.as_str()));
         args[i] = inner;
+    }
+}
+
+#[cfg(test)]
+mod lookup_index_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn app() -> crate::App {
+        let files = [
+            (
+                "lib/hook.rb",
+                "module Hook\n  def self.included(base)\n    base.ready\n  end\nend\n",
+            ),
+            (
+                "lib/host.rb",
+                "class Host\n  def self.ready\n    :ok\n  end\n  include Hook\nend\n",
+            ),
+            (
+                "lib/registry.rb",
+                "module Registry\n  def register(name)\n    name\n  end\nend\n",
+            ),
+            (
+                "lib/widget.rb",
+                "class Widget\n  extend Registry\n  register :alpha\nend\n",
+            ),
+        ];
+        let mut app = crate::ingest::ingest_app_from_tree(
+            files
+                .into_iter()
+                .map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec()))
+                .collect::<HashMap<_, _>>(),
+        )
+        .expect("ingest lookup-index fixture");
+        crate::session::analyze_and_lower(&mut app);
+        app
+    }
+
+    #[test]
+    fn lookup_index_is_shared_and_preserves_hook_and_extension_output() {
+        let app = app();
+        let classes: Vec<&LibraryClass> = ["Host", "Widget"]
+            .into_iter()
+            .map(|name| {
+                app.library_classes
+                    .iter()
+                    .find(|class| class.name.0.as_str() == name)
+                    .unwrap()
+            })
+            .collect();
+        let scanned: Vec<EmittedFile> = classes
+            .iter()
+            .map(|class| {
+                emit_library_class_decl(
+                    class,
+                    &app,
+                    PathBuf::from(format!("{}.rb", class.name.0.as_str())),
+                )
+            })
+            .collect();
+
+        reset_lookup_index_builds();
+        let guard = install_lookup_indexes(&app);
+        let indexed: Vec<EmittedFile> = classes
+            .iter()
+            .map(|class| {
+                emit_library_class_decl(
+                    class,
+                    &app,
+                    PathBuf::from(format!("{}.rb", class.name.0.as_str())),
+                )
+            })
+            .collect();
+        let _all_files = super::super::emit_library(&app);
+
+        assert_eq!(indexed, scanned);
+        assert_eq!(lookup_index_builds(), 1);
+        drop(guard);
     }
 }
 

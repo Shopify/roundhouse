@@ -23,6 +23,7 @@ const SPINEL_TEST_HELPER: &str =
 
 pub(crate) mod expr;
 mod library;
+pub(crate) use library::install_lookup_indexes;
 mod rbs;
 pub mod shake;
 mod shared;
@@ -128,6 +129,7 @@ pub fn emit_method(m: &MethodDef) -> String {
 /// routes, views, fixtures, importmap, schema) and emits only one
 /// `.rb` file per `LibraryClass`. Mirrors `typescript::emit_library`.
 pub fn emit_library(app: &App) -> Vec<EmittedFile> {
+    let _lookup_indexes = install_lookup_indexes(app);
     library::emit_library_class_decls(app)
 }
 
@@ -838,6 +840,7 @@ fn jbuilder_view_output_path(view_name: &str) -> PathBuf {
 /// which would have CRuby double-run every test if combined with the
 /// shim).
 pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
+    let _lookup_indexes = install_lookup_indexes(app);
     let mut files = Vec::new();
     files.extend(emit_lowered_schema_pair(app));
     // routes.rb gets a require-relative header prepended (see

@@ -1586,10 +1586,21 @@ pub fn all_scope_names(scopes: &ScopeRegistry) -> HashSet<Symbol> {
 /// Never erase reflection on arbitrary user methods: `send` can call a
 /// private helper where `public_send` and a direct receiver call cannot.
 /// Ingest refuses visibility changes on generated DSL methods without a
-/// local MethodDef; local overrides are vetoed by `app_method` below.
+/// local MethodDef; local overrides are vetoed by the app-method index below.
 pub fn ground_literal_model_dispatch(expr: &mut Expr, app: &crate::App, assocs: &AssocRegistry) {
-    expr.node
-        .for_each_child_mut(&mut |child| ground_literal_model_dispatch(child, app, assocs));
+    let methods = AppMethodIndex::new(app);
+    ground_literal_model_dispatch_indexed(expr, app, assocs, &methods);
+}
+
+fn ground_literal_model_dispatch_indexed(
+    expr: &mut Expr,
+    app: &crate::App,
+    assocs: &AssocRegistry,
+    methods: &AppMethodIndex,
+) {
+    expr.node.for_each_child_mut(&mut |child| {
+        ground_literal_model_dispatch_indexed(child, app, assocs, methods)
+    });
     let ExprNode::Send {
         recv: Some(recv),
         method,
@@ -1653,7 +1664,7 @@ pub fn ground_literal_model_dispatch(expr: &mut Expr, app: &crate::App, assocs: 
             // reader. It is safe only while the macro-generated reader
             // still owns the name throughout the recorded ancestry.
             if owner_id.is_some_and(|owner| {
-                app_method(app, owner, aname, crate::dialect::MethodReceiver::Instance)
+                methods.contains(owner, aname, crate::dialect::MethodReceiver::Instance)
             }) {
                 return;
             }
@@ -1672,7 +1683,7 @@ pub fn ground_literal_model_dispatch(expr: &mut Expr, app: &crate::App, assocs: 
     // Both calls being collapsed must still be framework-owned. A
     // dispatcher override changes `send` itself; a target override means
     // the literal does not select the macro-generated public method.
-    if app_method(app, id, method, side) || app_method(app, id, &name, side) {
+    if methods.contains(id, method, side) || methods.contains(id, &name, side) {
         return;
     }
     let generated = if association {
@@ -1686,79 +1697,116 @@ pub fn ground_literal_model_dispatch(expr: &mut Expr, app: &crate::App, assocs: 
     }
 }
 
-/// Whether app metadata proves that `id`'s lookup chain contains a
-/// user-defined method. This deliberately walks models, library classes,
-/// all reopenings, includes, parents and initializer-installed mixins.
-/// Unknown framework roots terminate the walk.
-pub(crate) fn app_method(
-    app: &crate::App,
-    id: &ClassId,
-    name: &Symbol,
-    side: crate::dialect::MethodReceiver,
-) -> bool {
-    fn visit(
-        app: &crate::App,
+#[derive(Default)]
+struct AppMethodNode {
+    instance_methods: HashSet<Symbol>,
+    class_methods: HashSet<Symbol>,
+    includes: Vec<ClassId>,
+    parent: Option<ClassId>,
+}
+
+/// App method lookup metadata keyed once by class name. The traversal keeps
+/// the scan's model-before-library order, reopening order, include order and
+/// global cycle guard; only finding each name changes from a whole-app scan
+/// to a map lookup.
+pub(crate) struct AppMethodIndex {
+    nodes: HashMap<ClassId, Vec<AppMethodNode>>,
+    mixins: HashMap<ClassId, Vec<ClassId>>,
+}
+
+impl AppMethodIndex {
+    pub(crate) fn new(app: &crate::App) -> Self {
+        let mut nodes: HashMap<ClassId, Vec<AppMethodNode>> = HashMap::new();
+        for model in &app.models {
+            let mut node = AppMethodNode {
+                includes: crate::analyze::model_includes(model),
+                parent: model.parent.clone(),
+                ..AppMethodNode::default()
+            };
+            for method in model.methods() {
+                match method.receiver {
+                    crate::dialect::MethodReceiver::Instance => {
+                        node.instance_methods.insert(method.name.clone());
+                    }
+                    crate::dialect::MethodReceiver::Class => {
+                        node.class_methods.insert(method.name.clone());
+                    }
+                }
+            }
+            nodes.entry(model.name.clone()).or_default().push(node);
+        }
+        for class in &app.library_classes {
+            let mut node = AppMethodNode {
+                includes: class.includes.clone(),
+                parent: class.parent.clone(),
+                ..AppMethodNode::default()
+            };
+            for method in &class.methods {
+                match method.receiver {
+                    crate::dialect::MethodReceiver::Instance => {
+                        node.instance_methods.insert(method.name.clone());
+                    }
+                    crate::dialect::MethodReceiver::Class => {
+                        node.class_methods.insert(method.name.clone());
+                    }
+                }
+            }
+            nodes.entry(class.name.clone()).or_default().push(node);
+        }
+        let mut mixins: HashMap<ClassId, Vec<ClassId>> = HashMap::new();
+        for mixin in &app.module_mixins {
+            mixins
+                .entry(ClassId(mixin.target.clone()))
+                .or_default()
+                .push(ClassId(mixin.module.clone()));
+        }
+        Self { nodes, mixins }
+    }
+
+    pub(crate) fn contains(
+        &self,
         id: &ClassId,
         name: &Symbol,
         side: crate::dialect::MethodReceiver,
-        seen: &mut HashSet<ClassId>,
     ) -> bool {
-        if !seen.insert(id.clone()) {
-            return false;
+        fn visit(
+            index: &AppMethodIndex,
+            id: &ClassId,
+            name: &Symbol,
+            side: crate::dialect::MethodReceiver,
+            seen: &mut HashSet<ClassId>,
+        ) -> bool {
+            if !seen.insert(id.clone()) {
+                return false;
+            }
+            for node in index.nodes.get(id).into_iter().flatten() {
+                let methods = match side {
+                    crate::dialect::MethodReceiver::Instance => &node.instance_methods,
+                    crate::dialect::MethodReceiver::Class => &node.class_methods,
+                };
+                if methods.contains(name)
+                    || node
+                        .includes
+                        .iter()
+                        .any(|inc| visit(index, inc, name, side, seen))
+                    || node
+                        .parent
+                        .as_ref()
+                        .is_some_and(|parent| visit(index, parent, name, side, seen))
+                {
+                    return true;
+                }
+            }
+            // Both retained `include` and `prepend` change instance lookup,
+            // not the singleton side. Their order cannot make the proof safer:
+            // the optimization needs every represented override to be absent.
+            side == crate::dialect::MethodReceiver::Instance
+                && index.mixins.get(id).into_iter().flatten().any(|mixin| {
+                    visit(index, mixin, name, side, seen)
+                })
         }
-        for model in app.models.iter().filter(|m| &m.name == id) {
-            if model
-                .methods()
-                .any(|m| m.name == *name && m.receiver == side)
-            {
-                return true;
-            }
-            if crate::analyze::model_includes(model)
-                .iter()
-                .any(|inc| visit(app, inc, name, side, seen))
-            {
-                return true;
-            }
-            if model
-                .parent
-                .as_ref()
-                .is_some_and(|p| visit(app, p, name, side, seen))
-            {
-                return true;
-            }
-        }
-        for class in app.library_classes.iter().filter(|c| &c.name == id) {
-            if class
-                .methods
-                .iter()
-                .any(|m| m.name == *name && m.receiver == side)
-            {
-                return true;
-            }
-            if class
-                .includes
-                .iter()
-                .any(|inc| visit(app, inc, name, side, seen))
-            {
-                return true;
-            }
-            if class
-                .parent
-                .as_ref()
-                .is_some_and(|p| visit(app, p, name, side, seen))
-            {
-                return true;
-            }
-        }
-        // Both retained `include` and `prepend` change instance lookup,
-        // not the singleton side. Their order cannot make the proof safer:
-        // the optimization needs every represented override to be absent.
-        side == crate::dialect::MethodReceiver::Instance
-            && app.module_mixins.iter()
-                .filter(|m| m.target == id.0)
-                .any(|m| visit(app, &ClassId(m.module.clone()), name, side, seen))
+        visit(self, id, name, side, &mut HashSet::new())
     }
-    visit(app, id, name, side, &mut HashSet::new())
 }
 
 /// True if `expr` (or a descendant) calls a method whose name is a scope.
@@ -4554,6 +4602,110 @@ mod tests {
     }
     fn is_rel(e: &Expr) -> bool {
         matches!(&*e.node, ExprNode::Var { name, .. } if name.as_str() == "__rel")
+    }
+
+    fn scanned_app_method(
+        app: &crate::App,
+        id: &ClassId,
+        name: &Symbol,
+        side: crate::dialect::MethodReceiver,
+    ) -> bool {
+        fn visit(
+            app: &crate::App,
+            id: &ClassId,
+            name: &Symbol,
+            side: crate::dialect::MethodReceiver,
+            seen: &mut HashSet<ClassId>,
+        ) -> bool {
+            if !seen.insert(id.clone()) {
+                return false;
+            }
+            for model in app.models.iter().filter(|model| &model.name == id) {
+                if model
+                    .methods()
+                    .any(|method| method.name == *name && method.receiver == side)
+                    || crate::analyze::model_includes(model)
+                        .iter()
+                        .any(|include| visit(app, include, name, side, seen))
+                    || model
+                        .parent
+                        .as_ref()
+                        .is_some_and(|parent| visit(app, parent, name, side, seen))
+                {
+                    return true;
+                }
+            }
+            for class in app.library_classes.iter().filter(|class| &class.name == id) {
+                if class
+                    .methods
+                    .iter()
+                    .any(|method| method.name == *name && method.receiver == side)
+                    || class
+                        .includes
+                        .iter()
+                        .any(|include| visit(app, include, name, side, seen))
+                    || class
+                        .parent
+                        .as_ref()
+                        .is_some_and(|parent| visit(app, parent, name, side, seen))
+                {
+                    return true;
+                }
+            }
+            side == crate::dialect::MethodReceiver::Instance
+                && app
+                    .module_mixins
+                    .iter()
+                    .filter(|mixin| mixin.target == id.0)
+                    .any(|mixin| visit(app, &ClassId(mixin.module.clone()), name, side, seen))
+        }
+        visit(app, id, name, side, &mut HashSet::new())
+    }
+
+    #[test]
+    fn app_method_index_matches_ordered_ancestry_scan() {
+        use std::{collections::HashMap, path::PathBuf};
+        let files = [
+            (
+                "db/schema.rb",
+                "ActiveRecord::Schema.define do\n  create_table :articles do |t|\n    t.string :title\n  end\nend\n",
+            ),
+            (
+                "app/models/application_record.rb",
+                "class ApplicationRecord < ActiveRecord::Base\n  def inherited_method\n    :root\n  end\nend\n",
+            ),
+            (
+                "app/models/concerns/trackable.rb",
+                "module Trackable\n  def tracked\n    true\n  end\nend\n",
+            ),
+            (
+                "app/models/article.rb",
+                "class Article < ApplicationRecord\n  include Trackable\n  def own_method\n    title\n  end\nend\n",
+            ),
+        ];
+        let app = crate::ingest::ingest_app_from_tree(
+            files
+                .into_iter()
+                .map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec()))
+                .collect::<HashMap<_, _>>(),
+        )
+        .expect("ingest app-method fixture");
+        let index = AppMethodIndex::new(&app);
+        let article = ClassId(Symbol::from("Article"));
+        for (name, side) in [
+            ("own_method", crate::dialect::MethodReceiver::Instance),
+            ("tracked", crate::dialect::MethodReceiver::Instance),
+            ("inherited_method", crate::dialect::MethodReceiver::Instance),
+            ("own_method", crate::dialect::MethodReceiver::Class),
+            ("missing", crate::dialect::MethodReceiver::Instance),
+        ] {
+            let name = Symbol::from(name);
+            assert_eq!(
+                index.contains(&article, &name, side),
+                scanned_app_method(&app, &article, &name, side),
+                "Article {side:?} {name}",
+            );
+        }
     }
 
     #[test]

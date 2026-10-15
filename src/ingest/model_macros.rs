@@ -22,6 +22,52 @@ use crate::span::SourceFile;
 
 mod class_eval;
 
+/// Library-class lookups used while specializing model macros. Reopenings
+/// keep their source order: `first` is the old `iter().find` answer, while
+/// method counts aggregate every reopening exactly as the filtered scan did.
+struct LibraryMacroIndex {
+    first: HashMap<ClassId, usize>,
+    class_method_counts: HashMap<ClassId, HashMap<Symbol, usize>>,
+}
+
+impl LibraryMacroIndex {
+    fn new(classes: &[crate::dialect::LibraryClass]) -> Self {
+        let mut first = HashMap::new();
+        let mut class_method_counts: HashMap<ClassId, HashMap<Symbol, usize>> = HashMap::new();
+        for (index, class) in classes.iter().enumerate() {
+            first.entry(class.name.clone()).or_insert(index);
+            let counts = class_method_counts.entry(class.name.clone()).or_default();
+            for method in &class.methods {
+                if method.receiver == MethodReceiver::Class {
+                    *counts.entry(method.name.clone()).or_default() += 1;
+                }
+            }
+        }
+        Self { first, class_method_counts }
+    }
+
+    fn first<'a>(
+        &self,
+        classes: &'a [crate::dialect::LibraryClass],
+        id: &ClassId,
+    ) -> Option<&'a crate::dialect::LibraryClass> {
+        self.first.get(id).map(|&index| &classes[index])
+    }
+
+    fn provider_count(
+        &self,
+        included: &HashSet<ClassId>,
+        hook_origins: &HashSet<ClassId>,
+        method: &Symbol,
+    ) -> usize {
+        self.class_method_counts
+            .iter()
+            .filter(|(id, _)| included.contains(*id) || hook_origins.contains(*id))
+            .map(|(_, counts)| counts.get(method).copied().unwrap_or(0))
+            .sum()
+    }
+}
+
 pub(crate) fn expand_model_macros(
     app: &mut App,
     sources: &[SourceFile],
@@ -32,13 +78,14 @@ pub(crate) fn expand_model_macros(
     let mut params_specs =
         crate::lower::controller_to_library::params::collect_specs(&app.controllers);
     params_specs.mark_file_fields(&app.models);
+    let library_index = LibraryMacroIndex::new(&app.library_classes);
     // Index once. Do not clone these defs onto every model, and do not
     // pretend the hook mixin was `include`d — availability is an
     // explicit load-hook origin check below.
     let hook_macros: HashMap<Symbol, (ClassId, MethodDef)> = {
         let mut map = HashMap::new();
         for id in &app.load_hook_class_macros {
-            let Some(class) = app.library_classes.iter().find(|c| &c.name == id) else {
+            let Some(class) = library_index.first(&app.library_classes, id) else {
                 continue;
             };
             for m in &class.methods {
@@ -52,6 +99,7 @@ pub(crate) fn expand_model_macros(
     };
     let hook_origins: HashSet<ClassId> = app.load_hook_class_macros.iter().cloned().collect();
     for model_index in 0..app.models.len() {
+        let app_methods = crate::lower::scope_chain::AppMethodIndex::new(app);
         let model = &app.models[model_index];
         let origins = app
             .concern_spliced_class_methods
@@ -107,7 +155,8 @@ pub(crate) fn expand_model_macros(
                 for arg in args {
                     if let ExprNode::Const { path } = &*arg.node {
                         include_closure(
-                            app,
+                            &app.library_classes,
+                            &library_index,
                             ClassId(Symbol::from(
                                 path.iter()
                                     .map(|p| p.as_str())
@@ -142,13 +191,7 @@ pub(crate) fn expand_model_macros(
             else {
                 continue;
             };
-            let providers = app
-                .library_classes
-                .iter()
-                .filter(|c| included.contains(&c.name) || hook_origins.contains(&c.name))
-                .flat_map(|c| &c.methods)
-                .filter(|m| m.receiver == MethodReceiver::Class && &m.name == method)
-                .count();
+            let providers = library_index.provider_count(&included, &hook_origins, method);
             let methods = (recv.is_none()
                 && block.is_none()
                 && (included.contains(origin) || hook_origins.contains(origin))
@@ -162,12 +205,7 @@ pub(crate) fn expand_model_macros(
                 ]
                 .iter()
                 .all(|name| {
-                    !crate::lower::scope_chain::app_method(
-                        app,
-                        &model.name,
-                        &Symbol::from(*name),
-                        MethodReceiver::Class,
-                    )
+                    !app_methods.contains(&model.name, &Symbol::from(*name), MethodReceiver::Class)
                 })
                 && supported_source_signature(def, sources)
                 && supported_source_call(expr, sources))
@@ -223,12 +261,7 @@ pub(crate) fn expand_model_macros(
                     && expansion.methods.iter().all(|m| {
                         names[&m.name] == 1
                             && !reserved.contains(&m.name)
-                            && !crate::lower::scope_chain::app_method(
-                                app,
-                                &model.name,
-                                &m.name,
-                                MethodReceiver::Instance,
-                            )
+                            && !app_methods.contains(&model.name, &m.name, MethodReceiver::Instance)
                     })
             });
             if let Some(methods) = methods {
@@ -295,13 +328,18 @@ fn macro_provider<'a>(
     hook_macros.get(method).map(|(id, def)| (id, def))
 }
 
-fn include_closure(app: &App, id: ClassId, included: &mut HashSet<ClassId>) {
+fn include_closure(
+    classes: &[crate::dialect::LibraryClass],
+    index: &LibraryMacroIndex,
+    id: ClassId,
+    included: &mut HashSet<ClassId>,
+) {
     if !included.insert(id.clone()) {
         return;
     }
-    if let Some(class) = app.library_classes.iter().find(|c| c.name == id) {
+    if let Some(class) = index.first(classes, &id) {
         for nested in &class.includes {
-            include_closure(app, nested.clone(), included);
+            include_closure(classes, index, nested.clone(), included);
         }
     }
 }
@@ -905,5 +943,52 @@ fn collapse_literal_send(expr: &mut Expr, helpers: &HashSet<Symbol>) -> bool {
             block: None,
             parenthesized: *parenthesized,
         };
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+    use std::{collections::HashMap, path::PathBuf};
+
+    #[test]
+    fn library_macro_index_matches_source_order_scans() {
+        let files = [
+            (
+                "lib/outer.rb",
+                "module Outer\n  include Inner\n  def self.install\n    :outer\n  end\nend\n",
+            ),
+            (
+                "lib/inner.rb",
+                "module Inner\n  def self.install\n    :inner\n  end\nend\n",
+            ),
+            (
+                "lib/outer_reopen.rb",
+                "module Outer\n  def self.install\n    :reopened\n  end\nend\n",
+            ),
+        ];
+        let app = crate::ingest::ingest_app_from_tree(
+            files
+                .into_iter()
+                .map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec()))
+                .collect::<HashMap<_, _>>(),
+        )
+        .expect("ingest macro-index fixture");
+        let index = LibraryMacroIndex::new(&app.library_classes);
+        let outer = ClassId(Symbol::from("Outer"));
+        let first = app.library_classes.iter().find(|class| class.name == outer).unwrap();
+        assert!(std::ptr::eq(index.first(&app.library_classes, &outer).unwrap(), first));
+
+        let mut included = HashSet::new();
+        include_closure(&app.library_classes, &index, outer.clone(), &mut included);
+        let hook_origins = HashSet::new();
+        let install = Symbol::from("install");
+        let scanned = app.library_classes.iter()
+            .filter(|class| included.contains(&class.name))
+            .flat_map(|class| &class.methods)
+            .filter(|method| method.receiver == MethodReceiver::Class && method.name == install)
+            .count();
+        assert_eq!(index.provider_count(&included, &hook_origins, &install), scanned);
+        assert!(included.contains(&ClassId(Symbol::from("Inner"))));
     }
 }

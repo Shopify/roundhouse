@@ -5846,6 +5846,7 @@ fn spinel_files_with_source_markers(
 }
 
 fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec<String>), String> {
+    let _lookup_indexes = emit::ruby::install_lookup_indexes(app);
     let mut files: Vec<(String, String)> = Vec::new();
 
     crate::runtime_files::walk_into("runtime/spinel/scaffold", "", &mut files)?;

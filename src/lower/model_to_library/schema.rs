@@ -62,6 +62,7 @@ pub(super) fn push_schema_methods(
     model: &Model,
     models: &[Model],
     table: &Table,
+    body_names: &ModelBodyNames,
 ) {
     let owner = &model.name;
 
@@ -94,7 +95,7 @@ pub(super) fn push_schema_methods(
         model,
         &table.columns.iter().map(|c| (c.name.clone(), super::ty_of_column_slot(c))).collect(),
     );
-    let mut demanded: Option<std::collections::HashSet<Symbol>> = None;
+    let mut demanded: Option<&std::collections::HashSet<Symbol>> = None;
     for col in &table.columns {
         methods.push(synth_attr_reader(owner, col, model));
         if model.enums.contains_key(&col.name) {
@@ -156,7 +157,7 @@ pub(super) fn push_schema_methods(
             // have to learn (rust's hand-written model impl, go's
             // call-form list), for an answer that is the constant
             // false/nil on those lanes anyway.
-            let demanded = demanded.get_or_insert_with(|| model_body_names(models));
+            let demanded = demanded.get_or_insert_with(|| body_names.get(models));
             for (name, runtime, ret) in pending_change_methods(col) {
                 if demanded.contains(&name)
                     && !super::associations::model_defines_instance_method(model, &name)
@@ -180,7 +181,7 @@ pub(super) fn push_schema_methods(
             continue;
         };
         let Some(col) = table.columns.iter().find(|c| c.name == *foreign_key) else { continue };
-        let demanded = demanded.get_or_insert_with(|| model_body_names(models));
+        let demanded = demanded.get_or_insert_with(|| body_names.get(models));
         let prev = Symbol::from(format!("{}_previously_changed?", name.as_str()));
         if demanded.contains(&prev) && !super::associations::model_defines_instance_method(model, &prev) {
             methods.push(synth_column_dirty_pred(owner, col, prev));
@@ -2154,6 +2155,44 @@ fn pending_change_methods(col: &Column) -> Vec<(Symbol, &'static str, Ty)> {
         (Symbol::from(format!("will_save_change_to_{n}?")), "attribute_changed?", Ty::Bool),
         (Symbol::from(format!("{n}_was")), "attribute_was", Ty::Untyped),
     ]
+}
+
+/// One models slice's body-name demand, shared by every model lowered
+/// from that slice. Without this cache, each model with a schema column
+/// walked every model body again while synthesizing Dirty methods.
+pub(crate) struct ModelBodyNames {
+    models_ptr: usize,
+    models_len: usize,
+    names: std::cell::OnceCell<std::collections::HashSet<Symbol>>,
+    #[cfg(test)]
+    builds: std::cell::Cell<usize>,
+}
+
+impl ModelBodyNames {
+    pub(crate) fn new(models: &[Model]) -> Self {
+        Self {
+            models_ptr: models.as_ptr() as usize,
+            models_len: models.len(),
+            names: std::cell::OnceCell::new(),
+            #[cfg(test)]
+            builds: std::cell::Cell::new(0),
+        }
+    }
+
+    pub(crate) fn get(&self, models: &[Model]) -> &std::collections::HashSet<Symbol> {
+        assert_eq!(self.models_ptr, models.as_ptr() as usize, "model body-name cache used with a different slice");
+        assert_eq!(self.models_len, models.len(), "model body-name cache used with a different slice");
+        self.names.get_or_init(|| {
+            #[cfg(test)]
+            self.builds.set(self.builds.get() + 1);
+            model_body_names(models)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_count(&self) -> usize {
+        self.builds.get()
+    }
 }
 
 /// Every method name a model body SENDS or names as a Symbol (`if:
