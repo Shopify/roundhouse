@@ -41,6 +41,7 @@ FLOOR_SMOKE_TARGETS = ["rust", "typescript", "ruby", "jruby"]
 # compare, WASM, and Spinel are not in this list.
 BASE = [
     "generate-fixture",
+    "unit-build",
     "unit",
     "build-roundhouse",
     "store-check",

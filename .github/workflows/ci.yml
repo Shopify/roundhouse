@@ -476,137 +476,145 @@ jobs:
   # Library correctness. Runs the default (non-ignored) test suite:
   # ingest / analyze / IR round-trip / per-target emit snapshot tests.
   # -------------------------------------------------------------------
-  unit:
+  unit-build:
     needs: generate-fixture
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      # A failed shard must not cancel coverage or diagnostic output from others.
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        shard: [0, 1, 2, 3]
+    outputs:
+      unit-test-artifact-id: ${{ steps.unit-tests.outputs.artifact-id }}
     env:
-      # Share first-party split DWARF instead of copying it into every test
-      # executable. Integration sidecars are freed with their finished batch;
-      # shared library/bin sidecars stay. Code stays unoptimized.
-      # Test-profile-only, Linux-job-only: dev, release and other hosts unchanged.
-      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: unpacked
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      ROUNDHOUSE_TEST_BUNDLE_ROOT: ${{ github.workspace }}
+      # Keep backtrace line data inside the archived executables.
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-nextest
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.MRI_RUBY }}
       - uses: actions/download-artifact@v8
         with:
           name: real-blog-fixture
       - name: Extract fixture
         run: tar -xzf real-blog.tar.gz
-      # `tests/overlay_sanitize_autolink.rs` shells out to ruby and
-      # loads the CRuby overlay's escape surface, which serves
-      # `sanitize` / `strip_tags` from the real gem. Without the gem the
-      # overlay falls back to the shared scanner (which refuses markup
-      # by design) and the test fails naming this step. It is the only
-      # coverage those helpers have: campfire's suite passes with the
-      # gem hidden, and the oracle comparison does not run in CI.
-      #
-      # setup-ruby, not the runner's system ruby, for two reasons. The
-      # first is that `gem install` against the system ruby is a
-      # `Gem::FilePermissionError` — this step shipped without it and
-      # took the job red on its first run. The second is the one that
-      # matters after today: the test asserts EXACT sanitizer output, so
-      # the ruby it runs on is part of the assertion. 3.4 is the version
-      # campfire-conformance pins, so both lanes exercise these helpers
-      # on the same one.
-      - uses: ruby/setup-ruby@v1
+      - name: Build the complete test archive and inventory
+        run: |
+          python3 scripts/ci-resources.py --out "$RUNNER_TEMP/unit-build-resources/build" -- \
+            python3 scripts/ci-unit-tests.py build \
+              --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
+              --inventory "$RUNNER_TEMP/unit-tests/inventory.json" --shard-count 4
+      - name: Check documentation tests
+        run: |
+          python3 scripts/ci-resources.py --out "$RUNNER_TEMP/unit-build-resources/docs" -- \
+            cargo test --locked --doc
+      # Test-profile binaries use opt-level=1. Rebuild this driver in the
+      # actual dev profile so the independent debug stack gate stays honest.
+      # Run after archiving: the test archive retains its own helper binaries.
+      - name: Build the unoptimized development bench driver
+        run: |
+          python3 scripts/ci-resources.py --out "$RUNNER_TEMP/unit-build-resources/dev-build" -- \
+            cargo build --locked --profile dev --bin emit_preview
+      - name: Emit every bench lane in the debug profile (scripts/bench's shape)
+        run: |
+          python3 scripts/ci-resources.py --out "$RUNNER_TEMP/unit-build-resources/bench" -- \
+            bash -euo pipefail -c "
+              test -x target/debug/emit_preview
+              for target in typescript crystal rust python elixir go kotlin swift csharp; do
+                target/debug/emit_preview --target \"\$target\" fixtures/real-blog >/dev/null
+              done
+            "
+      - name: Upload current-run test bundle
+        id: unit-tests
+        uses: actions/upload-artifact@v7
         with:
-          ruby-version: ${{ env.MRI_RUBY }}
-      # libvips42: `tests/vips_loader_policy.rs` boots an emitted variant
-      # app and asks `Vips.vips_foreign_find_load` after the app's loader
-      # policy. CRuby binds through FFI, so the library is enough; headers
-      # are the compiled Spinel job.
-      - name: System libvips for the emitted ruby-vips processor
-        # libvips42 pulls a large dep tree; slow Azure apt burned 8m on
-        # campfire-conformance in Full validation 37689396098 (libvips42+ffmpeg).
-        timeout-minutes: 20
-        run: |
-          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips42
-      # One gem process: three sequential `gem install` steps were paying
-      # RubyGems startup separately for the same default gem path.
-      #
-      # rails-html-sanitizer — `tests/overlay_sanitize_autolink.rs` shells
-      # out to ruby and loads the CRuby overlay's escape surface. Without
-      # the gem the overlay falls back to the shared scanner (which refuses
-      # markup by design) and the test fails naming this step.
-      # setup-ruby, not the runner's system ruby: `gem install` against
-      # system ruby is a Gem::FilePermissionError, and the test asserts
-      # EXACT sanitizer output, so the ruby it runs on is part of the
-      # assertion. 3.4 is the version campfire-conformance pins.
-      #
-      # activerecord — the native Date reference uses ActiveRecord against
-      # in-memory SQLite. Fixture generation ships source, not its gems.
-      #
-      # sqlite3 — `tests/emit_and_run.rs` and `tests/relation_runtime_cruby.rs`
-      # run the emitted Ruby tree. The second skipped without the gem and
-      # passed: before this install the unit job ran it as a no-op.
-      #
-      # bcrypt — Campfire launcher regressions
-      # (`tests/ci_campfire_optimization_test.py`) preload
-      # `scripts/campfire-test-bcrypt.rb`. A runner without the gem fails
-      # those tests; a dev box that has it hides the gap.
-      #
-      # rack — the built-in Cable mount control sends real Rack requests.
-      #
-      # ruby-vips — pairs with libvips42 above; without the gem the vips
-      # loader test dies on `cannot load such file -- vips`.
-      #
-      # markly — `tests/emit_and_run.rs` renders through the real gem on the
-      # CRuby tree (Markly's flag constants, lobsters' Markdowner); without
-      # it the emitted tree's guarded require loads nothing and the test
-      # fails with NameError on Markly.
-      - name: Install gems used by emitted Ruby and Campfire harness tests
-        run: |
-          gem install --no-document rails-html-sanitizer sqlite3 bcrypt rack ruby-vips markly
-          gem install --no-document activerecord -v '~> 8.1.0'
-      # Bounded build → run → free waves: every --all-targets identity still
-      # goes through Cargo (lib, bins, each integration target). Finished
-      # integration executables and their own split-DWARF sidecars are freed
-      # after a successful batch so peak disk stays near one wave instead of
-      # all hundreds at once. Shared libraries, package binaries (including
-      # CARGO_BIN_EXE helpers), and fingerprints stay for later batches and
-      # the independent debug bench gate. No test result is cached or skipped.
-      - name: Build and run all test targets in batches
-        run: |
-          python3 scripts/ci-resources.py --out "$RUNNER_TEMP/unit-resources/tests" -- \
-            python3 scripts/ci-unit-tests.py --shard-index ${{ strategy.job-index }} --shard-count ${{ strategy.job-total }}
+          name: unit-test-bundle
+          overwrite: true
+          path: |
+            ${{ runner.temp }}/unit-tests/unit-tests.tar.zst
+            ${{ runner.temp }}/unit-tests/inventory.json
+          if-no-files-found: error
+          retention-days: 1
       - name: Upload test build timings
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: unit-build-timings-${{ matrix.shard }}
+          name: unit-build-timings-${{ github.run_attempt }}
           path: target/cargo-timings/
           if-no-files-found: ignore
-      # scripts/bench emits nine of its lanes with `cargo run --bin
-      # emit_preview` — the DEBUG profile — and nothing else in CI did:
-      # the site job and bin/rh run `--release`, whose frames are a
-      # fraction of the size. A debug-only stack overflow (bf2e160f's
-      # 45-term `||` chain) therefore passed CI green and took nine lanes
-      # off the published bench page. This is the harness's own shape,
-      # run here so the next one fails a PR instead of a nightly.
-      - name: Emit every bench lane in the debug profile (scripts/bench's shape)
-        if: matrix.shard == 0
+      - name: Upload unit build resource samples
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-build-resources-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/unit-build-resources/
+          if-no-files-found: ignore
+
+  unit:
+    needs: [generate-fixture, unit-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # A failed partition must not cancel the remaining coverage.
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      # Existing tests embed source and helper-binary paths at compile time.
+      # Match the producer's checkout and extraction paths exactly.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@v7
+      # Some test bodies build isolated Rust fixtures, so keep Cargo available.
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-nextest
+      - uses: actions/download-artifact@v8
+        with:
+          name: real-blog-fixture
+      - name: Extract fixture
+        run: tar -xzf real-blog.tar.gz
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.MRI_RUBY }}
+      # These gates exercise the actual gems, not optional runtime fallbacks.
+      - name: System libvips for the emitted ruby-vips processor
+        timeout-minutes: 20
         run: |
-          python3 scripts/ci-resources.py --out "$RUNNER_TEMP/unit-resources/bench" -- \
-            bash -euo pipefail -c '
-              test -x target/debug/emit_preview
-              for target in typescript crystal rust python elixir go kotlin swift csharp; do
-                target/debug/emit_preview --target "$target" fixtures/real-blog >/dev/null
-              done
-            '
+          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libvips42
+      - name: Install gems used by emitted Ruby and Campfire harness tests
+        run: |
+          gem install --no-document rails-html-sanitizer sqlite3 bcrypt rack ruby-vips markly
+          gem install --no-document activerecord -v '~> 8.1.0'
+      - name: Download current-run test bundle
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.unit-build.outputs.unit-test-artifact-id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/unit-tests
+      - name: Validate coverage and run this test partition
+        run: |
+          python3 scripts/ci-resources.py --out "$RUNNER_TEMP/unit-resources/tests" -- \
+            python3 scripts/ci-unit-tests.py run \
+              --archive "$RUNNER_TEMP/unit-tests/unit-tests.tar.zst" \
+              --inventory "$RUNNER_TEMP/unit-tests/inventory.json" \
+              --shard-index ${{ strategy.job-index }} --shard-count ${{ strategy.job-total }} \
+              --report "$RUNNER_TEMP/unit-resources/tests/shard.json"
+      - name: Upload unit test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-test-results-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
       - name: Upload unit resource samples
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: unit-resources-${{ matrix.shard }}
+          name: unit-resources-${{ matrix.shard }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/unit-resources/
           if-no-files-found: ignore
 
@@ -4011,7 +4019,7 @@ jobs:
     # can still require them. Unselected PR skips must not fail this gate.
     # cancelled() overrides GitHub's implicit success(): evaluate skipped
     # or failed needs, but do not schedule gates after workflow cancellation.
-    needs: [plan, generate-fixture, unit, build-roundhouse, store-check, compare, compare-ruby, compare-ruby-next, browser-smoke-typescript, campfire-conformance, campfire-compare]
+    needs: [plan, generate-fixture, unit-build, unit, build-roundhouse, store-check, compare, compare-ruby, compare-ruby-next, browser-smoke-typescript, campfire-conformance, campfire-compare]
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -4031,7 +4039,7 @@ jobs:
   # Informational validation summary; no branch-protection or merge policy.
   ci-summary:
     name: CI summary
-    needs: [plan, generate-fixture, unit, build-roundhouse, store-check, compare, compare-ruby, compare-ruby-next, browser-smoke-typescript, campfire-conformance, campfire-compare, campfire-latest, compact-required, compare-extra, compare-jruby, build-wasm, browser-smoke-ide, build-site, smoke, smoke-extra, spinel-build, spinel-framework, campfire-spinel-build, campfire-spinel-compare, campfire-spinel-db, spinel-toolchain, spinel-compare, spinel-smoke, campfire-archive-build, campfire-smoke, campfire-smoke-docker, archive-results, assemble-site]
+    needs: [plan, generate-fixture, unit-build, unit, build-roundhouse, store-check, compare, compare-ruby, compare-ruby-next, browser-smoke-typescript, campfire-conformance, campfire-compare, campfire-latest, compact-required, compare-extra, compare-jruby, build-wasm, browser-smoke-ide, build-site, smoke, smoke-extra, spinel-build, spinel-framework, campfire-spinel-build, campfire-spinel-compare, campfire-spinel-db, spinel-toolchain, spinel-compare, spinel-smoke, campfire-archive-build, campfire-smoke, campfire-smoke-docker, archive-results, assemble-site]
     # Report selected failures and expected skips; stop on workflow cancellation.
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest

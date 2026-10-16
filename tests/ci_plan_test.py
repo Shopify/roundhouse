@@ -91,6 +91,7 @@ class Routing(unittest.TestCase):
             ci.BASE,
             [
                 "generate-fixture",
+                "unit-build",
                 "unit",
                 "build-roundhouse",
                 "store-check",
@@ -225,6 +226,7 @@ class Routing(unittest.TestCase):
         needs = {
             "plan": {"result": "success"},
             "generate-fixture": {"result": "success"},
+            "unit-build": {"result": "success"},
             "unit": {"result": "success"},
             "build-roundhouse": {"result": "success"},
             "store-check": {"result": "success"},
@@ -1042,7 +1044,7 @@ class Results(unittest.TestCase):
 
     def test_speculative_success_cannot_hide_unit_or_compiler_failure(self):
         plan = ci.select([])
-        for job in ["unit", "build-roundhouse"]:
+        for job in ["unit-build", "unit", "build-roundhouse"]:
             for result in ["failure", "cancelled", "skipped", None]:
                 with self.subTest(job=job, result=result):
                     needs = self.needs(plan)

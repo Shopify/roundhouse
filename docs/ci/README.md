@@ -39,10 +39,10 @@ basecamp/once-campfire `main` on that app's own Ruby after every merge to
 a pull request's plan), advisory. It always
 surveys the strict emit and reports ingest gaps and strict-emit errors; it
 runs the suite, and reports tests against the pinned floor, only when the
-survey finds no ingest gap. Four unit shards cover all package test targets in
-bounded batches; ignored integrations need selected toolchain lanes. Framework
-and toolchain suites also run inside comparison jobs, not necessarily as
-standalone checks. **Spinel is not part of `BASE`.**
+survey finds no ingest gap. `unit-build` compiles one archive of all library,
+binary, and integration tests. Four unit shards partition the active cases;
+ignored integrations still need selected toolchain lanes. Framework and toolchain
+suites also run inside comparison jobs. **Spinel is not part of `BASE`.**
 
 That floor is the merge claim for ordinary analyzer, lowerer, and runtime
 work: the Ruby shape runs, and Campfire still matches Rails. Crystal, Go,
@@ -84,6 +84,29 @@ has no effect. Stacked labels prefer the broader lane:
 `ci:spinel`, unioned on `BASE`) > path ownership. Documentation-only PRs
 still receive checks; changes to the rendered user guide also select
 site/browser coverage.
+
+### Unit test execution
+
+`unit-build` creates a same-run Nextest archive and a complete case inventory.
+The test jobs download its exact artifact ID, including on failed-job reruns.
+They retain the fixture, Ruby gems, system libraries, and Rust toolchain needed
+by test bodies, but do not rebuild the workspace.
+
+Each job checks the source SHA, archive digest, workspace paths, case identities,
+and ignored states before execution. The four hash partitions must be disjoint
+and cover every active case. An empty combined suite or incomplete inventory
+fails the job. Build artifacts are shared; test results are never reused.
+
+Producer and consumer workspace paths stay identical because existing tests
+embed source and executable paths. Test binaries retain embedded backtrace line
+data. The producer runs documentation tests once, then explicitly rebuilds
+`emit_preview` in the unoptimized dev profile for the nine-target bench gate.
+
+The producer and every unit shard remain required. Per-attempt timing, resource,
+coverage, and test-result artifacts retain failure evidence without matrix
+output races. The runner and its contracts are
+[`ci-unit-tests.py`](../../scripts/ci-unit-tests.py) and
+[`ci_unit_tests_test.py`](../../tests/ci_unit_tests_test.py).
 
 ### Focus labels (narrow fix rounds)
 
@@ -225,7 +248,7 @@ Read the owner and its executable contract before editing:
 
 | Concern | Source | Tests |
 |---|---|---|
-| Coverage and execution | [ci.yml](../../.github/workflows/ci.yml), [ci-plan.py](../../scripts/ci-plan.py), [ci-unit-tests.py](../../scripts/ci-unit-tests.py) | `tests/ci_plan_test.py`, `tests/ci_plan_focus_test.py`, `tests/ci_policy_workflow.rs`, `tests/workflow_yaml_parses.rs` |
+| Coverage and execution | [ci.yml](../../.github/workflows/ci.yml), [ci-plan.py](../../scripts/ci-plan.py), [ci-unit-tests.py](../../scripts/ci-unit-tests.py) | `tests/ci_unit_tests_test.py`, `tests/ci_plan_test.py`, `tests/ci_plan_focus_test.py`, `tests/ci_policy_workflow.rs`, `tests/workflow_yaml_parses.rs` |
 | Toolchain selection | [ci.yml](../../.github/workflows/ci.yml), [`.ruby-version`](../../.ruby-version), [bin/rh](../../bin/rh) | `tests/ci_toolchain_workflow.rs`, `tests/rh_verify.rs` |
 | Receipt reuse | [ci-reuse.py](../../scripts/ci-reuse.py) | `tests/ci_reuse_test.py` |
 | Fixture caching | [generate-fixture in ci.yml](../../.github/workflows/ci.yml) | `tests/ci_fixture_workflow.rs` |

@@ -4,123 +4,6 @@ mod test_subprocess;
 
 use std::fs;
 
-#[test]
-fn unit_batches_all_targets_without_reducing_coverage() {
-    let ci: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    let unit = &ci["jobs"]["unit"];
-    assert!(unit.get("if").is_none());
-    assert!(unit.get("continue-on-error").is_none());
-    assert_eq!(unit["runs-on"].as_str(), Some("ubuntu-latest"));
-    assert_eq!(unit["strategy"]["fail-fast"].as_bool(), Some(false));
-    assert_eq!(unit["strategy"]["max-parallel"].as_u64(), Some(4));
-    assert_eq!(
-        unit["strategy"]["matrix"]["shard"],
-        serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[0, 1, 2, 3]").unwrap()
-    );
-    assert!(
-        unit.get("outputs").is_none(),
-        "no racing matrix artifact output"
-    );
-    assert_eq!(
-        unit["env"]["CARGO_PROFILE_TEST_SPLIT_DEBUGINFO"].as_str(),
-        Some("unpacked")
-    );
-    assert!(
-        ci["env"]
-            .get("CARGO_PROFILE_TEST_SPLIT_DEBUGINFO")
-            .is_none()
-    );
-    let steps = unit["steps"].as_sequence().unwrap();
-    let gems = steps
-        .iter()
-        .position(|step| {
-            step["name"].as_str()
-                == Some("Install gems used by emitted Ruby and Campfire harness tests")
-        })
-        .expect("install sqlite3, bcrypt and ruby-vips before the unit batches");
-    let install = steps[gems]["run"].as_str().unwrap();
-    assert!(
-        install.contains("sqlite3")
-            && install.contains("bcrypt")
-            && install.contains("ruby-vips")
-            && install.contains("rails-html-sanitizer")
-            && install.contains("activerecord"),
-        "{install}"
-    );
-    let vips = steps
-        .iter()
-        .position(|step| {
-            step["name"].as_str() == Some("System libvips for the emitted ruby-vips processor")
-        })
-        .expect("install libvips42 before ruby-vips");
-    let vips_run = steps[vips]["run"].as_str().unwrap();
-    assert!(
-        vips_run.contains("ci-apt-install") && vips_run.contains("libvips42"),
-        "{vips_run}"
-    );
-    assert!(
-        vips < gems,
-        "ruby-vips binds the system libvips; the package must be on the box first"
-    );
-    let tests = steps
-        .iter()
-        .position(|step| step["name"].as_str() == Some("Build and run all test targets in batches"))
-        .expect("batch every lib/bin/integration target through Cargo");
-    assert!(
-        gems < tests,
-        "Campfire launcher regressions require bcrypt before the batches"
-    );
-    assert!(steps[tests].get("if").is_none());
-    assert!(steps[tests].get("continue-on-error").is_none());
-    let body = steps[tests]["run"].as_str().unwrap();
-    assert!(body.contains("--out \"$RUNNER_TEMP/unit-resources/tests\" --"));
-    assert!(body.contains("python3 scripts/ci-unit-tests.py"));
-    assert!(body.contains(
-        "--shard-index ${{ strategy.job-index }} --shard-count ${{ strategy.job-total }}"
-    ));
-    assert!(
-        !body.contains("cargo test --locked --all-targets"),
-        "all-target peak must not rebuild every integration executable at once"
-    );
-    let timings = steps
-        .iter()
-        .find(|step| {
-            step["with"]["name"].as_str() == Some("unit-build-timings-${{ matrix.shard }}")
-        })
-        .expect("retain build timings for investigation");
-    assert_eq!(timings["if"].as_str(), Some("always()"));
-    assert_eq!(
-        timings["with"]["path"].as_str(),
-        Some("target/cargo-timings/")
-    );
-    let bench = steps
-        .iter()
-        .find(|step| {
-            step["name"].as_str()
-                == Some("Emit every bench lane in the debug profile (scripts/bench's shape)")
-        })
-        .expect("retain the independent dev-profile stack-overflow gate");
-    assert_eq!(bench["if"].as_str(), Some("matrix.shard == 0"));
-    assert!(bench.get("continue-on-error").is_none());
-    let body = bench["run"].as_str().unwrap();
-    assert!(body.contains("bash -euo pipefail -c"));
-    assert!(body.contains("typescript crystal rust python elixir go kotlin swift csharp"));
-    assert!(body.contains("target/debug/emit_preview --target"));
-    assert!(
-        !body.contains("cargo run"),
-        "shard 0 already built bins; do not pay cargo startup per lane"
-    );
-    let resources = steps
-        .iter()
-        .find(|step| step["with"]["name"].as_str() == Some("unit-resources-${{ matrix.shard }}"))
-        .expect("retain phase samples even when a command fails");
-    assert_eq!(resources["if"].as_str(), Some("always()"));
-    assert_eq!(
-        resources["with"]["path"].as_str(),
-        Some("${{ runner.temp }}/unit-resources/")
-    );
-}
 
 #[test]
 fn speculative_fanout_retains_selection_and_real_prerequisites() {
@@ -128,9 +11,14 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
     let jobs = &ci["jobs"];
     assert!(jobs.get("writebook-inventory").is_none());
-    assert_eq!(jobs["unit"]["needs"].as_str(), Some("generate-fixture"));
+    assert_eq!(jobs["unit-build"]["needs"].as_str(), Some("generate-fixture"));
+    assert_eq!(
+        jobs["unit"]["needs"],
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[generate-fixture, unit-build]").unwrap()
+    );
     assert_eq!(jobs["generate-fixture"]["needs"].as_str(), Some("plan"));
     assert!(jobs["generate-fixture"].get("if").is_none());
+    assert!(jobs["unit-build"].get("if").is_none());
     assert!(jobs["unit"].get("if").is_none());
     for name in [
         "build-roundhouse",
@@ -178,6 +66,7 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
     for name in ["compact-required", "ci-summary"] {
         let needs = jobs[name]["needs"].as_sequence().unwrap();
         for required in [
+            "unit-build",
             "unit",
             "build-roundhouse",
             "campfire-conformance",
