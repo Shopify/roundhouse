@@ -273,7 +273,7 @@ module Main
     # ENV would reject); params delegation gets the same merged hash the
     # controller sees.
     controller.request = ActionDispatch::Request.new(env.to_h, merged)
-    controller.request.path_parameters = matched.path_params
+    controller.request.path_parameters = Main.route_parameters(controller, matched)
     # The body's params alone, for ParamsWrapper (`Params.wrap`).
     controller.request.request_parameters = request[:body_params]
     # Same object, module-reachable — helpers are module functions with
@@ -484,6 +484,19 @@ module Main
     when :comments then CommentsController.new
     else ActiveStorage::Routes.instantiate_controller(sym)
     end
+  end
+
+  # Rails' `request.path_parameters`: the route's captures, with the
+  # controller and action the request was dispatched to. The
+  # controller's own `path_parameters` and params keep the captures alone.
+  def self.route_parameters(controller, matched)
+    out = {}
+    matched.path_params.each { |k, v| out[k] = v }
+    # The dispatched controller and action win over a capture of the same
+    # name: Rails dispatches by these two, so they name what ran.
+    out["controller"] = controller.controller_path
+    out["action"] = matched.action.to_s
+    out
   end
 
   # First-time setup. Idempotent: skips when already configured (so

@@ -1,7 +1,8 @@
 # frozen_string_literal: true
 module ActionDispatch
-  # Route captures exposed with String/Symbol-indifferent reads. Query
-  # parameters are kept separately by the request and never enter this map.
+  # Route captures exposed with String/Symbol-indifferent reads, with the
+  # route's "controller" and "action" as in Rails. Query parameters are
+  # kept separately by the request and never enter this map.
   class RequestPathParameters
     def initialize(values)
       @values = {}
@@ -22,6 +23,10 @@ module ActionDispatch
 
     def key?(key)
       @values.key?(key.to_s)
+    end
+
+    def to_h
+      @values
     end
   end
 end

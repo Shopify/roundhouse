@@ -471,6 +471,17 @@ module ActionView
       sanitize_engine(html.to_s, tags, attributes)
     end
 
+    # `sanitize(html, tags:, attributes:)` written in a view or helper —
+    # the caller's allow-lists, as `sanitize_allowing`, but the VIEW
+    # form: the CRuby overlay answers a safe buffer here, as it does for
+    # `sanitize`, where `sanitize_allowing` (a content filter's) stays a
+    # plain String. The keyword call is rewritten to this one at emit
+    # (emit/ruby/library.rs), since `sanitize`'s arity is fixed. campfire's
+    # `MessagesHelper#auto_link_text` is the caller.
+    def self.sanitize_with(html, tags, attributes)
+      sanitize_engine(html.to_s, tags, attributes)
+    end
+
     # ── the safe-list engine and its rule tables ─────────────────────
     #
     # Every table below is PORTED from the gems named above, not
@@ -654,6 +665,18 @@ module ActionView
                 i = after
               else
                 name = sanitize_tag_name(raw)
+                # The parser drops ONE newline (LF, CR, or CRLF) right
+                # after a <pre> or <listing> start tag, kept or stripped,
+                # so the gem's output has lost it — measured:
+                # "<pre>\n\nx</pre>" sanitizes to "<pre>\nx</pre>".
+                # campfire's auto_link_text test pins it.
+                if name == "pre" || name == "listing"
+                  if s[after, 2] == "\r\n"
+                    after = after + 2
+                  elsif s[after, 1] == "\n" || s[after, 1] == "\r"
+                    after = after + 1
+                  end
+                end
                 if name == "svg" || name == "math"
                   # Foreign content is PRUNED whole — children, text and
                   # all — matching the gem's namespace rule. A

@@ -15,6 +15,12 @@ module ActionDispatch
       # The pattern split on "/" once at construction, so a `Router.match`
       # table walk never re-splits it per request.
       def pattern_parts: () -> Array[String]
+      # Precomputed for `Router.admits`: the segment count, whether the
+      # last segment is a `*glob`, and the first segment when it is a
+      # plain literal ("" when it is dynamic).
+      def part_count: () -> Integer
+      def globbed: () -> bool
+      def lead: () -> String
 
       def initialize: (String verb, String pattern, Symbol controller, Symbol action, ?Symbol? req_format, ?String int_params, ?String seg_constraints) -> void
     end
@@ -63,6 +69,11 @@ module ActionDispatch
       Array[::ActionDispatch::Router::Route] table,
       String format
     ) -> ::ActionDispatch::Router::MatchResult?
+
+    # Whether a path of `count` segments whose first segment is `lead` can
+    # match `route` at all (segment count, `*glob` tail, leading literal);
+    # `match_parts` decides the rest.
+    def self.admits: (::ActionDispatch::Router::Route route, Integer count, String lead) -> bool
 
     # Is `ext` one of Rails' registered format extensions?
     def self.format_extension: (String ext) -> bool

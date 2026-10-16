@@ -35,8 +35,11 @@
 //!   8. `json.<key> obj, partial: P, as: V`
 //!                                       → one pair whose value is a
 //!                                       partial render of ONE object
-//!   9. `json.cache! key do … end`      → transparent: the block's
-//!                                       statements ARE the object's
+//!   9. `json.cache! key do … end`      → Jbuilder's fragment cache
+//!                                       when it wraps the whole
+//!                                       template; otherwise transparent:
+//!                                       the block's statements ARE the
+//!                                       object's
 //!  10. `if c … else … end` and the `if`/`unless` modifiers around any
 //!      of the above                    → the same `if`, each branch's
 //!                                       pairs appended inside it
@@ -59,14 +62,17 @@
 //! (6)-(9) arrived together with campfire's bot API, which is six
 //! jbuilder templates written in exactly that dialect.
 //!
-//! `cache!` is the one with a SEMANTIC gap behind it, so say it plainly:
-//! Jbuilder's is a fragment cache keyed on the record, and the emit has
-//! no fragment cache to put the rendered JSON in. Rendering the block
-//! every time is correct output at the wrong cost, which is the same
-//! trade `<% cache %>` already takes on the ERB side. Reading it as an
-//! ordinary `json.<key>` pair — which is what the classifier did before
-//! this — was neither: it emitted a literal `"cache!"` key holding the
-//! whole record.
+//! `cache!` is Jbuilder's fragment cache keyed on the record. A template
+//! that is one `cache!` around everything it writes is cached as Jbuilder
+//! caches it, through the controller's `perform_caching` and
+//! `combined_fragment_cache_key` and `JbuilderTemplate`'s read/write pair
+//! (`walk_cached_template`); the strict targets' runtime never caches, so
+//! there it renders every time. Any other `cache!` (among sibling pairs,
+//! nested, with options) is still read transparently: correct output at
+//! the wrong cost, the trade the ERB `<% cache %>` takes when it cannot
+//! build a key. Reading it as an ordinary `json.<key>` pair, which is
+//! what the classifier did before either, was neither: it emitted a
+//! literal `"cache!"` key holding the whole record.
 //!
 //! Still deferred: `json.key_format!`, `json.ignore_nil!` and
 //! `json.child!`.
@@ -316,27 +322,28 @@ fn build_library_class(
     // (a partial whose callers name its local `widget` reads that,
     // and the model is the one the name gives, as the param type).
     let params: Vec<&str> = method.params.iter().map(|p| p.name.as_str()).collect();
-    let (arg_name, arg_columns) = if arg_name.is_empty() {
-        (arg_name, std::collections::HashMap::new())
+    let (arg_name, arg_model) = if arg_name.is_empty() {
+        (arg_name, None)
     } else if !is_partial || params.contains(&arg_name.as_str()) {
-        let columns = columns_for_arg(&arg_name, dir, is_partial, stem, app);
-        (arg_name, columns)
+        let model = model_for_arg(dir, is_partial, stem, app);
+        (arg_name, model)
     } else {
         params
             .iter()
             .find_map(|p| match crate::lower::view_to_library::ivar_ty(p, &known_models) {
-                crate::ty::Ty::Class { id, .. } => {
-                    Some((p.to_string(), columns_for_model(id.0.as_str(), app)))
-                }
+                crate::ty::Ty::Class { id, .. } => Some((p.to_string(), Some(id.0.as_str().to_string()))),
                 _ => None,
             })
             .unwrap_or_default()
     };
+    let arg_columns = arg_model.as_deref().map(|m| columns_for_model(m, app)).unwrap_or_default();
+    let arg_attributes = arg_model.as_deref().and_then(|m| attribute_names(m, app));
     let ctx = Ctx {
         resource_dir: dir.to_string(),
         accumulator: "io".to_string(),
         arg_name: arg_name.clone(),
         arg_columns,
+        arg_attributes,
         direct_helpers: app
             .routes
             .direct_helpers
@@ -344,11 +351,15 @@ fn build_library_class(
             .map(|h| h.name.as_str().to_string())
             .collect(),
         models: known_models.iter().cloned().collect(),
+        model_columns: std::rc::Rc::new(
+            known_models.iter().map(|m| (m.clone(), columns_for_model(m, app))).collect(),
+        ),
         temps: Default::default(),
         key_marks: Default::default(),
         sound_merges: Default::default(),
         partials: partials.clone(),
         partial_key,
+        template: format!("{dir}/{base}"),
     };
 
     let mut body_stmts: Vec<Expr> = Vec::new();
@@ -602,6 +613,11 @@ struct Ctx {
     /// temporal columns through their storage text (see
     /// `temporal_column_json`) rather than the generic `encode_value`.
     arg_columns: std::collections::HashMap<Symbol, crate::schema::ColumnType>,
+    /// The keys Rails' `attributes` answers for the record `arg_name`
+    /// names, in order: its model's table columns. `None` when the arg
+    /// has no such model, or the model declares an attribute its table
+    /// lacks (the attribute API), which `attributes` would also hold.
+    arg_attributes: Option<Vec<String>>,
     /// Names declared by `direct :name do |…| … end`, without the
     /// `_path`/`_url` suffix. A direct helper's block parameter is
     /// whatever the CALLER hands it — campfire's `direct
@@ -617,6 +633,13 @@ struct Ctx {
     /// template SOLO, with only framework stubs registered, so
     /// `boost.message.room` has no type to ask.
     models: std::collections::HashSet<String>,
+    /// Each of those models' column-type tables, for an element of a
+    /// collection the template names by its model (`array!(widgets,
+    /// :created_at)` reads `Widget`'s columns as `arg_columns` reads
+    /// the template argument's).
+    model_columns: std::rc::Rc<
+        std::collections::HashMap<String, std::collections::HashMap<Symbol, crate::schema::ColumnType>>,
+    >,
     /// Counter for the method's synthesized collection locals
     /// (`__col0`, `__col1`, …), shared by every clone of the template's
     /// `Ctx` so two collection blocks never bind the same name.
@@ -635,6 +658,10 @@ struct Ctx {
     /// This template's own `partial_key` when it is a partial: the
     /// key its ivar parameters are under (`PartialParams::ivar_param`).
     partial_key: Option<(String, String)>,
+    /// The template's path under app/views without extensions
+    /// (`messages/_message`): what a `json.cache!` key names it by,
+    /// where Rails names it by its digest path.
+    template: String,
 }
 
 /// Classification of a single top-level statement in a jbuilder
@@ -710,6 +737,12 @@ enum JbStmt<'a> {
         item_var: Symbol,
         body: &'a Expr,
     },
+    /// `json.array! col, :a, :b` — the same array, each element the
+    /// object `json.extract!(element, :a, :b)` writes.
+    ArrayExtract {
+        collection: &'a Expr,
+        attrs: Vec<Symbol>,
+    },
     /// `Recv.call(args) do … end` on anything but `json`, whose block
     /// reaches `json` — a tenant scope, `I18n.with_locale`, a gem
     /// helper. The call stays as written; its block's pairs belong to
@@ -723,13 +756,124 @@ enum JbStmt<'a> {
     /// literal Hash with literal keys is its pairs, written at compile
     /// time; any other value is walked when the template runs.
     Merge { value: &'a Expr },
+    /// `json.extract!(obj, *attrs)` / `json.(obj, params[:f])`: an
+    /// attribute list that is not all literal names, so the keys are
+    /// not known when the template is lowered. Jbuilder writes one pair
+    /// per name, whatever the list holds. Reported, never dropped.
+    ExtractDynamic,
+    /// `json.array! col, :a, fields: :b`: a Hash among the arguments that
+    /// is not `partial:` + `as:` options. Jbuilder takes it for an
+    /// attribute name and raises (`TypeError: {fields: :b} is not a
+    /// symbol nor a string`). Reported, never dropped.
+    ArrayHashArgument,
     /// Unrecognized DSL or non-Send statement. Surfaces as an empty io
     /// append so the lowered body stays well-formed.
     Unknown,
 }
 
 fn walk_template(body: &Expr, ctx: &Ctx) -> Vec<Expr> {
+    if let Some(cached) = walk_cached_template(body, ctx) {
+        return cached;
+    }
     emit_object(&flatten_cache_blocks(stmts_of(body)), ctx)
+}
+
+/// A template that is ONE `json.cache! key do … end` around everything
+/// it writes (campfire's message, boost and user partials): Jbuilder's
+/// fragment cache, as `JbuilderTemplate#cache!` runs it.
+///
+/// ```ruby
+/// if ActionView::ViewHelpers.jbuilder_caching?
+///   k = ActionView::ViewHelpers.jbuilder_cache_key("messages/_message", message)
+///   hit = ActionView::ViewHelpers.jbuilder_fragment_read(k)
+///   if hit.nil?
+///     cap = String.new
+///     … the block's object, into cap …
+///     io << ActionView::ViewHelpers.jbuilder_fragment_write(k, cap)
+///   else
+///     io << hit
+///   end
+/// else
+///   … the block's object, into io …
+/// end
+/// ```
+///
+/// The cached value is the object's JSON text where Jbuilder caches the
+/// object's Hash: the template writes nothing else, so the two are the
+/// same fragment. The key is built only when the controller caches, as
+/// Jbuilder builds it only then (an app's `combined_fragment_cache_key`
+/// may read the request). A `cache!` among other statements, with
+/// options, or nested, stays transparent (`flatten_cache_blocks`): the
+/// block renders every time.
+fn walk_cached_template(body: &Expr, ctx: &Ctx) -> Option<Vec<Expr>> {
+    let stmts = stmts_of(body);
+    let [only] = stmts.as_slice() else { return None };
+    let ExprNode::Send { recv: Some(recv), method, args, block: Some(block), .. } = &*only.node else {
+        return None;
+    };
+    if method.as_str() != "cache!" || !is_json_receiver(recv) {
+        return None;
+    }
+    let [key] = args.as_slice() else { return None };
+    if matches!(&*key.node, ExprNode::Hash { .. }) {
+        return None;
+    }
+    let ExprNode::Lambda { body: inner, .. } = &*block.node else { return None };
+    let inner_stmts = flatten_cache_blocks(stmts_of(inner));
+
+    let n = ctx.temps.get();
+    ctx.temps.set(n + 1);
+    let key_var = Symbol::from(format!("__jb_key{n}"));
+    let hit_var = Symbol::from(format!("__jb_hit{n}"));
+    let cap = format!("__jb_io{n}");
+    let cap_ctx = Ctx { accumulator: cap.clone(), ..ctx.clone() };
+
+    let helpers = || const_path(&[Symbol::from("ActionView"), Symbol::from("ViewHelpers")]);
+    let assign = |name: &Symbol, value: Expr| {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Assign { target: LValue::Var { id: VarId(0), name: name.clone() }, value },
+        )
+    };
+    let if_expr = |cond: Expr, then_branch: Expr, else_branch: Expr| {
+        Expr::new(Span::synthetic(), ExprNode::If { cond, then_branch, else_branch })
+    };
+
+    let mut miss = vec![assign_accumulator_string_new(&cap)];
+    miss.extend(emit_object(&inner_stmts, &cap_ctx));
+    let mut cap_result = var_ref(Symbol::from(cap.as_str()));
+    cap_result.hint = Some(IrHint::StringBuilderResult);
+    miss.push(io_append_call(
+        &ctx.accumulator,
+        send(Some(helpers()), "jbuilder_fragment_write", vec![var_ref(key_var.clone()), cap_result], None, true),
+    ));
+    let cached = seq(vec![
+        assign(
+            &key_var,
+            send(
+                Some(helpers()),
+                "jbuilder_cache_key",
+                vec![lit_str(ctx.template.clone()), key.clone()],
+                None,
+                true,
+            ),
+        ),
+        assign(
+            &hit_var,
+            send(Some(helpers()), "jbuilder_fragment_read", vec![var_ref(key_var.clone())], None, true),
+        ),
+        if_expr(
+            send(Some(var_ref(hit_var.clone())), "nil?", Vec::new(), None, false),
+            seq(miss),
+            io_append_call(&ctx.accumulator, var_ref(hit_var.clone())),
+        ),
+    ]);
+    let uncached = seq(emit_object(&inner_stmts, ctx));
+    Some(vec![if_expr(
+        send(Some(helpers()), "jbuilder_caching?", Vec::new(), None, false),
+        cached,
+        uncached,
+    )])
 }
 
 /// A template body's top-level statements. A one-statement template is
@@ -800,7 +944,7 @@ fn emit_object_filled(raw_stmts: &[&Expr], ctx: &Ctx) -> (Vec<Expr>, bool) {
         // `[]`); a partial's object is empty when the partial may set
         // nothing.
         let filled = match only {
-            JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. } => true,
+            JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. } | JbStmt::ArrayExtract { .. } => true,
             JbStmt::Partial { partial_path, .. } => partial_always_filled(partial_path, ctx),
             _ => false,
         };
@@ -815,6 +959,7 @@ fn emit_object_filled(raw_stmts: &[&Expr], ctx: &Ctx) -> (Vec<Expr>, bool) {
             JbStmt::ArrayBlock { collection, item_var, body } => {
                 Some(emit_array_block(collection, item_var, body, ctx))
             }
+            JbStmt::ArrayExtract { collection, attrs } => Some(emit_array_extract(collection, attrs, ctx)),
             JbStmt::PartialRecord { arg, as_name } => {
                 record_partial_path(arg, as_name.as_ref(), &ctx.resource_dir, &ctx.models)
                     .map(|(partial_path, local)| {
@@ -858,7 +1003,10 @@ fn emit_object_filled(raw_stmts: &[&Expr], ctx: &Ctx) -> (Vec<Expr>, bool) {
 /// the walker writes as an empty append (`JbStmt::Unknown`).
 fn has_unlowered(stmts: &[&Expr], ctx: &Ctx) -> bool {
     stmts.iter().any(|s| match classify(s) {
-        JbStmt::Unknown | JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. } => true,
+        JbStmt::Unknown
+        | JbStmt::ArrayPartial { .. }
+        | JbStmt::ArrayBlock { .. }
+        | JbStmt::ArrayExtract { .. } => true,
         JbStmt::PartialRecord { arg, as_name } => {
             record_partial_path(arg, as_name.as_ref(), &ctx.resource_dir, &ctx.models).is_none()
         }
@@ -870,7 +1018,7 @@ fn has_unlowered(stmts: &[&Expr], ctx: &Ctx) -> bool {
                 || rescues.iter().any(|r| has_unlowered(&branch_stmts(&r.body), ctx))
         }
         JbStmt::Around { body, .. } => has_unlowered(&branch_stmts(body), ctx),
-        JbStmt::AroundUnlowered => true,
+        JbStmt::AroundUnlowered | JbStmt::ExtractDynamic | JbStmt::ArrayHashArgument => true,
         JbStmt::Merge { value } => !merge_lowers(s, value, ctx),
         _ => false,
     })
@@ -1011,6 +1159,16 @@ fn emit_pairs(
     mut sep: Sep,
 ) -> Sep {
     for (stmt, src) in classified.iter().zip(raw_stmts.iter()) {
+        // `json.merge!(record.attributes…)` proved sound: the pairs
+        // `extract!` writes for the same attributes.
+        if let JbStmt::Merge { value } = stmt {
+            if let Some((obj, attrs)) = attributes_merge(value, ctx) {
+                if ctx.sound_merges.borrow().contains(&(*src as *const Expr as usize)) {
+                    sep = emit_pairs(&[JbStmt::Extract { obj, attrs }], &[*src], ctx, out, sep);
+                    continue;
+                }
+            }
+        }
         // Synthesis choke point: everything pushed for this DSL
         // statement (key/comma appends, encode_value calls) attributes
         // back to it. The `{` / `}` wrappers belong to the template as
@@ -1143,7 +1301,7 @@ fn emit_pairs(
                     None => out.push(io_append_lit(&ctx.accumulator, "")),
                 }
             }
-            JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. } => {
+            JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. } | JbStmt::ArrayExtract { .. } => {
                 // An array is not merged into an object (jbuilder raises
                 // a MergeError once the object has a pair): drop a
                 // marker rather than emit malformed JSON.
@@ -1210,6 +1368,30 @@ fn emit_pairs(
                     src.span,
                     "jbuilder block on a non-json call",
                     "the block reaches `json` but its parameters or form cannot be lowered",
+                ));
+            }
+            JbStmt::ExtractDynamic => {
+                crate::ingest::survey::record(&crate::ingest::IngestError::Unsupported {
+                    file: String::new(),
+                    message: "jbuilder: `json.extract!`, `json.call` or `json.array!` with an attribute list that is not all literal names"
+                        .to_string(),
+                });
+                out.push(unsupported_stmt(
+                    src.span,
+                    "jbuilder extract! with dynamic attributes",
+                    "only literal attribute names are lowered; a splat, a param, an ivar or a constant names keys known only at run time",
+                ));
+            }
+            JbStmt::ArrayHashArgument => {
+                crate::ingest::survey::record(&crate::ingest::IngestError::Unsupported {
+                    file: String::new(),
+                    message: "jbuilder: `json.array!` with a Hash argument that is not `partial:` and `as:` options"
+                        .to_string(),
+                });
+                out.push(unsupported_stmt(
+                    src.span,
+                    "jbuilder array! with a Hash that is not partial options",
+                    "Jbuilder takes the Hash for an attribute name and raises TypeError; only `partial:` with `as:` is an option",
                 ));
             }
             JbStmt::Merge { value } if merge_lowers(src, value, ctx) => {
@@ -1307,6 +1489,59 @@ fn emit_merge(value: &Expr, ctx: &Ctx, out: &mut Vec<Expr>, mut sep: Sep) -> Sep
     if sep == Sep::After { Sep::After } else { Sep::Unknown }
 }
 
+/// `json.merge!(record.attributes)`, narrowed by any chain of
+/// `except(...)` / `slice(...)` with literal keys: the record and the
+/// attributes the merge writes, in the order Rails' Hash answers them.
+/// `attributes` is the record's columns under String keys, in column
+/// order (an enum column under its label), so the merge is the object
+/// `json.extract!(record, *those)` builds. Only for the template's own
+/// record, whose model's columns are known (`Ctx::arg_attributes`).
+///
+/// The Hash is String-keyed: a Symbol passed to `except` / `slice`
+/// names no key, as on Rails' plain Hash. `slice` answers in its
+/// arguments' order.
+fn attributes_merge<'a>(value: &'a Expr, ctx: &Ctx) -> Option<(&'a Expr, Vec<Symbol>)> {
+    let mut ops: Vec<(bool, Vec<Option<String>>)> = Vec::new();
+    let mut cur = value;
+    let record = loop {
+        let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*cur.node else { return None };
+        match method.as_str() {
+            "except" | "slice" => {
+                let keys = args
+                    .iter()
+                    .map(|a| match &*a.node {
+                        ExprNode::Lit { value: Literal::Sym { .. } } => Some(None),
+                        _ => string_literal(a).map(Some),
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                ops.push((method.as_str() == "slice", keys));
+                cur = recv;
+            }
+            "attributes" if args.is_empty() => break recv,
+            _ => return None,
+        }
+    };
+    if !obj_is_named_local(record, &ctx.arg_name) {
+        return None;
+    }
+    let mut keys: Vec<String> = ctx.arg_attributes.clone()?;
+    for (slice, names) in ops.into_iter().rev() {
+        let names: Vec<String> = names.into_iter().flatten().collect();
+        keys = if slice {
+            let mut picked: Vec<String> = Vec::new();
+            for n in names {
+                if keys.contains(&n) && !picked.contains(&n) {
+                    picked.push(n);
+                }
+            }
+            picked
+        } else {
+            keys.into_iter().filter(|k| !names.contains(k)).collect()
+        };
+    }
+    Some((record, keys.into_iter().map(Symbol::from).collect()))
+}
+
 /// Whether a `json.merge!` statement is lowered: a literal Hash its
 /// object proved sound (`mark_sound_merges`), or any other value whose
 /// type is a Hash. Anything else (an Array, which Jbuilder renders as
@@ -1324,11 +1559,11 @@ fn merge_lowers(stmt: &Expr, value: &Expr, ctx: &Ctx) -> bool {
 /// all known: a pair's key, `extract!`'s attributes, a literal merge's
 /// keys, both branches of a condition. `None` for a partial, a block
 /// on another call, a merge of a non-literal, or anything unknown.
-fn object_keys(stmt: &JbStmt<'_>) -> Option<Vec<String>> {
+fn object_keys(stmt: &JbStmt<'_>, ctx: &Ctx) -> Option<Vec<String>> {
     let branch = |body: &Expr| -> Option<Vec<String>> {
         let mut keys = Vec::new();
         for s in branch_stmts(body) {
-            keys.extend(object_keys(&classify(s))?);
+            keys.extend(object_keys(&classify(s), ctx)?);
         }
         Some(keys)
     };
@@ -1338,7 +1573,10 @@ fn object_keys(stmt: &JbStmt<'_>) -> Option<Vec<String>> {
         | JbStmt::PairPartial { key, .. }
         | JbStmt::Nested { key, .. }
         | JbStmt::PairBlock { key, .. } => Some(vec![key.as_str().to_string()]),
-        JbStmt::Merge { value } => literal_merge_pairs(value).map(|pairs| pairs.into_iter().map(|(k, _)| k).collect()),
+        JbStmt::Merge { value } => match literal_merge_pairs(value) {
+            Some(pairs) => Some(pairs.into_iter().map(|(k, _)| k).collect()),
+            None => attributes_merge(value, ctx).map(|(_, attrs)| attrs.iter().map(|a| a.as_str().to_string()).collect()),
+        },
         JbStmt::Local => Some(Vec::new()),
         JbStmt::Cond { then_branch, else_branch, .. } => {
             let mut keys = branch(then_branch)?;
@@ -1357,16 +1595,19 @@ fn object_keys(stmt: &JbStmt<'_>) -> Option<Vec<String>> {
 fn mark_sound_merges(classified: &[JbStmt<'_>], raw_stmts: &[&Expr], ctx: &Ctx) {
     for (i, stmt) in classified.iter().enumerate() {
         let JbStmt::Merge { value } = stmt else { continue };
-        let Some(own) = literal_merge_pairs(value).map(|pairs| pairs.into_iter().map(|(k, _)| k).collect::<Vec<_>>())
-        else {
-            continue;
+        let own = match literal_merge_pairs(value) {
+            Some(pairs) => pairs.into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            None => match attributes_merge(value, ctx) {
+                Some((_, attrs)) => attrs.iter().map(|a| a.as_str().to_string()).collect(),
+                None => continue,
+            },
         };
         let distinct: std::collections::HashSet<&String> = own.iter().collect();
         if distinct.len() != own.len() {
             continue;
         }
         let mut others: Vec<String> = Vec::new();
-        let known = classified.iter().enumerate().filter(|(j, _)| *j != i).all(|(_, c)| match object_keys(c) {
+        let known = classified.iter().enumerate().filter(|(j, _)| *j != i).all(|(_, c)| match object_keys(c, ctx) {
             Some(keys) => {
                 others.extend(keys);
                 true
@@ -1541,17 +1782,12 @@ fn classify<'a>(stmt: &'a Expr) -> JbStmt<'a> {
             let Some((obj, rest)) = args.split_first() else {
                 return JbStmt::Unknown;
             };
-            let mut attrs: Vec<Symbol> = Vec::new();
-            for a in rest {
-                if let ExprNode::Lit {
-                    value: Literal::Sym { value },
-                } = &*a.node
-                {
-                    attrs.push(value.clone());
-                } else {
-                    return JbStmt::Unknown;
-                }
-            }
+            // Silently writing nothing for this statement is a 200 with
+            // keys missing; a list that is not all literal names is
+            // refused instead.
+            let Some(attrs) = literal_attribute_names(rest) else {
+                return JbStmt::ExtractDynamic;
+            };
             JbStmt::Extract { obj, attrs }
         }
         // `json.merge!(hash)`: Jbuilder merges the hash's pairs into
@@ -1572,6 +1808,26 @@ fn classify<'a>(stmt: &'a Expr) -> JbStmt<'a> {
                 if let Some((item_var, body)) = item_block(block) {
                     return JbStmt::ArrayBlock { collection, item_var, body };
                 }
+            }
+            // `json.array! col, :a, :b` — no options, attribute names:
+            // Jbuilder extracts them from each element
+            // (`_map_collection` over `extract!`).
+            let rest = &args[1..];
+            // JbuilderTemplate#array! reads its FIRST extra argument as
+            // options only when it holds both `partial:` and `as:`
+            // (`_partial_options?`); any other Hash is an attribute name
+            // to `_extract`, which raises. Refused rather than dropped.
+            let partial_options = rest.first().and_then(|a| extract_hash(a)).is_some_and(|opts| {
+                hash_get_value(opts, "partial").is_some() && hash_get_value(opts, "as").is_some()
+            });
+            if block.is_none() && !partial_options && rest.iter().any(|a| extract_hash(a).is_some()) {
+                return JbStmt::ArrayHashArgument;
+            }
+            if block.is_none() && !rest.is_empty() && !rest.iter().any(|a| extract_hash(a).is_some()) {
+                return match literal_attribute_names(rest) {
+                    Some(attrs) => JbStmt::ArrayExtract { collection, attrs },
+                    None => JbStmt::ExtractDynamic,
+                };
             }
             let Some(opts) = args.iter().skip(1).find_map(extract_hash) else {
                 return JbStmt::Unknown;
@@ -1793,6 +2049,81 @@ fn mentions_json(e: &Expr) -> bool {
     found
 }
 
+/// The names of an `extract!`/`array!` attribute list, when every one is
+/// a literal: a Symbol, or a String, which Jbuilder writes as given just
+/// the same. A String is taken only when it is a method name the
+/// lowered `record.<name>` read can spell. `None` for anything else.
+fn literal_attribute_names(args: &[Expr]) -> Option<Vec<Symbol>> {
+    args.iter()
+        .map(|a| match &*a.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
+            ExprNode::Lit { value: Literal::Str { value } } if is_plain_method_name(value) => {
+                Some(Symbol::from(value.as_str()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_plain_method_name(name: &str) -> bool {
+    let body = name.strip_suffix(['?', '!']).unwrap_or(name);
+    let mut chars = body.chars();
+    chars.next().is_some_and(|c| c == '_' || c.is_ascii_lowercase())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// `json.array! col, :a, :b`: `emit_array_block` over the element
+/// block `{ |__item| json.extract!(__item, :a, :b) }`, which is what
+/// Jbuilder runs for each element.
+///
+/// Only over a collection whose elements are known to be records: one
+/// the template names by a model (`widgets`, typed `Array[Widget]` as
+/// the template's parameter is). The element then reads its temporal
+/// columns from their storage text, as the template argument's do.
+/// Jbuilder reads a Hash element with `fetch` instead, and a collection
+/// of anything else is not known to answer `element.a`, so any other
+/// collection is refused rather than lowered to a read that raises.
+fn emit_array_extract(collection: &Expr, attrs: &[Symbol], ctx: &Ctx) -> Vec<Expr> {
+    let models: Vec<String> = ctx.models.iter().cloned().collect();
+    let model = match &*collection.node {
+        ExprNode::Var { name, .. } => Some(name.as_str()),
+        ExprNode::Send { recv: None, method, args, block: None, .. } if args.is_empty() => {
+            Some(method.as_str())
+        }
+        _ => None,
+    }
+    .and_then(|name| match crate::lower::view_to_library::ivar_ty(name, &models) {
+        crate::ty::Ty::Array { elem } => match &*elem {
+            crate::ty::Ty::Class { id, .. } => Some(id.0.as_str().to_string()),
+            _ => None,
+        },
+        _ => None,
+    });
+    let Some(model) = model else {
+        crate::ingest::survey::record(&crate::ingest::IngestError::Unsupported {
+            file: String::new(),
+            message: "jbuilder: `json.array!` with attribute names over a collection whose elements are not known to be records"
+                .to_string(),
+        });
+        return vec![unsupported_stmt(
+            collection.span,
+            "jbuilder array! with attribute names over an untyped collection",
+            "only a collection named by its model (`@widgets`) is lowered; Jbuilder reads a Hash element with fetch and other elements by method",
+        )];
+    };
+    let item = Symbol::from("__item");
+    let mut args = vec![var_ref(item.clone())];
+    args.extend(attrs.iter().map(|a| {
+        Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Sym { value: a.clone() } })
+    }));
+    let json = send(None, "json", Vec::new(), None, false);
+    let body = send(Some(json), "extract!", args, None, true);
+    let mut inner = ctx.clone();
+    inner.arg_name = item.as_str().to_string();
+    inner.arg_columns = ctx.model_columns.get(&model).cloned().unwrap_or_default();
+    emit_array_block(collection, &item, &body, &inner)
+}
+
 fn is_json_receiver(recv: &Expr) -> bool {
     matches!(
         &*recv.node,
@@ -1981,7 +2312,7 @@ fn emit_array_block(collection: &Expr, item_var: &Symbol, body: &Expr, ctx: &Ctx
     };
     // Whether every element sets a pair: a partial may set nothing,
     // unless its template always does.
-    let mut filled = false;
+    let filled;
     let element = match single_partial {
         Some((partial_path, locals)) => {
             filled = partial_always_filled(&partial_path, ctx);
@@ -2295,7 +2626,11 @@ fn partial_params(app: &App) -> PartialParams {
 /// call counts as possibly empty.
 fn template_always_filled(stmts: &[&Expr]) -> bool {
     let mut dsl = stmts.iter().map(|s| classify(s)).filter(|c| !matches!(c, JbStmt::Local));
-    if let (Some(JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. }), None) = (dsl.next(), dsl.next()) {
+    if let (
+        Some(JbStmt::ArrayPartial { .. } | JbStmt::ArrayBlock { .. } | JbStmt::ArrayExtract { .. }),
+        None,
+    ) = (dsl.next(), dsl.next())
+    {
         return true;
     }
     sets_a_pair(stmts)
@@ -2960,46 +3295,56 @@ fn obj_is_named_local(obj: &Expr, name: &str) -> bool {
     }
 }
 
-/// Build the `{column_name → ColumnType}` map for the template's
-/// main positional arg, when that arg resolves to a known model
-/// backed by a schema table. Returns an empty map for layouts,
-/// index views (arg is a collection, not a single record), and any
-/// arg we can't tie back to a schema row.
-fn columns_for_arg(
-    arg_name: &str,
-    dir: &str,
-    is_partial: bool,
-    stem: &str,
-    app: &App,
-) -> std::collections::HashMap<Symbol, crate::schema::ColumnType> {
-    let mut out: std::collections::HashMap<Symbol, crate::schema::ColumnType> =
-        std::collections::HashMap::new();
+/// The model the template's main positional arg is a record of, when
+/// it resolves to a known model backed by a schema table. `None` for
+/// layouts, index views (the arg is a collection, not a single record),
+/// and any arg we can't tie back to a schema row.
+fn model_for_arg(dir: &str, is_partial: bool, stem: &str, app: &App) -> Option<String> {
     // Index views' arg is the plural collection (`articles`), not a
     // single record. Per-row column lookups don't apply — the
     // extract! inside the partial handles those instead.
-    if !is_partial && stem == "index" {
-        return out;
+    if (!is_partial && stem == "index") || dir == "layouts" {
+        return None;
     }
-    if dir == "layouts" {
-        return out;
-    }
-    let model_class = crate::naming::singularize_camelize(dir);
-    out = columns_for_model(&model_class, app);
+    let backed = |m: String| (!columns_for_model(&m, app).is_empty()).then_some(m);
     // A namespaced view directory (`api/v1/widgets`) names its record by
     // the last segment, as Rails' partial lookup does: the namespace is
     // the controller's. A namespaced model (`admin/widgets` for
     // `Admin::Widget`) is tried first.
-    if out.is_empty() {
-        if let Some((_, last)) = dir.rsplit_once('/') {
-            out = columns_for_model(&crate::naming::classify_path(dir), app);
-            if out.is_empty() {
-                out = columns_for_model(&crate::naming::singularize_camelize(last), app);
+    backed(crate::naming::singularize_camelize(dir)).or_else(|| {
+        let (_, last) = dir.rsplit_once('/')?;
+        backed(crate::naming::classify_path(dir)).or_else(|| backed(crate::naming::singularize_camelize(last)))
+    })
+}
+
+/// Rails' `attributes` keys for `model_class`, in order: its table's
+/// columns. `None` when the model declares an attribute the table lacks
+/// (the attribute API adds it to `attributes`), or changes which columns
+/// are attributes (`ignored_columns`, which Rails leaves out of
+/// `attributes`, or `inheritance_column`): the same declarations
+/// `as_json_record` does not read.
+fn attribute_names(model_class: &str, app: &App) -> Option<Vec<String>> {
+    use crate::lower::as_json_record::{ATTRIBUTE_MACROS, COLUMN_SETTERS};
+    let model = app.models.iter().find(|m| m.name.0.as_str() == model_class)?;
+    let changes_columns = model.body.iter().any(|item| match item {
+        crate::dialect::ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
+            ExprNode::Send { recv, method, .. } => {
+                COLUMN_SETTERS.contains(&method.as_str())
+                    || (recv.is_none() && ATTRIBUTE_MACROS.contains(&method.as_str()))
             }
-        }
+            _ => false,
+        },
+        _ => false,
+    });
+    if changes_columns {
+        return None;
     }
-    let _ = arg_name; // arg_name is informational; the dir → model
-                     // resolution above is the load-bearing path.
-    out
+    let table = app.schema.tables.get(&model.table.0)?;
+    let columns: Vec<String> = table.columns.iter().map(|c| c.name.as_str().to_string()).collect();
+    if model.attributes.fields.keys().any(|k| !columns.iter().any(|c| c == k.as_str())) {
+        return None;
+    }
+    Some(columns)
 }
 
 /// The `{column_name → ColumnType}` map of `model_class`'s table; empty

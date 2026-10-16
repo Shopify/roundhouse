@@ -56,6 +56,10 @@ const CORE_VALUE_CONSTS: &[(&str, &str, fn() -> Ty)] = &[
     ("Float", "MAX", || Ty::Float),
     ("Float", "MIN", || Ty::Float),
     ("IO", "NULL", || Ty::Str),
+    // `Regexp.new(selector, Regexp::IGNORECASE)` — lobsters' domain selectors.
+    ("Regexp", "IGNORECASE", || Ty::Int),
+    ("Regexp", "EXTENDED", || Ty::Int),
+    ("Regexp", "MULTILINE", || Ty::Int),
     ("File", "NULL", || Ty::Str),
     // `File.open(path, File::RDWR | File::CREAT, 0644)` and
     // `file.flock(File::LOCK_EX | File::LOCK_NB)` — campfire's WAL
@@ -102,6 +106,7 @@ const CORE_VALUE_CLASSES: &[(&str, &str)] = &[
     ("File", "IO"),
     ("Encoding", "Object"),
     ("OpenSSL::SSL", "Object"),
+    ("Regexp", "Object"),
 ];
 
 fn encoding_ty() -> Ty {

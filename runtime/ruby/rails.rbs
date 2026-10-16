@@ -88,6 +88,7 @@ module Rails
     ENV_CONFIG: Hash[String, Symbol?]
     def env_config: () -> Hash[String, Symbol?]
     def config_time_zone: () -> String
+    def config_filter_parameters: () -> Array[String]
     def active_storage_excluded_content_types: () -> Array[String]
     def active_storage_video_preview_arguments: () -> String
     def active_storage_previewers: () -> Array[untyped]

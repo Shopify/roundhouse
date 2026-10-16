@@ -1088,6 +1088,61 @@ end
                 }
             }
         }
+        // `config.filter_parameters += [:passw, …]` — the keys Rails
+        // masks in `request.filtered_parameters`. Application body
+        // first, then the initializers in load order, as Rails runs
+        // them. (Rails also copies the list into
+        // `ActiveSupport.filter_parameters` for the event reporter; the
+        // runtime's stays the reporter's own, as before.) Synthesized as
+        // `config_filter_parameters` on the reopen, over the framework
+        // default (`[]`) in runtime/ruby/rails.rb. A Regexp, Proc or
+        // computed operand is not read; the survey names it.
+        {
+            let mut names: Vec<String> = Vec::new();
+            let mut seen = false;
+            let mut fold = |bytes: &[u8], file: &Path| {
+                for line in extract_filter_parameters(bytes) {
+                    match line {
+                        FilterParametersLine::Literal { replace, names: more } => {
+                            seen = true;
+                            if replace {
+                                names.clear();
+                            }
+                            names.extend(more);
+                        }
+                        FilterParametersLine::Computed { replace } => {
+                            // A computed `=` still replaces what came before
+                            // it; only its own operand goes unread.
+                            if replace {
+                                seen = true;
+                                names.clear();
+                            }
+                            survey::record(&IngestError::Unsupported {
+                                file: file.display().to_string(),
+                                message: "config.filter_parameters is not a list of Symbol or String literals; request.filtered_parameters does not apply it".to_string(),
+                            })
+                        }
+                    }
+                }
+            };
+            fold(&source, &app_config_path);
+            let init_dir = dir.join("config/initializers");
+            if vfs.is_dir(&init_dir) {
+                for entry in read_rb_files(vfs, &init_dir)? {
+                    if let Ok(bytes) = vfs.read(&entry) {
+                        fold(&bytes, &entry);
+                    }
+                }
+            }
+            if seen {
+                let literal = names.iter().map(|n| format!("{n:?}")).collect::<Vec<_>>().join(", ");
+                if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
+                    "def config_filter_parameters\n  [{literal}]\nend\n"
+                )) {
+                    methods.append(&mut synth);
+                }
+            }
+        }
         // `Vips.block_untrusted(true)` / `Vips.block("<op>", true)` —
         // an initializer setting libvips' loader policy before any
         // upload is decoded (any app that stores user uploads; campfire
@@ -1357,11 +1412,17 @@ end
                 }
                 app.module_mixins.extend(mixins);
                 app.initializer_filters.extend(extract_initializer_filters(&bytes, &path_str));
+                if let Some(store) = extract_collection_cache_store(&bytes, &path_str) {
+                    app.collection_cache_store = Some(store);
+                }
                 app.sql_functions
                     .extend(super::sql_functions::extract_sql_functions(&bytes, &path_str));
             }
         }
     }
+    // `config/database.yml`'s `pragmas:`, run on each connection after
+    // the Db shim's own (see `database_yml`).
+    app.database_pragmas = super::database_yml::database_pragmas(vfs, dir);
 
     // Each controller's lexical nesting, for resolving its superclass
     // once every controller is known (see
@@ -1840,10 +1901,21 @@ end
             }
         }
     }
-    let gem_files = match &app.gem_lock {
+    let (mut gem_files, missing_gems) = match &app.gem_lock {
         Some(lock) => crate::i18n::gems::gem_locale_files(vfs, dir, lock, &path_gem_dirs(vfs, dir)),
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
+    let application_rb = vfs.read_to_string(&dir.join("config/application.rb")).unwrap_or_default();
+    let configured = application_rb.lines().map(str::trim).filter(|l| !l.starts_with('#')).find_map(available_locales_line).and_then(Result::ok);
+    gem_files.retain(|(path, _)| crate::i18n::rails_i18n::loads(path, &application_rb, configured.as_deref()));
+    for gem in missing_gems.iter().filter(|g| !g.starts_with("rails-i18n ") || crate::i18n::rails_i18n::enables(&application_rb, "locale")) {
+        warn_i18n(format!("{gem} is in Gemfile.lock but installed in no gem root (BUNDLE_PATH, GEM_HOME, GEM_PATH): its locale files are not read, so a key only it defines answers as a missing translation"));
+    }
+    if let Some(version) = app.gem_lock.as_ref().and_then(|l| l.version_of("rails-i18n")) {
+        if version != crate::i18n::rails_i18n::RULES_VERSION && crate::i18n::rails_i18n::enables(&application_rb, "pluralization") {
+            warn_i18n(format!("rails-i18n {version}: plural rules are read as rails-i18n {}'s, which may differ from this version's", crate::i18n::rails_i18n::RULES_VERSION));
+        }
+    }
     let (catalog, problems) = crate::i18n::Catalog::load_with_gems(&default_locale(vfs, dir), &gem_files, &mut files);
     for (file, problem) in problems {
         survey::record(&IngestError::Unsupported { file, message: format!("locale file not loaded: {problem}") });
@@ -6462,7 +6534,7 @@ fn walk_erb<V: Vfs + ?Sized>(
                     || !stem.contains('.')
                     || matches!(
                         format,
-                        Some("turbo_stream" | "svg" | "text" | "json" | "js" | "pdf" | "csv" | "txt" | "css")
+                        Some("turbo_stream" | "svg" | "text" | "json" | "js" | "pdf" | "csv" | "txt" | "css" | "md")
                     )
                     // Feeds: `.rss.builder` / `.atom.builder` (lobsters'
                     // `home/stories.rss.builder`), lowered as
@@ -8759,6 +8831,47 @@ pub(super) fn extract_initializer_filters(source: &[u8], file: &str) -> Vec<crat
     out
 }
 
+/// `ActionView::PartialRenderer.collection_cache = <Const>.<reader>` in a
+/// `config/initializers/` file, bare or inside `to_prepare` (campfire's
+/// `fragment_cache.rb` points it at `FragmentCache.store`). The same
+/// discipline as the mixin reader: a constant receiver and an
+/// argument-less, blockless method on it, readable off the parse.
+/// Anything else (a computed store, `ActiveSupport::Cache.lookup_store`
+/// with arguments) is not recorded, and the initializer ledger reports
+/// the statement. The last assignment wins, as at boot.
+pub(super) fn extract_collection_cache_store(source: &[u8], file: &str) -> Option<crate::app::CollectionCacheStore> {
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let src = String::from_utf8_lossy(source).into_owned();
+    let program = root.as_program_node()?;
+
+    let mut out = None;
+    for stmt in initializer_statements(&program) {
+        let Some(call) = stmt.as_call_node() else { continue };
+        if super::util::constant_id_str(&call.name()) != "collection_cache=" {
+            continue;
+        }
+        let Some(recv) = call.receiver() else { continue };
+        if constant_text(&recv, &src).as_deref() != Some("ActionView::PartialRenderer") {
+            continue;
+        }
+        let Some(args) = call.arguments() else { continue };
+        let args: Vec<_> = args.arguments().iter().collect();
+        let [value] = args.as_slice() else { continue };
+        let Some(read) = value.as_call_node() else { continue };
+        if read.arguments().is_some() || read.block().is_some() {
+            continue;
+        }
+        let Some(store_recv) = read.receiver() else { continue };
+        let Some(receiver) = constant_text(&store_recv, &src) else { continue };
+        out = Some(crate::app::CollectionCacheStore {
+            receiver: Symbol::from(receiver),
+            reader: Symbol::from(super::util::constant_id_str(&read.name())),
+        });
+    }
+    out
+}
+
 /// The source text of a node that is a constant or a constant path
 /// (`Foo`, `Turbo::StreamsChannel`), or None for anything else. Read as
 /// TEXT rather than resolved: the receiver may name a class this tree
@@ -9218,6 +9331,101 @@ pub(super) fn extract_variable_content_type_exclusions(source: &[u8]) -> Vec<Str
         out.extend(body[..close].split_whitespace().map(|s| s.to_string()));
     }
     out
+}
+
+/// One `config.filter_parameters` statement, as
+/// [`extract_filter_parameters`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilterParametersLine {
+    /// `+= [...]` (`replace: false`) or `= [...]` (`replace: true`) of
+    /// Symbol and String literals, each as its String.
+    Literal { replace: bool, names: Vec<String> },
+    /// Any other operand: a Regexp, a Proc, a computed list. `replace`
+    /// is true for a plain `=`, which still discards the names before it.
+    Computed { replace: bool },
+}
+
+/// The `config.filter_parameters` statements of a file, in source order
+/// (`Rails.application.config.filter_parameters += [:passw, :email]` in
+/// `filter_parameter_logging.rb`, or `config.filter_parameters += [...]`
+/// in the Application body). Line-scanned like the other config reads;
+/// the list may span lines, so the scan continues to its closing
+/// bracket. `%i[...]` and `%w[...]` lists count as literals.
+pub(crate) fn extract_filter_parameters(source: &[u8]) -> Vec<FilterParametersLine> {
+    let source = String::from_utf8_lossy(source);
+    let mut out = Vec::new();
+    let mut lines = source.lines();
+    while let Some(line) = lines.next() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some(idx) = t.find("config.filter_parameters") else { continue };
+        let rest = t[idx + "config.filter_parameters".len()..].trim_start();
+        let (replace, rest) = if let Some(r) = rest.strip_prefix("+=") {
+            (false, r)
+        } else if let Some(r) = rest.strip_prefix('=').filter(|r| !r.starts_with('=')) {
+            (true, r)
+        } else {
+            out.push(FilterParametersLine::Computed { replace: false });
+            continue;
+        };
+        let mut text = rest.trim().to_string();
+        if text.is_empty() {
+            if let Some(next) = lines.next() {
+                text.push_str(next.trim());
+            }
+        }
+        let opens = text.starts_with('[') || text.starts_with("%i[") || text.starts_with("%w[");
+        if opens {
+            while !text.contains(']') {
+                let Some(next) = lines.next() else { break };
+                text.push(' ');
+                text.push_str(next.trim());
+            }
+        }
+        out.push(filter_parameter_list(&text).map_or(FilterParametersLine::Computed { replace }, |names| {
+            FilterParametersLine::Literal { replace, names }
+        }));
+    }
+    out
+}
+
+/// The names of a `[:a, "b"]`, `%i[a b]` or `%w[a b]` literal that is
+/// the whole operand (nothing but a comment after it).
+fn filter_parameter_list(text: &str) -> Option<Vec<String>> {
+    let (words, body) = if let Some(b) = text.strip_prefix("%i[").or_else(|| text.strip_prefix("%w[")) {
+        (true, b)
+    } else {
+        (false, text.strip_prefix('[')?)
+    };
+    let close = body.find(']')?;
+    let after = body[close + 1..].trim();
+    if !(after.is_empty() || after.starts_with('#')) {
+        return None;
+    }
+    let inner = &body[..close];
+    if words {
+        return Some(inner.split_whitespace().map(str::to_string).collect());
+    }
+    inner
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            let name = if let Some(sym) = e.strip_prefix(':') {
+                sym
+            } else if e.len() >= 2
+                && ((e.starts_with('"') && e.ends_with('"')) || (e.starts_with('\'') && e.ends_with('\'')))
+            {
+                &e[1..e.len() - 1]
+            } else {
+                return None;
+            };
+            let plain = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+            plain.then(|| name.to_string())
+        })
+        .collect()
 }
 
 /// `(Vips.block_untrusted(true) seen, operations named by Vips.block(
@@ -10160,6 +10368,13 @@ pub(super) fn fallbacks_line(line: &str, default: &str) -> Option<Result<Option<
             .map(Some)
             .ok_or_else(|| format!("`fallbacks = {value}` is not a list of locales")),
     })
+}
+
+/// A warning about what the app's i18n reads from its gems.
+fn warn_i18n(detail: String) {
+    let mut d = crate::diagnostic::Diagnostic::unsupported(crate::span::Span::synthetic(), None, "I18n", detail);
+    d.severity = crate::diagnostic::Severity::Warning;
+    super::prism::push(d);
 }
 
 /// Each locale's own plural rule: rails-i18n adds its pluralization

@@ -65,6 +65,10 @@ module Db
   # lease. See `start_checkpointer`.
   @checkpoint_wanted = false
   @checkpointer_pid  = nil
+  # True when a process of the server's own runs the checkpoints
+  # (`checkpoint_in_own_process!`): serving processes then start no
+  # checkpoint thread at all.
+  @checkpoint_external = false
   # The process-shared flock File while this process holds it. Retained
   # so `adopt_after_fork` can close the child's inherited copy without
   # LOCK_UN (parent keeps the lock). Cleared on release.
@@ -172,6 +176,11 @@ module Db
     # in an initializer), per connection as Rails' adapter registers
     # them. Defined only when the app has some (runtime/sql_functions.rb
     # is generated for it).
+    # The app's own `pragmas:` from config/database.yml, after the pins
+    # above so its value wins, as Rails merges them over DEFAULT_PRAGMAS
+    # (generated: `project::apply_database_pragmas`).
+    # >>> generated: database-pragmas
+    # <<< generated: database-pragmas
     SqlFunctions.install(db) if defined?(SqlFunctions)
     db
   end
@@ -253,6 +262,17 @@ module Db
 
   def self._txn_depth=(value)
     Fiber[:ar_txn_depth] = value
+  end
+
+  # The open transaction's enlisted writes (connection.rb), held in the
+  # same per-thread storage as the depth.
+  def self._txn_records
+    records = Fiber[:ar_txn_records]
+    if records.nil?
+      records = []
+      Fiber[:ar_txn_records] = records
+    end
+    records
   end
 
   # Request-scoped connection lease. Checks out a handle, binds it to
@@ -788,6 +808,31 @@ module Db
     @checkpoint_wanted = true
   end
 
+  # CHECKPOINTS IN A PROCESS THAT SERVES NOTHING, for a server that can
+  # run one (falcon.rb). A checkpoint runs inside SQLite holding the GVL,
+  # so the thread above freezes its whole process while it copies the
+  # WAL and syncs, and its RESTART holds that process's write permit.
+  # Under Falcon a process is one event loop with all of its requests on
+  # it: the worker that won the checkpoint lock had half of the POST
+  # cell's stalls on the bench box (2026-10-15), and with no checkpointer
+  # at all the POST p99 fell to Puma's. Serving processes call this
+  # instead: their connections still leave checkpoints to someone else
+  # (wal_autocheckpoint=0), and no thread starts. The server runs
+  # `run_checkpointer` in a process of its own and restarts it if it dies.
+  def self.checkpoint_in_own_process!
+    @checkpoint_wanted = true
+    @checkpoint_external = true
+  end
+
+  # The checkpoint loop on the calling thread; it does not return. Takes
+  # the same flock as the per-worker thread, so it is still the only
+  # checkpointer. Nothing to do for a database with no file.
+  def self.run_checkpointer
+    path = @path
+    return if path.nil? || path == ":memory:" || path.start_with?("file:")
+    checkpoint_loop(path)
+  end
+
   # Rate-limited visibility for checkpoint_loop failures. Resets the
   # suppress window only by time, not by success — a later success simply
   # stops calling this. Private: the loop is the only production caller;
@@ -808,8 +853,13 @@ module Db
   private_class_method :warn_checkpoint_failure
 
   def self.prepare_for_checkpointer(conn)
-    start_checkpointer if @checkpointer_pid != Process.pid
-    return if @checkpointer_pid != Process.pid
+    if @checkpoint_external
+      path = @path
+      return if path.nil? || path == ":memory:" || path.start_with?("file:")
+    else
+      start_checkpointer if @checkpointer_pid != Process.pid
+      return if @checkpointer_pid != Process.pid
+    end
     return if conn.instance_variable_get(:@rh_manual_checkpoint)
     conn.execute("PRAGMA wal_autocheckpoint=0")
     conn.instance_variable_set(:@rh_manual_checkpoint, true)

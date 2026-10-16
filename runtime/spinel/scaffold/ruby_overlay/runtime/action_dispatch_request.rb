@@ -65,6 +65,15 @@ module ActionDispatch
       @params[key.to_s]
     end
 
+    # `request.filtered_parameters` - see the twin in
+    # runtime/ruby/action_dispatch/request.rb.
+    def filtered_parameters
+      all = {}
+      @params.each { |k, v| all[k] = v }
+      @path_parameters.to_h.each { |k, v| all[k] = v }
+      ActiveSupport::ParameterFilter.new(Rails.application.config_filter_parameters).filter(all)
+    end
+
     def authorization
       ActionDispatch::Http::Headers.authorization(@env)
     end

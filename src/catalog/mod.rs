@@ -757,19 +757,22 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
     },
+    // The runtime's `upsert_all` answers the affected-row count, not
+    // Rails' `ActiveRecord::Result` (ledgered in docs/pipeline/runtime.md
+    // beside `insert_all`'s); typed as what the emitted code returns.
     CatalogedMethod {
         name: "upsert",
         receiver: ReceiverContext::Class,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: None,
+        return_kind: Some(ReturnKind::Int),
     },
     CatalogedMethod {
         name: "upsert_all",
         receiver: ReceiverContext::Class,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: None,
+        return_kind: Some(ReturnKind::Int),
     },
     CatalogedMethod {
         name: "touch_all",

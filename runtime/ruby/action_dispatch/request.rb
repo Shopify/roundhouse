@@ -370,6 +370,18 @@ module ActionDispatch
       @params = value
     end
 
+    # Rails' `filtered_parameters`: the request's parameters, path
+    # parameters last (with the route's controller and action), with the
+    # value of every key the app's `config.filter_parameters` names
+    # replaced by "[FILTERED]", for an app that logs them itself
+    # (`Rails.logger` does not filter; only Rails' own request log does).
+    def filtered_parameters
+      all = {}
+      @params.each { |k, v| all[k] = v }
+      @path_parameters.to_h.each { |k, v| all[k] = v }
+      ActiveSupport::ParameterFilter.new(Rails.application.config_filter_parameters).filter(all)
+    end
+
     # Build a request from a CGI/Rack-shaped env hash.
     #
     # THE SHARED CONSTRUCTOR. This class and the CRuby overlay's twin

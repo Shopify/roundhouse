@@ -400,6 +400,15 @@ module Cable
       conns = SUBS[stream]
       return nil if conns.nil? || conns.empty?
 
+      # A connection's own internal channel carries a control message
+      # for the connection, not a frame for the client.
+      internal = conns.select { |conn| conn.internal_channel?(stream) }
+      unless internal.empty?
+        internal.each { |conn| conn.process_internal_message(message) }
+        conns = SUBS[stream]
+        return nil if conns.nil? || conns.empty?
+      end
+
       # As Rails writes it: ActiveSupport::JSON escapes `<`, `>` and `&`
       # inside strings, which plain JSON.generate does not (#619).
       message_json = JsonBuilder.escape_html_entities(JSON.generate(message))
@@ -475,6 +484,7 @@ module Cable
       @monitor = nil
       @closed = false
       @identity = identity
+      @internal_channel = nil
 
       @driver = WebSocket::Driver.rack(EnvAdapter.new(env, self), protocols: PROTOCOLS)
       @driver.on(:open)    { send_json({ "type" => "welcome" }) }
@@ -490,6 +500,37 @@ module Cable
     # both into @buffer, which is why the monitor must already exist.
     def start
       @driver.start
+      subscribe_internal_channel
+    end
+
+    # Rails' `subscribe_to_internal_channel`: an identified connection
+    # listens on `action_cable/<connection identifier>`, which is where
+    # `ActionCable.server.remote_connections.where(…).disconnect`
+    # broadcasts. Reactor thread, like every SUBS write.
+    def subscribe_internal_channel
+      id = @identity.nil? ? "" : @identity.connection_identifier
+      return nil if id.empty?
+
+      @internal_channel = "action_cable/#{id}"
+      Registry.subscribe(@internal_channel, self)
+    end
+
+    def internal_channel?(stream)
+      !@internal_channel.nil? && @internal_channel == stream
+    end
+
+    # Rails' `process_internal_message`: a "disconnect" closes the
+    # socket, telling the client first whether to reconnect — Action
+    # Cable's client reconnects (and replays its subscriptions, which is
+    # where authorization runs again) only when told to.
+    def process_internal_message(message)
+      type = message[:type] || message["type"]
+      return nil unless type.to_s == "disconnect"
+
+      reconnect = message.key?(:reconnect) ? message[:reconnect] : message["reconnect"]
+      send_json({ "type" => "disconnect", "reason" => "remote", "reconnect" => reconnect ? true : false })
+      on_writable
+      close
     end
 
     def identifiers_for(stream)

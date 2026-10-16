@@ -17,19 +17,23 @@ use crate::vfs::Vfs;
 /// Gems that are not engines but add locale files themselves, with the
 /// files' paths under the gem's root (`config/locales/*.yml` style
 /// globs: one `*` within a directory, or `**` for any depth).
-pub const NON_ENGINE_LOCALES: &[(&str, &[&str])] = &[];
+pub const NON_ENGINE_LOCALES: &[(&str, &[&str])] = &[("rails-i18n", &["rails/locale/*.yml"])];
 
 /// `(path, source)` for every gem locale file, in load order: in-repo
-/// `PATH` gems, then installed gems, each in lockfile order.
-pub fn gem_locale_files<V: Vfs + ?Sized>(vfs: &V, app_dir: &Path, lock: &Lockfile, in_repo: &[PathBuf]) -> Vec<(String, String)> {
+/// `PATH` gems, then installed gems, each in lockfile order; and each
+/// gem of [`NON_ENGINE_LOCALES`] the lockfile names but no gem root has.
+pub fn gem_locale_files<V: Vfs + ?Sized>(vfs: &V, app_dir: &Path, lock: &Lockfile, in_repo: &[PathBuf]) -> (Vec<(String, String)>, Vec<String>) {
     let roots = gem_roots(vfs, app_dir);
     let mut dirs: Vec<(String, PathBuf)> = in_repo.iter().map(|d| (d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), d.clone())).collect();
+    let mut missing = Vec::new();
     for (name, version) in &lock.specs {
         if lock.is_in_repo(name) {
             continue;
         }
-        if let Some(dir) = installed_gem(vfs, &roots, name, version) {
-            dirs.push((name.clone(), dir));
+        match installed_gem(vfs, &roots, name, version) {
+            Some(dir) => dirs.push((name.clone(), dir)),
+            None if NON_ENGINE_LOCALES.iter().any(|(gem, _)| gem == name) => missing.push(format!("{name} {version}")),
+            None => {}
         }
     }
     let mut files = Vec::new();
@@ -47,7 +51,7 @@ pub fn gem_locale_files<V: Vfs + ?Sized>(vfs: &V, app_dir: &Path, lock: &Lockfil
             }
         }
     }
-    files
+    (files, missing)
 }
 
 /// Where Bundler installs gems for this app, most specific first.
@@ -155,7 +159,8 @@ mod tests {
         write(&app, &format!("{gems}/plain-2.0/lib/plain.rb"), "module Plain\nend\n");
         write(&app, &format!("{gems}/plain-2.0/config/locales/en.yml"), "en:\n  plain: x\n");
         let lock = Lockfile::parse("GEM\n  remote: https://rubygems.org/\n  specs:\n    admin (1.0)\n    plain (2.0)\n    absent (3.0)\n\nDEPENDENCIES\n  admin\n  plain\n  absent\n");
-        let files = gem_locale_files(&crate::vfs::FsVfs::new(), &app, &lock, &[]);
+        let (files, missing) = gem_locale_files(&crate::vfs::FsVfs::new(), &app, &lock, &[]);
+        assert!(missing.is_empty(), "{missing:?}");
         let names: Vec<String> = files.iter().map(|(p, _)| p.rsplit("/gems/").next().unwrap().to_string()).collect();
         assert_eq!(names, vec!["admin-1.0/config/locales/en.yml", "admin-1.0/config/locales/nested/fr.yml"]);
         std::fs::remove_dir_all(root).unwrap();

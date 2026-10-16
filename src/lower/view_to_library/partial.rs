@@ -371,12 +371,13 @@ fn named_collection_item_render(
 ///   c.preload_associations(c) if c.respond_to?(:preload_associations)
 ///   keys = []
 ///   c.each { |item| keys << ActionView::ViewHelpers.collection_fragment_key("x/y", <key>) }
-///   hits = keys.map { |k| ActionView::ViewHelpers.collection_fragment_read(k) }
+///   hits = ActionView::ViewHelpers.collection_fragment_read_multi(keys)
 ///   i = 0
 ///   c.each do |y|
 ///     if hits[i].nil? then io << collection_fragment_write(keys[i], <render y>) else io << hits[i] end
 ///     i += 1
 ///   end
+///   ActionView::ViewHelpers.collection_rendered("app/views/x/_y.html.erb", hits)
 /// else
 ///   c.preload_associations(c) if c.respond_to?(:preload_associations)
 ///   c.each { |y| io << <render y> }
@@ -408,8 +409,8 @@ fn wrap_keyed_cached_collection(
     let span = collection.span;
     let uniq = span.start;
     let name = |stem: &str| Symbol::from(format!("__ck_{stem}_{uniq}"));
-    let (coll, keys, hits, idx, hit, k) =
-        (name("c"), name("keys"), name("hits"), name("i"), name("hit"), name("k"));
+    let (coll, keys, hits, idx, hit) =
+        (name("c"), name("keys"), name("hits"), name("i"), name("hit"));
     let cap = format!("__ck_io_{uniq}");
     let assign = |target: &Symbol, value: Expr| {
         Expr::new(
@@ -482,16 +483,17 @@ fn wrap_keyed_cached_collection(
     );
     let read_all = assign(
         &hits,
-        send(
-            Some(var_ref(keys.clone())),
-            "map",
-            Vec::new(),
-            Some(block(
-                k.clone(),
-                view_helpers_call("collection_fragment_read", vec![var_ref(k.clone())]),
-            )),
-            false,
-        ),
+        view_helpers_call("collection_fragment_read_multi", vec![var_ref(keys.clone())]),
+    );
+    // Rails' `render_collection.action_view` names the partial's template
+    // file; the walker lowers HTML ERB, so that is its extension.
+    let identifier = match partial.rsplit_once('/') {
+        Some((dir, base)) => format!("app/views/{dir}/_{base}.html.erb"),
+        None => format!("app/views/_{partial}.html.erb"),
+    };
+    let rendered = view_helpers_call(
+        "collection_rendered",
+        vec![str_lit(&identifier), var_ref(hits.clone())],
     );
     let miss_ctx = ViewCtx { accumulator: cap.clone(), ..ctx.clone() };
     let miss = seq(vec![
@@ -534,6 +536,7 @@ fn wrap_keyed_cached_collection(
         read_all,
         assign(&idx, int_lit(0)),
         render_each,
+        rendered,
     ]);
     let uncached = seq(vec![
         preload(),

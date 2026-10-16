@@ -1049,6 +1049,29 @@ fn report_unemitted_library_classes(app: &App, target: BuildTarget) {
     }
 }
 
+/// `class LoginFailedError < StandardError; end` beside a controller in
+/// its file: the Ruby emit re-declares it ahead of the controller, the
+/// other targets declare nothing for it.
+fn report_controller_sibling_classes(app: &App, target: BuildTarget) {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel) {
+        return;
+    }
+    for controller in &app.controllers {
+        for sibling in &controller.sibling_classes {
+            emit::diagnostics::report_unsupported(
+                sibling.parent_span,
+                target.as_str(),
+                "class",
+                format!(
+                    "`{}`, declared beside `{}` in its file, is not emitted for this target (the Ruby emit carries it)",
+                    sibling.name.as_str(),
+                    controller.name.0.as_str()
+                ),
+            );
+        }
+    }
+}
+
 /// True when every ancestor of `lc` is another app library class (or
 /// explicit `Object`), so the chain ends at `Object` rather than a
 /// framework / gem / stdlib base. Explicit `Object` is treated as the
@@ -1908,6 +1931,7 @@ fn target_files_inner(
     reject_unsupported_forwarded_procs(app, target)?;
     report_unsupported_keys(app, target);
     report_unemitted_library_classes(app, target);
+    report_controller_sibling_classes(app, target);
     report_sqlite_index_predicates(app, target);
     report_native_ruby_syntax(app, target);
     report_self_bindings(app, target);
@@ -3307,6 +3331,7 @@ fn ruby_family_runtime_files(
                 "runtime/db.rb".to_string(),
                 format!("{TIME_PARSING_REQUIRE}{db_jruby}"),
             ));
+            apply_database_pragmas(&mut files, app);
             apply_jruby_gemfile(&mut files)?;
         }
     }
@@ -4376,6 +4401,56 @@ fn apply_instantiate_named(files: &mut [(String, String)], app: &App) {
     }
 }
 
+/// `config/database.yml`'s `pragmas:` (`App::database_pragmas`, see
+/// `ingest::database_yml`) into each SQLite Db shim's connection open,
+/// after the shim's own pins: one arm per environment that names any,
+/// keyed on the parked `Rails.env_name` (unset reads as development,
+/// as `Rails.env` does). A span replace between markers; an app with
+/// no pragmas leaves the region empty. Each shim has its own way to
+/// run a statement on the handle it just opened, so the call is picked
+/// by which shim the file is.
+fn apply_database_pragmas(files: &mut [(String, String)], app: &App) {
+    const MARK: &str = "# >>> generated: database-pragmas\n";
+    const TAIL_MARK: &str = "# <<< generated: database-pragmas\n";
+    if app.database_pragmas.is_empty() {
+        return;
+    }
+    for (path, content) in files.iter_mut() {
+        if !path.starts_with("runtime/db") || !path.ends_with(".rb") {
+            continue;
+        }
+        let Some(mark) = content.find(MARK) else { continue };
+        let line_start = content[..mark].rfind('\n').map_or(0, |i| i + 1);
+        let indent = content[line_start..mark].to_string();
+        let Some(rel_end) = content[mark..].find(TAIL_MARK) else { continue };
+        let end = mark + rel_end + TAIL_MARK.len();
+        let exec = |stmt: &str| {
+            let lit = crate::emit::ruby::expr::ruby_str_literal(stmt);
+            if content.contains("SQL.sqlite3_exec(dbh") {
+                format!("SQL.sqlite3_exec(dbh, {lit}, nil, nil, nil)")
+            } else if content.contains("st = raw.create_statement") {
+                format!("st.execute({lit})")
+            } else {
+                format!("db.execute({lit})")
+            }
+        };
+        let mut generated = format!("{MARK}{indent}case Rails.env_name.to_s\n");
+        for (env, statements) in &app.database_pragmas {
+            let names = if env == "development" {
+                format!("{}, \"\"", crate::emit::ruby::expr::ruby_str_literal(env))
+            } else {
+                crate::emit::ruby::expr::ruby_str_literal(env)
+            };
+            generated.push_str(&format!("{indent}when {names}\n"));
+            for stmt in statements {
+                generated.push_str(&format!("{indent}  {}\n", exec(stmt)));
+            }
+        }
+        generated.push_str(&format!("{indent}end\n{indent}{TAIL_MARK}"));
+        content.replace_range(mark..end, &generated);
+    }
+}
+
 /// Write `JobRegistry` — each payload job's writer and reader, and the
 /// record locators they use — into `runtime/job_registry.rb`, from
 /// `App::job_plans`. A span replace between markers, like
@@ -4889,7 +4964,7 @@ fn apply_rails_version(files: &mut [(String, String)], app: &App) {
 fn apply_module_mixins(files: &mut Vec<(String, String)>, app: &App, form: MixinForm) {
     use std::fmt::Write;
 
-    if app.module_mixins.is_empty() && app.initializer_filters.is_empty() {
+    if app.module_mixins.is_empty() && app.initializer_filters.is_empty() && app.collection_cache_store.is_none() {
         return;
     }
     let mut block = String::from(match form {
@@ -4969,6 +5044,20 @@ fn apply_module_mixins(files: &mut Vec<(String, String)>, app: &App, form: Mixin
             let _ = writeln!(block, "    return nil if performed?");
         }
         let _ = writeln!(block, "    nil\n  end\nend");
+    }
+    // The store cached collections read, as the app's initializer points
+    // it (`lower::module_mixins` kept it only when the reader resolves).
+    // Here for the same reason as a mixin: it names an app constant, so
+    // it runs once every class has loaded, where `to_prepare` runs it.
+    if let Some(store) = &app.collection_cache_store {
+        let _ = writeln!(
+            block,
+            "\n# `ActionView::PartialRenderer.collection_cache` as config/initializers/\n\
+             # assigns it (generated — see apply_module_mixins).\n\
+             ActionView::PartialRenderer.collection_cache = {}.{}",
+            store.receiver.as_str(),
+            store.reader.as_str()
+        );
     }
     for (path, content) in files.iter_mut() {
         if path == "boot.rb" {
@@ -5497,7 +5586,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "Rails::HTML5::SafeListSanitizer" | "JSON" | "JSON::ParserError"
         | "Struct" | "Mutex" | "Queue" | "SizedQueue"
         | "Thread::Queue" | "Thread::SizedQueue" | "Thread::Mutex"
-        | "ThreadError" | "ClosedQueueError" | "Comparable" | "Enumerable"
+        | "ThreadError" | "ClosedQueueError" | "RegexpError" | "Comparable" | "Enumerable"
         | "JSON::GeneratorError"
         // Ported for spinel (`runtime/ruby/rack_utils.rb`), the gem's own on
         // the ruby family; no strict target loads either.
@@ -5713,6 +5802,43 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                     format!("ActiveSupport::Duration is the Ruby-family runtime's value class; the {target} runtime ships none"),
                 );
             }
+        }
+        if !matches!(target, "jruby" | "spinel")
+            && let crate::expr::ExprNode::Const { path } = &*expr.node
+            && let ["Regexp", flag @ ("IGNORECASE" | "EXTENDED" | "MULTILINE")] = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..]
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "bundled_constant",
+                format!("Regexp::{flag} is Ruby's option bit, which the {target} emit has no Regexp to read"),
+            );
+        }
+        // `runtime/ruby/active_record/connection.rb` carries `upsert_all`; no strict runtime transpiles it.
+        if !matches!(target, "jruby" | "spinel")
+            && let crate::expr::ExprNode::Send { recv: Some(_), method, .. } = &*expr.node
+            && matches!(method.as_str(), "upsert" | "upsert_all")
+            && expr.ty == Some(crate::ty::Ty::Int)
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "upsert",
+                format!("`{}` is the Ruby-family runtime's; the {target} runtime ships none", method.as_str()),
+            );
+        }
+        // `translate_site` / `translate_runtime` are reported with their call (`report_i18n_table_sites`).
+        if !matches!(target, "jruby" | "spinel")
+            && let crate::expr::ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node
+            && matches!(&*recv.node, crate::expr::ExprNode::Const { path } if path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["I18n"]))
+            && !matches!(method.as_str(), "translate_site" | "translate_runtime")
+        {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "I18n",
+                format!("`I18n.{}` is the Ruby-family runtime's (the locale in effect, switching it, or a missing translation's answer); the {target} runtime ships none", method.as_str()),
+            );
         }
         if matches!(&*expr.node, crate::expr::ExprNode::Const { .. }) {
             if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
@@ -6620,6 +6746,9 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
     // a method nothing defined.
     apply_global_id_locate(&mut files, app);
     apply_instantiate_named(&mut files, app);
+    // Every SQLite shim in the base set (db.rb, db_cruby.rb); the JDBC one
+    // is read in later, by `ruby_family_runtime_files`.
+    apply_database_pragmas(&mut files, app);
     apply_attachable_locate(&mut files, app);
     // Same reason: both lanes require `runtime/job_registry.rb`.
     apply_job_registry(&mut files, app);

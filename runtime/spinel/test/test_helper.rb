@@ -29,6 +29,11 @@
 # (LocalSecret treats "" as unset) and a secret inherited from the
 # parent process would sign the vectors with a different key.
 ENV["SECRET_KEY_BASE"] = "roundhouse-test-secret"
+# Rails' own test_helper opens with `ENV["RAILS_ENV"] ||= "test"`, and
+# boot.rb parks it as `Rails.env`. Without it a test process reads as
+# development: `Rails.env.test?` gates (campfire's WAL checkpointer
+# `start(enabled: !Rails.env.test?)`) take the serving branch.
+ENV["RAILS_ENV"] = "test" if ENV["RAILS_ENV"].nil?
 require_relative "../runtime/base64"
 require_relative "../runtime/json_impl"
 require_relative "../runtime/db"
@@ -938,22 +943,13 @@ end
 # The runtime fragment-caches message partials in its own store; these
 # give the test the settings it reads and restores. A fresh
 # `ActiveSupport::Cache::MemoryStore` (runtime/active_support_cache.rb) is
-# a `Rails::Cache`, so it can stand in for `Rails.cache` here.
+# a `Rails::Cache`, so it can stand in for `Rails.cache` here. The
+# third knob, `ActionView::PartialRenderer.collection_cache`, is the
+# runtime's own (runtime/action_controller_fragment_caching.rb): the
+# store cached collections really read.
 module Rails
   def self.cache=(store)
     @cache_store = store
-  end
-end
-
-module ActionView
-  class PartialRenderer
-    def self.collection_cache
-      @collection_cache
-    end
-
-    def self.collection_cache=(store)
-      @collection_cache = store
-    end
   end
 end
 
@@ -2312,6 +2308,16 @@ module RequestDispatch
     else
       body = selector_or_root.to_s
       selector = content_or_opts
+      content_or_opts = opts
+      opts = nil
+    end
+    # Rails' substitution values: a `?` in an attribute predicate
+    # (`"#row[data-n=?]", value`) takes the argument after the selector,
+    # and the equality test, if any, is the argument after that. Read as
+    # the content string instead, the value was looked for in the
+    # element's text and the predicate matched a literal "?".
+    if selector.to_s.include?("=?]") && content_or_opts.is_a?(String)
+      selector = selector.to_s.sub("=?]", "=\"#{content_or_opts}\"]")
       content_or_opts = opts
       opts = nil
     end

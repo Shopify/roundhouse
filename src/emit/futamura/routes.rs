@@ -26,11 +26,11 @@
 //!   * actions with a route that a route the lowered router refused
 //!     could shadow (Rails would match the refused one first).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::App;
 use crate::diagnostic::{Diagnostic, Severity};
-use crate::dialect::{LibraryClass, MethodReceiver};
+use crate::dialect::{ControllerBodyItem, LibraryClass, MethodReceiver};
 use crate::expr::{Expr, ExprNode, Literal, Pattern};
 use crate::ident::Symbol;
 use crate::lower::routes::FlatRoute;
@@ -57,10 +57,18 @@ struct Index<'a> {
     classes: HashMap<String, Vec<&'a LibraryClass>>,
     /// method name -> every (class, side) defining it, for fan-out.
     by_name: HashMap<Symbol, Vec<(String, bool)>>,
+    /// INTERIM (see `enqueue_send`'s fallback): the analyzer's own type
+    /// for every expression in the app's controller bodies, from before
+    /// `routes::plan`'s own re-lowering re-types them from scratch and
+    /// loses framework/private-helper receiver types (G2/G3, tracked
+    /// upstream as rubys/roundhouse#58). Keyed by exact source span
+    /// (file, start, end), since the re-lowering reads the same spans
+    /// without moving them.
+    analyzer_stamps: HashMap<(u32, u32, u32), Ty>,
 }
 
 impl<'a> Index<'a> {
-    fn new(lcs: &'a [LibraryClass]) -> Self {
+    fn new(lcs: &'a [LibraryClass], analyzer_stamps: HashMap<(u32, u32, u32), Ty>) -> Self {
         let mut classes: HashMap<String, Vec<&'a LibraryClass>> = HashMap::new();
         let mut by_name: HashMap<Symbol, Vec<(String, bool)>> = HashMap::new();
         for lc in lcs {
@@ -72,7 +80,7 @@ impl<'a> Index<'a> {
                     .push((lc.name.0.as_str().to_string(), is_class_side(&m.receiver)));
             }
         }
-        Index { classes, by_name }
+        Index { classes, by_name, analyzer_stamps }
     }
 
     /// Every body of `class`'s `name` on one side (a reopened class or a
@@ -254,7 +262,7 @@ pub fn plan(lowered: &App, diags: &[Diagnostic], gaps: &[(String, String)]) -> R
         lcs
     });
     lcs.extend(lowered.library_classes.iter().cloned());
-    let index = Index::new(&lcs);
+    let index = Index::new(&lcs, analyzer_stamps(lowered));
     // Controllers: their actions keep the app's spans under a
     // re-synthesized header.
     let controllers: HashSet<String> = lowered.controllers.iter().map(|c| c.name.0.as_str().to_string()).collect();
@@ -679,7 +687,32 @@ fn enqueue_send(
             // framework object, whose methods are the runtime's.
             Some(_) if rooted_in_framework(index, class, class_side, recv.as_ref().unwrap()) => {}
             Some((_, ty)) => {
-                let classes = ty.map(classes_of).unwrap_or_default();
+                // INTERIM (rubys/roundhouse#58, G2/G3): `routes::plan`'s
+                // own re-lowering re-types every body from scratch and
+                // loses the analyzer's type for values that come from a
+                // framework helper (Devise's `current_<scope>`) or the
+                // app's own private helpers (pinned `Untyped` on purpose
+                // by #810), reading back as the open `Var`/`Bottom`
+                // sentinel or `Untyped`. Only in that case, fall back to
+                // the analyzer's own stamp for this exact receiver span
+                // (`lowered.controllers`, never re-lowered) — but only
+                // when the analyzer itself considers it resolved, never
+                // a `Var`/`Bottom`/`Untyped` of its own and never a
+                // union with an unresolved member, so a wrong guess can
+                // never make the planner skip a real dispatch target.
+                // Remove this once G2/G3 are settled upstream.
+                let needs_fallback = ty.is_none_or(|t| t.is_open() || t.is_unknown());
+                let classes = if needs_fallback {
+                    let r = recv.as_ref().unwrap();
+                    index
+                        .analyzer_stamps
+                        .get(&(r.span.file.0, r.span.start, r.span.end))
+                        .filter(|t| !t.is_open() && !t.is_unknown() && !t.mentions_unknown())
+                        .map(classes_of)
+                        .unwrap_or_else(|| ty.map(classes_of).unwrap_or_default())
+                } else {
+                    ty.map(classes_of).unwrap_or_default()
+                };
                 if classes.is_empty() {
                     fan_out(method, &mut push);
                 } else {
@@ -740,6 +773,82 @@ fn rooted_in_framework(index: &Index, class: &str, class_side: bool, e: &Expr) -
     }
 }
 
+/// INTERIM (see `enqueue_send`'s fallback, rubys/roundhouse#58): every
+/// expression's type as the analyzer itself left it on `app.controllers`
+/// — the app's own action and private-helper bodies — keyed by exact
+/// source span. `routes::plan` re-lowers these same bodies into fresh
+/// `LibraryClass`es through `emit::ruby::lowered_controller_lcs_with_layout`,
+/// which reads `app.controllers` by shared reference and re-types a
+/// *clone* of each body from scratch (`lower::typing::type_method_body`);
+/// it never mutates `app.controllers` itself, so the analyzer's original
+/// stamps survive here untouched. The two trees share spans because the
+/// lowering only re-types in place — it does not move or resynthesize
+/// expression spans — so a span found here names the same source
+/// location as its counterpart in the re-lowered body.
+fn analyzer_stamps(app: &App) -> HashMap<(u32, u32, u32), Ty> {
+    let mut out: HashMap<(u32, u32, u32), Ty> = HashMap::new();
+    // A span can recur with a different type, and not every recurrence
+    // is a real disagreement:
+    //
+    //   * safe navigation (`u&.email`) re-types its guarded receiver
+    //     TWICE at the identical span — once with its honest, unnarrowed
+    //     type (`T | nil`, the local's static type) and once narrowed to
+    //     plain `T` inside the branch where the dispatch actually runs.
+    //     `classes_of` already drops a union's `Nil` member, so these
+    //     two answer `enqueue_send`'s question identically; keeping
+    //     either is fine, and `dispatch_classes` below treats them as
+    //     the same stamp rather than a conflict.
+    //   * a synthesized method body can share its span with another
+    //     (`owns_source`'s note on synthesized accessors borrowing
+    //     spans), and a concern spliced into several controllers
+    //     replays the same source at the same span under a different
+    //     `self_ty` each time — these CAN genuinely disagree on which
+    //     app classes a call reaches, and that is a real conflict: the
+    //     first type seen is no more trustworthy than the second, so a
+    //     span whose dispatch classes ever disagree is dropped for good
+    //     rather than left holding whichever type happened to visit
+    //     first — a wrong stamp here would narrow `enqueue_send`'s
+    //     dispatch past a real target.
+    //
+    // An open or unknown type (`Var`/`Bottom`/`Untyped`, or a union
+    // mentioning one) is never recorded and never conflicts: `enqueue_send`
+    // already refuses to adopt one (see its own filter), so storing it
+    // would only ever risk manufacturing a conflict against a later,
+    // useful closed stamp for no benefit.
+    let mut conflicted: HashSet<(u32, u32, u32)> = HashSet::new();
+    let mut record = |e: &Expr| {
+        let Some(ty) = &e.ty else { return };
+        if e.span.file.0 == 0 || ty.is_open() || ty.is_unknown() || ty.mentions_unknown() {
+            return;
+        }
+        let key = (e.span.file.0, e.span.start, e.span.end);
+        if conflicted.contains(&key) {
+            return;
+        }
+        match out.get(&key) {
+            None => {
+                out.insert(key, ty.clone());
+            }
+            Some(existing) if existing == ty => {}
+            Some(existing) if dispatch_classes(existing) == dispatch_classes(ty) => {}
+            Some(_) => {
+                out.remove(&key);
+                conflicted.insert(key);
+            }
+        }
+    };
+    for c in &app.controllers {
+        for item in &c.body {
+            match item {
+                ControllerBodyItem::Action { action, .. } => visit(&action.body, &mut record),
+                ControllerBodyItem::ClassMethod { method, .. } => visit(&method.body, &mut record),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// App classes a typed receiver can be. Empty means "unknown": fan out.
 fn classes_of(ty: &Ty) -> Vec<String> {
     match ty {
@@ -761,6 +870,16 @@ fn classes_of(ty: &Ty) -> Vec<String> {
         Ty::Untyped | Ty::Var { .. } => Vec::new(),
         _ => vec![String::from("\0none")],
     }
+}
+
+/// `classes_of` as an order-insensitive set, for comparing whether two
+/// types answer `enqueue_send`'s dispatch question the same way —
+/// `analyzer_stamps`'s own conflict check, so a nilable union and its
+/// narrowed non-nil member (safe navigation's two stamps for one
+/// receiver span) compare equal without caring which union variant
+/// order either happened to carry.
+fn dispatch_classes(ty: &Ty) -> BTreeSet<String> {
+    classes_of(ty).into_iter().collect()
 }
 
 fn visit(e: &Expr, f: &mut dyn FnMut(&Expr)) {
@@ -788,7 +907,151 @@ fn may_overlap(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{app_relative, gap_blocking, may_overlap, view_prefix};
+    use super::{analyzer_stamps, app_relative, gap_blocking, may_overlap, view_prefix};
+    use crate::dialect::{Action, Controller, ControllerBodyItem, LayoutDecl, RenderTarget};
+    use crate::expr::{Expr, ExprNode};
+    use crate::ident::{ClassId, Symbol, TyVar};
+    use crate::span::{FileId, Span};
+    use crate::ty::{Row, Ty};
+    use crate::App;
+
+    /// A minimal controller holding one action whose whole body is `e`,
+    /// so `analyzer_stamps` sees exactly the spans and types `e` carries.
+    fn controller_with_action(class: &str, action: &str, body: Expr) -> Controller {
+        Controller {
+            name: ClassId(Symbol::from(class)),
+            parent: None,
+            parent_span: Span::synthetic(),
+            body: vec![ControllerBodyItem::Action {
+                action: Action {
+                    name: Symbol::from(action),
+                    params: Row::closed(),
+                    opt_params: Vec::new(),
+                    kw_params: Vec::new(),
+                    kwrest_param: None,
+                    block_param: None,
+                    rest_param: None,
+                    anonymous_formal: None,
+                    name_span: Span::synthetic(),
+                    body,
+                    renders: RenderTarget::Inferred,
+                    effects: Default::default(),
+                },
+                leading_comments: Vec::new(),
+                leading_blank_line: false,
+            }],
+            layout: LayoutDecl::Inherit,
+            sibling_classes: Vec::new(),
+        }
+    }
+
+    fn class_ty(name: &str) -> Ty {
+        Ty::Class { id: ClassId(Symbol::from(name)), args: Vec::new().into() }
+    }
+
+    fn stamped(span: Span, ty: Ty) -> Expr {
+        let mut e = Expr::new(span, ExprNode::SelfRef);
+        e.ty = Some(ty);
+        e
+    }
+
+    /// Two controllers whose bodies were spliced from the same concern
+    /// source (`ingest::splice_concerns_into_controllers` copies a
+    /// concern's methods into each includer) can carry the SAME span
+    /// typed differently per includer — e.g. a private `target` helper
+    /// the concern calls answers a different model in each controller.
+    /// The first type seen for that span is no more trustworthy than the
+    /// second, so a span that ever disagrees with itself must yield no
+    /// stamp at all, never whichever type happened to visit first: a
+    /// wrong stamp would let `enqueue_send` narrow dispatch past a real
+    /// target.
+    #[test]
+    fn a_span_with_two_different_types_yields_no_stamp() {
+        let conflict_span = Span { file: FileId(1), start: 10, end: 20 };
+        let app = App {
+            controllers: vec![
+                controller_with_action("WidgetsController", "index", stamped(conflict_span, class_ty("Widget"))),
+                controller_with_action("ThingsController", "index", stamped(conflict_span, class_ty("Thing"))),
+            ],
+            ..Default::default()
+        };
+        let stamps = analyzer_stamps(&app);
+        assert_eq!(stamps.get(&(1, 10, 20)), None, "{stamps:?}");
+    }
+
+    /// The same span typed the SAME way twice (two includers whose
+    /// helper happens to answer the same model) is not a conflict: the
+    /// stamp survives.
+    #[test]
+    fn a_span_with_the_same_type_twice_keeps_its_stamp() {
+        let agree_span = Span { file: FileId(1), start: 30, end: 40 };
+        let app = App {
+            controllers: vec![
+                controller_with_action("WidgetsController", "index", stamped(agree_span, class_ty("Widget"))),
+                controller_with_action("GadgetsController", "index", stamped(agree_span, class_ty("Widget"))),
+            ],
+            ..Default::default()
+        };
+        let stamps = analyzer_stamps(&app);
+        assert_eq!(stamps.get(&(1, 30, 40)), Some(&class_ty("Widget")));
+    }
+
+    fn nilable_class_ty(name: &str) -> Ty {
+        Ty::Union { variants: vec![class_ty(name), Ty::Nil].into() }
+    }
+
+    /// Safe navigation (`u&.email`) re-types its guarded receiver TWICE
+    /// at the identical span: its honest, unnarrowed type (`T | nil`)
+    /// and, in the non-nil dispatch branch, plain `T`. This is the
+    /// actual shape that regressed rubys/roundhouse#1001 — neither side
+    /// is open or unknown, so "ignore open/unknown types" alone does not
+    /// cover it. `classes_of` already drops a union's `Nil` member, so
+    /// both stamps answer `enqueue_send`'s dispatch question identically
+    /// and must not be treated as a conflict.
+    #[test]
+    fn a_nilable_union_and_its_narrowed_non_nil_member_are_not_a_conflict() {
+        let span = Span { file: FileId(1), start: 50, end: 60 };
+        let app = App {
+            controllers: vec![controller_with_action(
+                "WidgetsController",
+                "index",
+                // One occurrence narrowed, one not — order must not
+                // matter, so this covers unnarrowed-then-narrowed.
+                Expr::new(Span::synthetic(), ExprNode::Seq {
+                    exprs: vec![
+                        stamped(span, nilable_class_ty("Widget")),
+                        stamped(span, class_ty("Widget")),
+                    ],
+                }),
+            )],
+            ..Default::default()
+        };
+        let stamps = analyzer_stamps(&app);
+        assert!(stamps.get(&(1, 50, 60)).is_some(), "{stamps:?}");
+    }
+
+    /// An open type (`Var`, the analyzer's own "not yet inferred"
+    /// sentinel) recorded before a later, closed type for the same span
+    /// must not poison it: the open occurrence is never stored in the
+    /// first place, so the closed one that follows is simply the span's
+    /// first real entry.
+    #[test]
+    fn an_open_type_then_a_closed_type_keeps_the_closed_one() {
+        let span = Span { file: FileId(1), start: 70, end: 80 };
+        let open = Ty::Var { var: TyVar(0) };
+        let app = App {
+            controllers: vec![controller_with_action(
+                "WidgetsController",
+                "index",
+                Expr::new(Span::synthetic(), ExprNode::Seq {
+                    exprs: vec![stamped(span, open), stamped(span, class_ty("Widget"))],
+                }),
+            )],
+            ..Default::default()
+        };
+        let stamps = analyzer_stamps(&app);
+        assert_eq!(stamps.get(&(1, 70, 80)), Some(&class_ty("Widget")), "{stamps:?}");
+    }
 
     #[test]
     fn overlap_is_segmentwise() {

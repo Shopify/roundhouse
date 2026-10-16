@@ -314,7 +314,31 @@ pub const GEM_CATALOG: &[GemClass] = &[
     },
     GemClass {
         name: "Nokogiri",
-        class_methods: &[("HTML", GemTy::Untyped), ("XML", GemTy::Untyped)],
+        class_methods: &[
+            ("HTML", GemTy::Untyped),
+            ("HTML4", GemTy::Untyped),
+            ("HTML5", GemTy::Untyped),
+            ("XML", GemTy::Untyped),
+        ],
+        instance_methods: &[],
+    },
+    // Nokogiri's HTML5 parser (gumbo, vendored by the gem and carried by
+    // spinel-nokogiri): `Nokogiri::HTML5.fragment(html)` and the module's
+    // Document/DocumentFragment classes. The parsed tree stays unmodeled,
+    // as `Nokogiri::HTML`'s does.
+    GemClass {
+        name: "Nokogiri::HTML5",
+        class_methods: &[("parse", GemTy::Untyped), ("fragment", GemTy::Untyped)],
+        instance_methods: &[],
+    },
+    GemClass {
+        name: "Nokogiri::HTML5::Document",
+        class_methods: &[("parse", GemTy::Untyped)],
+        instance_methods: &[],
+    },
+    GemClass {
+        name: "Nokogiri::HTML5::DocumentFragment",
+        class_methods: &[("parse", GemTy::Untyped)],
         instance_methods: &[],
     },
     // pdf-reader — PDF metadata/text extraction.

@@ -49,6 +49,12 @@ module ActiveStorage
       def process_action: (Symbol action_name) -> nil
       def show: () -> nil
     end
+
+    class ProxyController < ActionController::Base
+      @headers: ActionController::HeaderStore
+      def process_action: (Symbol action_name) -> nil
+      def show: () -> nil
+    end
   end
 
   module Representations

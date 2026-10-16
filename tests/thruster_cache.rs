@@ -118,3 +118,100 @@ fn thruster_cache_follows_thrusters_rules() {
     assert!(output.status.success(), "thruster cache failed:\n{stdout}\n{stderr}");
     assert!(stdout.contains("ALL OK"), "thruster cache cases did not execute:\n{stdout}");
 }
+
+// The Falcon front answers from the store the Rack middleware fills, as
+// a Protocol::HTTP response, and hands everything else to the app behind
+// it. Protocol::HTTP is stood in for by the three shapes Front builds, so
+// the rules are held here without Falcon's gems; the real classes are
+// exercised by the ruby-falcon bench lane.
+const FRONT_SCRIPT: &str = r##"
+require "rack"
+require File.expand_path("runtime/spinel/scaffold/ruby_overlay/runtime/thruster_cache", Dir.pwd)
+
+module Protocol
+  module HTTP
+    Response = Struct.new(:status, :headers, :body) do
+      def self.[](status, headers, body) = new(status, headers, body)
+    end
+    class Headers
+      def initialize(fields) = @fields = fields
+      def to_a = @fields
+      def [](name) = @fields.select { |k, _| k == name }.map(&:last).join(",").then { |v| v.empty? ? nil : v }
+    end
+    module Body
+      Buffered = Struct.new(:chunks, :length)
+    end
+  end
+end
+
+Request = Struct.new(:method, :path, :authority, :headers)
+calls = Hash.new(0)
+app = lambda do |env|
+  calls[env["PATH_INFO"]] += 1
+  case env["PATH_INFO"]
+  when "/public"
+    [200, { "content-type" => "text/css", "cache-control" => "public, max-age=60", "content-length" => "11",
+            "set-cookie" => "s=1", "etag" => "\"v1\"" }, ["body-public"]]
+  when "/vary"
+    [200, { "cache-control" => "public, max-age=60", "vary" => "Accept" }, ["accept=#{env["HTTP_ACCEPT"]}"]]
+  else
+    [200, { "cache-control" => "private" }, ["dynamic"]]
+  end
+end
+mw = ThrusterCache::Middleware.new(app)
+inner = []
+front = ThrusterCache::Front.new(->(request) { inner << request.path; :passed_to_app })
+req = ->(path, headers = {}, method: "GET") {
+  Request.new(method, path, "example.org", Protocol::HTTP::Headers.new(headers.to_a))
+}
+rack_get = ->(path, extra = {}) {
+  mw.call(Rack::MockRequest.env_for("http://example.org#{path}", { "HTTP_HOST" => "example.org" }.merge(extra)))
+}
+check = ->(cond, what) { raise "FAILED: #{what}" unless cond }
+
+check.(front.call(req.("/public")) == :passed_to_app, "a miss goes to the app behind the front")
+rack_get.("/public")
+r = front.call(req.("/public"))
+check.(r.status == 200 && r.body.chunks == ["body-public"] && r.body.length == 11, "a stored response is answered by the front")
+check.(r.headers["x-cache"] == "hit" && r.headers["content-type"] == "text/css", "the front's hit carries the stored headers and X-Cache: hit")
+check.(r.headers["set-cookie"].nil?, "the front's hit carries no Set-Cookie")
+check.(r.headers["vary"] == "Accept-Encoding", "the front's hit carries the Vary the store added")
+check.(r.headers.to_a.none? { |k, _| k == "content-length" }, "the front's hit leaves Content-Length to the writer (a stored one went out twice)")
+check.(calls["/public"] == 1, "the front's hit never reaches the Rack app")
+
+r = front.call(req.("/public", { "if-none-match" => "\"v0\", \"v1\"" }))
+check.(r.status == 304 && r.body.nil? && r.headers["content-type"].nil? && r.headers["etag"] == "\"v1\"", "the front answers 304 to the ETag")
+r = front.call(req.("/public", method: "HEAD"))
+check.(inner.last == "/public" && r == :passed_to_app, "HEAD has its own key, so a GET entry is not its hit")
+rack_get.("/public", method: "HEAD")
+r = front.call(req.("/public", method: "HEAD"))
+check.(r.status == 200 && r.body.nil? && r.headers["content-length"] == "11", "a HEAD hit has no body and states its length")
+
+check.(front.call(req.("/public", { "range" => "bytes=0-1" })) == :passed_to_app, "a Range request bypasses the front")
+check.(front.call(req.("/public", { "upgrade" => "websocket" })) == :passed_to_app, "a WebSocket upgrade bypasses the front")
+check.(front.call(req.("/public", method: "POST")) == :passed_to_app, "a POST bypasses the front")
+check.(front.call(req.("/public?x=1")) == :passed_to_app, "the query string is part of the key")
+
+rack_get.("/vary", "HTTP_ACCEPT" => "text/html")
+r = front.call(req.("/vary", { "accept" => "text/html" }))
+check.(r.status == 200 && r.body.chunks == ["accept=text/html"], "a Vary'd entry is found for matching request headers")
+check.(front.call(req.("/vary", { "accept" => "application/json" })) == :passed_to_app, "a different Vary value is not a hit")
+
+ENV["ROUNDHOUSE_RESPONSE_CACHE"] = "0"
+check.(front.call(req.("/public")) == :passed_to_app, "ROUNDHOUSE_RESPONSE_CACHE=0 turns the front off too")
+
+puts "ALL OK"
+"##;
+
+#[test]
+fn falcon_front_answers_hits_from_the_shared_store() {
+    let output = Command::new("ruby")
+        .args(["-e", FRONT_SCRIPT])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Ruby interpreter available");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "falcon front failed:\n{stdout}\n{stderr}");
+    assert!(stdout.contains("ALL OK"), "falcon front cases did not execute:\n{stdout}");
+}

@@ -101,13 +101,25 @@ module ActionView
       Rails.application.token_fields_omitted
     end
 
+    # A broadcast renders as Rails' `ApplicationController.renderer`
+    # does: through a controller of its own, not the request that
+    # triggered it, so `controller.perform_caching` and the fragment
+    # store answer for a render with no request snapshot behind it —
+    # the detached controller, which caches nothing
+    # (runtime/action_controller_fragment_caching.rb). The request's
+    # controller is put back when the render is done. Like the flag, a
+    # raise inside the render leaves the swap for the rest of that one
+    # request only; the next dispatch assigns its own controller.
     def self.begin_broadcast_render
       Thread.current[:view_broadcast_rendering] = true
+      Thread.current[:view_broadcast_request_controller] = ActionController::Current.controller
+      ActionController::Current.controller = ActionView::ViewHelpers.broadcast_controller
       ""
     end
 
     def self.broadcast_render(_armed, html)
       Thread.current[:view_broadcast_rendering] = false
+      ActionController::Current.controller = Thread.current[:view_broadcast_request_controller]
       html
     end
   end

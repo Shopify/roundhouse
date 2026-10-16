@@ -267,10 +267,10 @@ pub(in crate::analyze) fn register(
     // `set(wait: …).perform_later(…)`. Same shape as the mailer
     // block above: identify jobs by walking the parent chain to
     // `ActiveJob::Base`, then register the entries.
-    // `perform_later`/`set` return the class-typed value (`set`
-    // collapses to self under the inline semantics
-    // `lower::job_class_side` synthesizes, so the chained
-    // `perform_later` re-dispatches on the class);
+    // `set` returns the class-typed value (it collapses to self under
+    // the inline semantics `lower::job_class_side` synthesizes, so the
+    // chained `perform_later` re-dispatches on the class);
+    // `perform_later` answers nil, as that wrapper does;
     // `perform_now` returns `perform`'s declared type.
     {
         let parent_of: HashMap<&ClassId, Option<&ClassId>> = app
@@ -313,7 +313,8 @@ pub(in crate::analyze) fn register(
             let cls = classes.entry(lc.name.clone()).or_default();
             cls.parent = lc.parent.clone();
             for (entry, ty) in [
-                ("perform_later", self_ty.clone()),
+                // Not the job Rails answers: the wrapper `job_class_side` writes answers nil.
+                ("perform_later", Ty::Nil),
                 ("set", self_ty.clone()),
                 ("perform_now", perform_ret),
             ] {

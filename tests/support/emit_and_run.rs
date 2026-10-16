@@ -221,7 +221,8 @@ impl Overlay {
         (emitted, errors)
     }
 
-    fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
+    /// Copy the fixture and apply the edits: the scratch dir and the app in it.
+    fn materialize(self) -> (PathBuf, PathBuf) {
         let scratch = scratch_dir();
         let source = scratch.join("app");
         copy_tree(&self.base, &source);
@@ -254,6 +255,19 @@ impl Overlay {
             }
         }
 
+        (scratch, source)
+    }
+
+    /// The warnings ingesting the overlaid app reports.
+    pub fn ingest_warnings(self) -> Vec<String> {
+        let (scratch, source) = self.materialize();
+        let (_app, diags) = roundhouse::ingest::prism::scope(|| ingest_app(&source).expect("ingest the overlaid fixture"));
+        let _ = std::fs::remove_dir_all(&scratch);
+        diags.into_iter().filter(|d| d.severity == Severity::Warning).map(|d| d.message).collect()
+    }
+
+    fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
+        let (scratch, source) = self.materialize();
         let mut app = ingest_app(&source).expect("ingest the overlaid fixture");
         let lower_diags = roundhouse::session::analyze_and_lower(&mut app);
         let mut errors: Vec<_> = diagnose(&app)

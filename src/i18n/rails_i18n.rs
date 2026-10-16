@@ -1,7 +1,9 @@
 //! rails-i18n: the gem's pluralization module, which installs a rule per
 //! locale from `rails/pluralization/<locale>.rb` for each available
-//! locale unless `config.rails_i18n.enabled_modules` leaves it out.
-//! Its locale files and ordinals are not modeled.
+//! locale unless `config.rails_i18n.enabled_modules` leaves it out, and
+//! its `rails/locale/<locale>.yml` translations the same way (read where
+//! the gem is installed, by [`super::gems`]). Its ordinals and
+//! transliterations are not modeled.
 
 use crate::gems::Lockfile;
 
@@ -41,11 +43,33 @@ pub fn rails_i18n(locale: &str) -> Option<String> {
     Some(format!("? ! num :other {}", rails_i18n_rule(name)?))
 }
 
+/// The rules above are 8.1.0's; another version's may differ.
+pub const RULES_VERSION: &str = "8.1.0";
+
+/// Whether the railtie enables `module` (`:locale`, `:pluralization`):
+/// every one unless `config.rails_i18n.enabled_modules` names a list.
+pub fn enables(application_rb: &str, module: &str) -> bool {
+    let modules = application_rb.lines().map(str::trim).find_map(|l| l.strip_prefix("config.rails_i18n.enabled_modules"));
+    modules.is_none_or(|m| m.contains(&format!(":{module}")) || m.contains(&format!("\"{module}\"")) || m.contains(&format!("'{module}'")))
+}
+
+/// Whether the railtie loads the gem file at `path`: a `rails/locale`
+/// file when the locale module is enabled and its locale is among
+/// `available` (`config.i18n.available_locales` as the railtie reads
+/// it, `None` for every locale).
+pub fn loads(path: &str, application_rb: &str, available: Option<&[String]>) -> bool {
+    let p = std::path::Path::new(path);
+    if !p.parent().is_some_and(|d| d.ends_with("rails/locale")) {
+        return true;
+    }
+    let locale = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    enables(application_rb, "locale") && available.is_none_or(|a| a.iter().any(|l| l == locale))
+}
+
 /// Each of `locales`' rule, when the app bundles rails-i18n with its
 /// pluralization module (`application_rb` is `config/application.rb`).
 pub fn plural_rules(lock: Option<&Lockfile>, application_rb: &str, locales: &[String]) -> Vec<(String, String)> {
-    let modules = application_rb.lines().map(str::trim).find_map(|l| l.strip_prefix("config.rails_i18n.enabled_modules"));
-    if !lock.is_some_and(|l| l.has("rails-i18n")) || modules.is_some_and(|m| !m.contains("pluralization")) {
+    if !lock.is_some_and(|l| l.has("rails-i18n")) || !enables(application_rb, "pluralization") {
         return Vec::new();
     }
     locales.iter().filter_map(|l| Some((l.clone(), rails_i18n(l)?))).collect()
@@ -62,6 +86,18 @@ mod tests {
         }
         assert_eq!(rails_i18n("ja").as_deref(), Some("? ! num :other :other"));
         assert_eq!(rails_i18n("xx"), None);
+    }
+
+    #[test]
+    fn the_railtie_loads_a_locale_file_by_module_and_availability() {
+        let pl = "/gems/rails-i18n-8.1.0/rails/locale/pl.yml";
+        assert!(loads(pl, "", None));
+        assert!(loads(pl, "", Some(&["en".into(), "pl".into()])));
+        assert!(!loads(pl, "", Some(&["en".into()])));
+        assert!(!loads(pl, "    config.rails_i18n.enabled_modules = [:pluralization]", None));
+        assert!(loads(pl, "    config.rails_i18n.enabled_modules = [:locale]", None));
+        assert!(loads("/gems/devise/config/locales/en.yml", "", Some(&[])));
+        assert!(!enables("config.rails_i18n.enabled_modules = [:locale]", "pluralization"));
     }
 
 }

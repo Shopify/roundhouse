@@ -835,6 +835,18 @@ module Db
     Thread.current[:ar_txn_depth] = value
   end
 
+  # The open transaction's enlisted writes (connection.rb), held in the
+  # same per-thread storage as the depth.
+  def self._txn_records
+    records = Thread.current[:ar_txn_records]
+    if records.nil?
+      records = [ActiveRecord::EnlistedRecord.new(ActiveRecord::Base.new, 0)]
+      records.clear
+      Thread.current[:ar_txn_records] = records
+    end
+    records
+  end
+
   # Not PostgreSQL's DISABLE TRIGGER: its DDL here carries no foreign keys yet (emit::shared::schema_sql), so a fixture load has nothing to defer.
   def self.without_foreign_keys
     yield

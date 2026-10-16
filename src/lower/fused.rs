@@ -394,7 +394,7 @@ fn rewrite_mid_node(
         }
     }
     if !enum_map.is_empty() {
-        super::enum_symbols::rewrite_node(e, enum_map);
+        super::enum_symbols::rewrite_node(e, enum_map, enclosing);
     }
     if !json_map.is_empty() {
         super::has_json::rewrite_node(e, json_map);

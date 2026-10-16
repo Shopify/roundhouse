@@ -141,10 +141,13 @@ fn the_spinel_tree_defines_the_http_auth_helpers_and_reads_the_header() {
             .contains("request_obj.env[ActionDispatch::Http::Headers.env_name(name)] = value"),
         "main.rb does not map parsed headers into the request env"
     );
-    assert!(file(&files, "main.rb").contains("request_obj.path_parameters = matched.path_params"));
+    // The route's captures reach the request through `Main.route_parameters`,
+    // which adds the route's controller and action in front of them.
+    assert!(file(&files, "main.rb").contains("request_obj.path_parameters = Main.route_parameters(controller, matched)"));
+    assert!(file(&files, "main.rb").contains("matched.path_params.each { |k, v| out[k] = v }"));
     assert!(
         include_str!("../runtime/spinel/scaffold/ruby_overlay/main.rb")
-            .contains("controller.request.path_parameters = matched.path_params")
+            .contains("controller.request.path_parameters = Main.route_parameters(controller, matched)")
     );
     let request = file(&files, "runtime/action_dispatch/request.rb");
     for feature in ["def authorization", "def path_parameters"] {

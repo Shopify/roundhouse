@@ -934,10 +934,10 @@ jobs:
       shard-1: ${{ steps.result.outputs.shard-1 }}
       shard-2: ${{ steps.result.outputs.shard-2 }}
     runs-on: ubuntu-latest
-    # 20m: unsharded, the suite took 20-30m (full run 38665931779); a shard
-    # carries about a third. Headroom for cold cache / slow Postgres health
-    # without papering over a hung suite.
-    timeout-minutes: 20
+    # 30m: upstream's shards take 11-14m, but a fork's runners take about
+    # 1.7x that (a 20m bound cut a passing shard 2 there, fork run
+    # 38923600903). Still short of papering over a hung suite.
+    timeout-minutes: 30
 
     continue-on-error: ${{ needs.plan.outputs.spinel-advisory == 'true' }}
     # spinel_pg_db runs the PostgreSQL Db shim against this server.
@@ -1058,8 +1058,9 @@ jobs:
     timeout-minutes: 55
 
     services:
+      # Not public.ecr.aws: its anonymous pulls fail with "toomanyrequests: Data limit exceeded" on shared runner IPs.
       redis:
-        image: public.ecr.aws/docker/library/redis
+        image: mirror.gcr.io/library/redis
         ports: ['6379:6379']
     env:
       # The oracle's `bundle install` lands inside build/campfire-oracle
@@ -1322,8 +1323,9 @@ jobs:
       minor-gc: ${{ steps.result.outputs.minor-gc }}
       verify-gen: ${{ steps.result.outputs.verify-gen }}
     services:
+      # Not public.ecr.aws: its anonymous pulls fail with "toomanyrequests: Data limit exceeded" on shared runner IPs.
       redis:
-        image: public.ecr.aws/docker/library/redis
+        image: mirror.gcr.io/library/redis
         ports: ['6379:6379']
     env:
       BUNDLE_PATH: vendor/bundle
@@ -1425,8 +1427,9 @@ jobs:
 
     continue-on-error: true
     services:
+      # Not public.ecr.aws: its anonymous pulls fail with "toomanyrequests: Data limit exceeded" on shared runner IPs.
       redis:
-        image: public.ecr.aws/docker/library/redis
+        image: mirror.gcr.io/library/redis
         ports: ['6379:6379']
     env:
       BUNDLE_PATH: vendor/bundle

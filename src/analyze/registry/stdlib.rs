@@ -686,7 +686,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         "TypeError", "NameError", "NoMethodError", "IndexError",
         "KeyError", "RangeError", "IOError", "NotImplementedError",
         "FrozenError", "ZeroDivisionError", "StopIteration",
-        "ThreadError", "ClosedQueueError",
+        "ThreadError", "ClosedQueueError", "RegexpError",
         // CRuby's bundled libraries and Spinel's uri/net/json packages
         // recognize these exception names; emitted requires load them.
         "URI::Error", "URI::InvalidURIError", "Net::OpenTimeout", "Net::ReadTimeout",

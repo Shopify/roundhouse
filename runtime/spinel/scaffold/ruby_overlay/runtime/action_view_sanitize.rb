@@ -94,6 +94,14 @@ unless RH_SANITIZER_VENDOR.nil?
         RH_SAFE_LIST_SANITIZER.sanitize(html.to_s, tags: tags, attributes: attributes).to_s
       end
 
+      # `sanitize(html, tags:, attributes:)` from a view or helper — the
+      # emit rewrites the keyword call to this one. The view form, so a
+      # safe buffer, as `sanitize` above answers.
+      def self.sanitize_with(html, tags, attributes)
+        return nil if html.nil?
+        SafeString.new(RH_SAFE_LIST_SANITIZER.sanitize(html.to_s, tags: tags, attributes: attributes).to_s)
+      end
+
       # `auto_link` — the `rails_autolink` gem (campfire's Gemfile),
       # PORTED rather than declared: unlike the sanitizer it depends on
       # actionview, which this tree does not have and does not want.

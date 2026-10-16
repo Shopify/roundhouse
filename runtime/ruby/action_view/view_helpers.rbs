@@ -56,6 +56,12 @@ module ActionView
     def self.collection_fragment_key: (String partial, untyped key) -> String
     def self.collection_fragment_read: (String name) -> String?
     def self.collection_fragment_write: (String name, String value) -> String
+    def self.collection_fragment_read_multi: (Array[String] names) -> Array[String?]
+    def self.collection_rendered: (String identifier, Array[String?] hits) -> nil
+    def self.jbuilder_caching?: () -> bool
+    def self.jbuilder_cache_key: (String template, untyped key) -> String
+    def self.jbuilder_fragment_read: (String key) -> String?
+    def self.jbuilder_fragment_write: (String key, String value) -> String
     def self.to_query: (Hash[Symbol, untyped] params) -> String
     def self.to_query_pairs: (Hash[Symbol, untyped] params, String namespace) -> String
     def self.to_query_value: (String name, untyped value) -> String

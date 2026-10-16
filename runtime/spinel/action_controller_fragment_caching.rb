@@ -93,6 +93,13 @@ module ActionController
 
     # Answers `content`, stored or not. `ttl` is whole seconds, 0 for
     # none; a store that cannot carry it is not written.
+    # Rails' `AbstractController::Caching::Fragments#
+    # instrument_fragment_cache`: the block's value. What Rails reports
+    # around it (`read_fragment.action_controller`) is not reported.
+    def instrument_fragment_cache(_name, _key)
+      yield
+    end
+
     def write_fragment(key, content, ttl = 0)
       return content unless perform_caching
       store = cache_store
@@ -108,6 +115,22 @@ module ActionController
 end
 
 module ActionView
+  # Rails' `ActionView::PartialRenderer.collection_cache`: the store a
+  # cached collection render reads and writes, `Rails.cache` until
+  # assigned. An app assigns it from an initializer (written at the end
+  # of boot.rb, `project::apply_module_mixins`), a test around a block.
+  class PartialRenderer
+    def self.collection_cache
+      return @collection_cache if @collection_cache_assigned
+      Rails.cache
+    end
+
+    def self.collection_cache=(store)
+      @collection_cache = store
+      @collection_cache_assigned = true
+    end
+  end
+
   module ViewHelpers
     class DetachedFragmentController < ActionController::Base
       def perform_caching
@@ -140,19 +163,31 @@ module ActionView
       ActiveSupport::Cache.expanded_key(controller.combined_fragment_cache_key([ partial, key ]))
     end
 
-    # Rails reads every element from `ActionView::PartialRenderer.
-    # collection_cache`, which defaults to `Rails.cache` and which
-    # campfire points at its fragment store. The controller's
-    # `cache_store` is that store for every app this runtime serves.
+    # Rails reads and writes every element through `ActionView::
+    # PartialRenderer.collection_cache` — `Rails.cache` unless the app
+    # points it elsewhere (campfire's `fragment_cache.rb` initializer
+    # points it at its bounded `FragmentCache.store`), NOT the
+    # controller's `cache_store`.
     def self.collection_fragment_read(name)
-      store = ActionView::ViewHelpers.fragment_controller.cache_store
+      store = ActionView::PartialRenderer.collection_cache
       return nil if store.nil?
       return store.read(name) if store.is_a?(ActiveSupport::Cache::MemoryStore)
       store.read_str(name)
     end
 
+    # The whole collection's keys in one `read_multi`, as Rails asks.
+    def self.collection_fragment_read_multi(names)
+      store = ActionView::PartialRenderer.collection_cache
+      return names.map { |_name| nil } if store.nil?
+      if store.is_a?(ActiveSupport::Cache::MemoryStore)
+        found = store.read_multi(*names)
+        return names.map { |name| found[name] }
+      end
+      names.map { |name| store.read_str(name) }
+    end
+
     def self.collection_fragment_write(name, value)
-      store = ActionView::ViewHelpers.fragment_controller.cache_store
+      store = ActionView::PartialRenderer.collection_cache
       return value if store.nil?
       if store.is_a?(ActiveSupport::Cache::MemoryStore)
         store.write(name, value)
@@ -161,10 +196,40 @@ module ActionView
       store.write_str(name, value, 0)
     end
 
+    # Jbuilder's `cache!`: on when the controller caches.
+    def self.jbuilder_caching?
+      ActionView::ViewHelpers.fragment_controller.perform_caching
+    end
+
+    # Jbuilder's `_cache_key`: the template and the key as
+    # `cache_fragment_name` pairs them (the template's path standing in
+    # for its digest path), through the controller's
+    # `combined_fragment_cache_key`, expanded under the `jbuilder`
+    # namespace.
+    def self.jbuilder_cache_key(template, key)
+      controller = ActionView::ViewHelpers.fragment_controller
+      ActiveSupport::Cache.expand_cache_key(controller.combined_fragment_cache_key([ template, key ]), :jbuilder)
+    end
+
+    def self.jbuilder_fragment_read(key)
+      JbuilderTemplate.new(ActionView::ViewHelpers.fragment_controller).read_fragment(key)
+    end
+
+    def self.jbuilder_fragment_write(key, value)
+      JbuilderTemplate.new(ActionView::ViewHelpers.fragment_controller).write_fragment(key, value)
+    end
+
     # The controller rendering this page, or a detached one.
     def self.fragment_controller
       controller = ActionController::Current.controller
       return controller unless controller.nil?
+      ActionView::ViewHelpers.broadcast_controller
+    end
+
+    # The detached controller: what a broadcast renders through
+    # (runtime/thread_state.rb), and what any render with no controller
+    # in flight reads.
+    def self.broadcast_controller
       @detached_controller ||= DetachedFragmentController.new
     end
 
@@ -172,6 +237,50 @@ module ActionView
     # its own, as Rails' does.
     def self.fragment_name(key)
       key.start_with?("views/") ? key[6, key.length - 6] : key
+    end
+  end
+end
+
+# Jbuilder's template, as far as its fragment cache goes: the two
+# methods Jbuilder 2.14's `cache!` reads and writes through, with
+# Jbuilder's bodies (`Rails.cache`, under the controller's
+# `instrument_fragment_cache`). An app overrides them by prepending onto
+# this class from an initializer (campfire's `BoundedJbuilderFragments`
+# reads `controller.cache_store` instead); the prepend is written at the
+# end of boot.rb (`project::apply_module_mixins`). `@context` is the
+# view, which answers `controller`.
+class JbuilderTemplate
+  class Context
+    def initialize(controller)
+      @controller = controller
+    end
+
+    def controller
+      @controller
+    end
+  end
+
+  def initialize(controller)
+    @context = JbuilderTemplate::Context.new(controller)
+  end
+
+  def read_fragment(key)
+    _read_fragment_cache(key, nil)
+  end
+
+  def write_fragment(key, value)
+    _write_fragment_cache(key, nil) { value }
+  end
+
+  def _read_fragment_cache(key, options = nil)
+    @context.controller.instrument_fragment_cache(:read_fragment, key) { Rails.cache.read_str(key) }
+  end
+
+  def _write_fragment_cache(key, options = nil)
+    @context.controller.instrument_fragment_cache(:write_fragment, key) do
+      value = yield
+      Rails.cache.write_str(key, value, 0)
+      value
     end
   end
 end

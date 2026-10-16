@@ -14,11 +14,11 @@ use super::as_json_shape::{JsonPair, PairValue, ShapeError};
 use super::as_json_writer::{writer_method, PairEncoding};
 
 // Not the columns alone: these add to `attribute_names` or change what a column's reader answers.
-const ATTRIBUTE_MACROS: &[&str] =
+pub(super) const ATTRIBUTE_MACROS: &[&str] =
     &["attribute", "serialize", "store", "store_accessor", "encrypts", "composed_of"];
 
 // Not read from the declaration: an app that renames the inheritance column or ignores columns keeps the runtime encoder.
-const COLUMN_SETTERS: &[&str] = &["inheritance_column=", "ignored_columns=", "ignored_columns"];
+pub(super) const COLUMN_SETTERS: &[&str] = &["inheritance_column=", "ignored_columns=", "ignored_columns"];
 
 pub(super) fn column_writer(
     model: &Model,

@@ -107,22 +107,14 @@ module ActionCable
     # API. campfire calls it from `User#deactivate` and
     # `User#reset_remote_connections`.
     #
-    # The set it selects is EMPTY here, and that is STILL a divergence
-    # after subscription dispatch: connections now carry an identity and
-    # channels read `current_user` off it, so the selection is finally
-    # expressible — but nothing indexes live connections by user, and
-    # `Cable::Reactor`'s table is keyed by socket. Closing it means an
-    # index the reactor maintains on attach and drops on close, plus a
-    # posted close for each hit.
-    #
-    # WHAT IT COSTS UNTIL THEN: a deactivated or banned user's open
-    # socket keeps its subscriptions. The membership check in
-    # `RoomMessagesChannel` runs at SUBSCRIBE time, which is exactly the
-    # window campfire's own comment calls out ("revoking a membership
-    # disconnects the user with reconnect: true, and the client then
-    # replays its subscriptions") — the replay is now authorized, the
-    # disconnect that forces it is not. Recorded in
-    # docs/pipeline/runtime.md rather than left as a silent no-op.
+    # As Rails does it: `disconnect` broadcasts on the selected
+    # identifier's internal channel (`RemoteConnection` below), and each
+    # identified `Cable::Connection` subscribed to its own internal
+    # channel when it started, so the message closes exactly the sockets
+    # of that user. The membership check in `RoomMessagesChannel` runs at
+    # SUBSCRIBE time, and this close is what makes the client replay its
+    # subscriptions through it ("revoking a membership disconnects the
+    # user with reconnect: true", campfire's own comment).
     def remote_connections
       raise STUB_RAISE[0] if STUB_RAISE_ON[0]
       RemoteConnections.new
@@ -247,9 +239,8 @@ module ActionCable
   end
 
   # The `where(…)` half of the above: a selection over connections
-  # identified by their connection identifiers. Holds no state because
-  # the selection is always empty; `disconnect` is what a caller does
-  # with it.
+  # identified by their connection identifiers. The selection is a NAME,
+  # as in Rails — the identifier text — not a set of sockets.
   class RemoteConnections
     def where(identifiers)
       if Server::EXPECT_COUNT[0] >= 0
@@ -257,20 +248,47 @@ module ActionCable
         admitted = Server::EXPECT_USERS.length == 1 && current_user == Server::EXPECT_USERS[0]
         raise "unexpected invocation: remote_connections.where(current_user: #{current_user&.id})" unless admitted
       end
-      RemoteConnection.new
+      RemoteConnection.new(ActionCable.connection_identifier(identifiers.values))
     end
   end
 
+  # Rails' `RemoteConnection#disconnect` broadcasts
+  # `{ type: "disconnect", reconnect: }` on the selected connections'
+  # INTERNAL CHANNEL, `action_cable/<connection identifier>`; every live
+  # connection subscribed to its own internal channel when it connected,
+  # and closes itself on that message. Both halves are on this lane: the
+  # broadcast here, the subscription and the close in `cable.rb`
+  # (`Cable::Connection#start`, `Cable::Registry.deliver`).
   class RemoteConnection
+    def initialize(identifier = "")
+      @identifier = identifier
+    end
+
+    def internal_channel
+      "action_cable/#{@identifier}"
+    end
+
     def disconnect(reconnect: false)
       if Server::EXPECT_COUNT[0] >= 0
         if reconnect != Server::EXPECT_RECONNECT[0]
           raise "unexpected invocation: remote_connection.disconnect(reconnect: #{reconnect})"
         end
         Server::EXPECT_CALLS[0] += 1
+        # A mocked graph stands in for the real object, as under mocha:
+        # the expectation is the whole effect.
+        return nil
       end
+      ActionCable.server.broadcast(internal_channel, { type: "disconnect", reconnect: reconnect })
       nil
     end
+  end
+
+  # Rails' `Connection::Identification#connection_gid`: each identifier
+  # that is set, as its GlobalID param when it has one, sorted and joined
+  # by ":". The same text names a connection's internal channel on the
+  # socket side and the selection on the broadcasting side.
+  def self.connection_identifier(values)
+    values.compact.map { |o| o.respond_to?(:to_gid_param) ? o.to_gid_param : o.to_s }.sort.join(":")
   end
 
   SERVER = Server.new
@@ -641,6 +659,12 @@ module ActionCable
       # identifiers connects anonymously instead of erroring.
       def connect
         nil
+      end
+
+      # Rails' `connection_identifier`, over the one identifier there is:
+      # "" for an anonymous connection, which then has no internal channel.
+      def connection_identifier
+        ActionCable.connection_identifier([ current_user ])
       end
 
       def reject_unauthorized_connection

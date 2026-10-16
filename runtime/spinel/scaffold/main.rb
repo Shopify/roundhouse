@@ -42,6 +42,19 @@ module Main
     end
   end
 
+  # Rails' `request.path_parameters`: the route's captures, with the
+  # controller and action the request was dispatched to. The
+  # controller's own `path_parameters` and params keep the captures alone.
+  def self.route_parameters(controller, matched)
+    out = {}
+    matched.path_params.each { |k, v| out[k] = v }
+    # The dispatched controller and action win over a capture of the same
+    # name: Rails dispatches by these two, so they name what ran.
+    out["controller"] = controller.controller_path
+    out["action"] = matched.action.to_s
+    out
+  end
+
   # The controller's params, built the way Rails builds them
   # (`ActionDispatch::Http::Parameters#parameters`): the body's params,
   # the query string's merged over them, the route's path captures over
@@ -481,7 +494,11 @@ module Main
     request_obj.remote_ip = req.remote_host
     request_obj.referer = req.req_headers.fetch("referer", "")
     request_obj.host = req.req_headers.fetch("host", "localhost")
-    request_obj.path_parameters = matched.path_params
+    request_obj.path_parameters = Main.route_parameters(controller, matched)
+    # The controller's params, copied into the request's own slot (as
+    # `Request.for` copies, see runtime/action_dispatch/request.rb):
+    # `request.filtered_parameters` reads them.
+    params.each { |k, v| request_obj.params[k] = v }
     fmt_name = "html"
     fmt_name = "json" if request_format == :json
     fmt_name = "rss" if request_format == :rss

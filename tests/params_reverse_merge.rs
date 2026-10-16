@@ -51,7 +51,7 @@ fn a_default_outside_the_permit_list_is_always_assigned() {
             src.contains(r#"_p = WidgetParams.from_raw(Params.require_present(@params, "widget"))"#),
             "{target:?}:\n{src}"
         );
-        assert!(src.contains("_p.status = 0\n    _p.status_provided = true\n    _p\n"), "{target:?}:\n{src}");
+        assert!(src.contains("_p.status = \"0\"\n    _p.status_provided = true\n    _p\n"), "{target:?}:\n{src}");
         assert!(!src.contains(".merge("), "{target:?}:\n{src}");
     }
 }
@@ -66,7 +66,7 @@ fn a_default_inside_the_permit_list_yields_to_the_request() {
         src.contains("if !(_p.kind_provided)\n      _p.kind = \"basic\"\n      _p.kind_provided = true\n    end\n"),
         "{src}"
     );
-    assert!(src.contains("    _p.status = 0\n"), "{src}");
+    assert!(src.contains("    _p.status = \"0\"\n"), "{src}");
 }
 
 /// The helper's signature and its call site agree with the body: one
@@ -85,7 +85,7 @@ fn the_expect_form_keeps_its_refusal() {
         src.contains(r#"_p = WidgetParams.from_raw(Params.expect_present(@params, "widget", ["name"], [], [], []))"#),
         "{src}"
     );
-    assert!(src.contains("_p.status = 0"), "{src}");
+    assert!(src.contains("_p.status = \"0\""), "{src}");
 }
 
 /// `return <chain>.reverse_merge(...)`: the statements replace the
@@ -98,7 +98,7 @@ fn an_explicit_return_is_rewritten_too() {
             src.contains(r#"_p = WidgetParams.from_raw(Params.require_present(@params, "widget"))"#),
             "{target:?}:\n{src}"
         );
-        assert!(src.contains("_p.status = 0\n    _p.status_provided = true\n    return _p\n"), "{target:?}:\n{src}");
+        assert!(src.contains("_p.status = \"0\"\n    _p.status_provided = true\n    return _p\n"), "{target:?}:\n{src}");
         assert!(!src.contains(".merge("), "{target:?}:\n{src}");
     }
 }

@@ -71,14 +71,23 @@ use Rack::Static, urls: ["/assets", "/icon.png", "/icon.svg"], root: "static",
 # public/ (robots.txt, the error pages) is served ahead of the routes.
 # Not `Rack::Static, urls: [""], cascade: true`: Rack::Files answers a
 # POST with 405, which does not cascade, and every form post died there.
+#
+# The files are listed ONCE, at boot, as the hand-ported campfire on Falcon
+# does (its Assets table), rather than stat'ed per request as Rails'
+# FileHandler does: the stat was ~5% of a `/up` request on the bench box,
+# paid by every route. A file put under public/ after boot is not served
+# until a restart, which no deploy of a precompiled public/ does. An exact
+# key lookup also leaves no `..` to guard against.
 PUBLIC_FILES = Rack::Files.new("public", STATIC_HEADERS)
+PUBLIC_PATHS = Dir.glob("**/*", File::FNM_DOTMATCH, base: "public")
+  .select { |rel| File.file?(File.join("public", rel)) }
+  .to_h { |rel| ["/#{rel}", true] }.freeze
 use(Class.new do
   def initialize(app) = @app = app
 
   def call(env)
-    path = env["PATH_INFO"].to_s
-    if %w[GET HEAD].include?(env["REQUEST_METHOD"]) && !path.include?("..") &&
-       File.file?(File.join("public", path))
+    method = env["REQUEST_METHOD"]
+    if (method == "GET" || method == "HEAD") && PUBLIC_PATHS.key?(env["PATH_INFO"])
       PUBLIC_FILES.call(env)
     else
       @app.call(env)

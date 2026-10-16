@@ -94,8 +94,15 @@ module ActiveStorage
     def audio?: () -> bool
     def variable?: () -> bool
     def redirect_url: (String disposition) -> String
+    def proxy_url: (String disposition) -> String
+    def service_route: (String kind, String disposition) -> String
+    def content_type_for_serving: () -> String
+    def forced_disposition_for_serving: () -> String
     def url: (?String disposition) -> String
   end
+
+  def self.content_types_to_serve_as_binary: () -> Array[String]
+  def self.content_types_allowed_inline: () -> Array[String]
 
   module DiskKey
     def self.expiry: () -> String
@@ -285,6 +292,11 @@ end
 module RouteHelpers
   def self.rails_blob_path: (ActiveStorage::Attached attachment, ?disposition: String?, ?only_path: bool?) -> String
   def self.rails_blob_url: (ActiveStorage::Attached attachment, ?disposition: String?, ?only_path: bool?) -> String
+  def self.rails_storage_proxy_path: (ActiveStorage::Attached | ActiveStorage::Blob model, ?disposition: String?, ?only_path: bool?) -> String
+  def self.rails_storage_proxy_url: (ActiveStorage::Attached | ActiveStorage::Blob model, ?disposition: String?, ?only_path: bool?) -> String
+  def self.rails_storage_redirect_path: (ActiveStorage::Attached | ActiveStorage::Blob model, ?disposition: String?, ?only_path: bool?) -> String
+  def self.rails_storage_redirect_url: (ActiveStorage::Attached | ActiveStorage::Blob model, ?disposition: String?, ?only_path: bool?) -> String
+  def self.storage_blob: (ActiveStorage::Attached | ActiveStorage::Blob model) -> ActiveStorage::Blob?
   def self.rails_representation_path: (ActiveStorage::VariantWithRecord variant, ?only_path: bool?) -> String
   def self.rails_representation_url: (ActiveStorage::VariantWithRecord variant, ?only_path: bool?) -> String
   def self.rails_direct_uploads_path: () -> String

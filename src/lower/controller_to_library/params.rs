@@ -325,8 +325,7 @@ pub fn collect_specs(controllers: &[Controller]) -> ParamsSpecs {
     let mut specs: Vec<ParamsSpec> = Vec::new();
     for c in controllers {
         for action in c.actions() {
-            let tail = body_tail(&action.body);
-            collect_from_expr(&action.body, tail, &c.name, &mut index, &mut specs);
+            collect_from_expr(&action.body, &c.name, &mut index, &mut specs);
         }
     }
     assign_class_ids(&mut specs);
@@ -510,7 +509,6 @@ fn record(
 
 fn collect_from_expr(
     expr: &Expr,
-    tail: &Expr,
     controller: &ClassId,
     index: &mut BTreeMap<(Symbol, Vec<Symbol>), usize>,
     specs: &mut Vec<ParamsSpec>,
@@ -529,11 +527,7 @@ fn collect_from_expr(
             }
         }
     }
-    let found = if std::ptr::eq(expr, tail) {
-        match_reverse_merge(expr).or_else(|| match_permit_call_full(expr))
-    } else {
-        match_permit_call_full(expr)
-    };
+    let found = match_reverse_merge(expr).or_else(|| match_permit_call_full(expr));
     if let Some((resource, fields, nested)) = found {
         warn_nested_keys(&resource, &nested, controller, expr.span);
         record(resource, fields, controller, expr.span, Wants::default(), index, specs);
@@ -543,7 +537,7 @@ fn collect_from_expr(
         // register a second, narrower class for the same call site.
         return;
     }
-    walk_children(expr, &mut |c| collect_from_expr(c, tail, controller, index, specs));
+    walk_children(expr, &mut |c| collect_from_expr(c, controller, index, specs));
 }
 
 /// Record the NON-SCALAR permit keys this pass drops.
@@ -697,14 +691,12 @@ pub fn model_update_name(spec: &ParamsSpec, bang: bool) -> Symbol {
 /// First permit list in `expr`, in the same pre-order the collector
 /// uses — the way a `<resource>_params` helper body names its spec.
 pub fn first_permit_in(body: &Expr) -> Option<(Symbol, Vec<Symbol>)> {
-    first_permit_at(body, body_tail(body))
+    first_permit_at(body)
 }
 
-fn first_permit_at(expr: &Expr, tail: &Expr) -> Option<(Symbol, Vec<Symbol>)> {
-    if std::ptr::eq(expr, tail) {
-        if let Some((resource, fields, _)) = match_reverse_merge(expr) {
-            return Some((resource, fields));
-        }
+fn first_permit_at(expr: &Expr) -> Option<(Symbol, Vec<Symbol>)> {
+    if let Some((resource, fields, _)) = match_reverse_merge(expr) {
+        return Some((resource, fields));
     }
     if let Some(found) = match_permit_call(expr) {
         return Some(found);
@@ -712,7 +704,7 @@ fn first_permit_at(expr: &Expr, tail: &Expr) -> Option<(Symbol, Vec<Symbol>)> {
     let mut found = None;
     walk_children(expr, &mut |c| {
         if found.is_none() {
-            found = first_permit_at(c, tail);
+            found = first_permit_at(c);
         }
     });
     found
@@ -957,10 +949,19 @@ pub(super) fn hand_update_the_attrs(
     wanted: &mut std::collections::BTreeSet<ClassId>,
 ) {
     body.node.for_each_child_mut(&mut |c| hand_update_the_attrs(c, specs, answers, wanted));
-    let ExprNode::Send { recv: Some(_), method, args, block: None, .. } = &mut *body.node else {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *body.node else {
         return;
     };
-    if !matches!(method.as_str(), "update" | "update!") || args.len() != 1 {
+    // `Model.new(x)` / `create(x)` / `create!(x)` take the attribute Hash
+    // too. The typed factories are reached by name before typing
+    // (`rewrite_model_new_to_from_params`), so one left here holds the
+    // params object some other way: a local (`attrs = <permit
+    // chain>.reverse_merge(...)`) or the statements a defaults merge
+    // lowers to.
+    let constructs = matches!(method.as_str(), "new" | "create" | "create!")
+        && matches!(&*recv.node, ExprNode::Const { .. });
+    let updates = matches!(method.as_str(), "update" | "update!");
+    if !(constructs || updates) || args.len() != 1 {
         return;
     }
     let Some(Ty::Class { id, .. }) = args[0].ty.as_ref() else { return };
@@ -975,7 +976,7 @@ pub(super) fn hand_update_the_attrs(
             }
         }
     }
-    if specs.has_typed_update(spec) {
+    if updates && specs.has_typed_update(spec) {
         return;
     }
     let class_id = spec.class_id.clone();
@@ -1126,9 +1127,10 @@ fn match_permit_call_full(expr: &Expr) -> Option<(Symbol, Vec<Symbol>, Vec<Symbo
 
 /// Form 4: `{ field: expr, … }.merge(<permit-chain>)`, ingest's spelling
 /// of `<permit-chain>.reverse_merge(field: expr, …)`. The defaults' keys
-/// join the fields as Form 3's do. Callers match it only at a method
-/// body's tail (see [`body_tail`]): the rewrite is a statement Seq, and
-/// the tail of a params helper is where one can stand.
+/// join the fields as Form 3's do. The rewrite is a statement Seq, like
+/// Form 3's, so it stands wherever Form 3's does: a params helper's tail,
+/// a local's value (`attrs = <chain>.reverse_merge(...)`) or a call's
+/// argument.
 fn match_reverse_merge(expr: &Expr) -> Option<(Symbol, Vec<Symbol>, Vec<Symbol>)> {
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else {
         return None;
@@ -2210,9 +2212,9 @@ pub fn rewrite_to_from_raw(expr: &Expr, specs: &ParamsSpecs, guard: bool) -> Exp
                 return Some(build_from_raw_merge(&spec.class_id, entries, e.span, arg));
             }
         }
-        // Reverse-merge form (Form 4), at the body's tail only. Under an
-        // explicit `return` the statements replace the `return`, which
-        // moves onto the final `_p`.
+        // Reverse-merge form (Form 4). Under an explicit `return` at the
+        // body's tail the statements replace the `return`, which moves
+        // onto the final `_p`.
         let defaults = |e: &Expr| -> Option<Expr> {
             let (resource, fields, _) = match_reverse_merge(e)?;
             let ExprNode::Send { recv: Some(recv), args, .. } = &*e.node else { unreachable!() };
@@ -2232,10 +2234,8 @@ pub fn rewrite_to_from_raw(expr: &Expr, specs: &ParamsSpecs, guard: bool) -> Exp
                 }
             }
         }
-        if std::ptr::eq(e, tail) {
-            if let Some(seq) = defaults(e) {
-                return Some(seq);
-            }
+        if let Some(seq) = defaults(e) {
+            return Some(seq);
         }
         let (resource, fields) = match_permit_call(e)?;
         let spec = specs.find(&resource, &fields)?;
@@ -2313,7 +2313,7 @@ fn build_from_raw_merge(class_id: &ClassId, entries: &[(Expr, Expr)], span: Span
             span,
             ExprNode::Assign {
                 target: LValue::Attr { recv: p(()), name: name.clone() },
-                value: v.clone(),
+                value: param_string_literal(v).unwrap_or_else(|| v.clone()),
             },
         ));
         stmts.push(Expr::new(
@@ -2326,6 +2326,25 @@ fn build_from_raw_merge(class_id: &ClassId, entries: &[(Expr, Expr)], span: Span
     }
     stmts.push(p(()));
     Expr::new(span, ExprNode::Seq { exprs: stmts })
+}
+
+/// A literal merged value as the String a request would carry for it:
+/// every field of a `<Resource>Params` is a String (the model's typed
+/// factory casts it as it casts the request's), so `status: 0` is
+/// `"0"`, `role: :owner` is `"owner"`. A literal of another type in a
+/// String field is a type error on a strict target, and Spinel
+/// miscompiles it. Any other value is left as written.
+fn param_string_literal(v: &Expr) -> Option<Expr> {
+    let text = match &*v.node {
+        ExprNode::Lit { value: Literal::Int { value } } => value.to_string(),
+        ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+        ExprNode::Lit { value: Literal::Bool { value } } => value.to_string(),
+        _ => return None,
+    };
+    Some(crate::lower::typing::with_ty(
+        Expr::new(v.span, ExprNode::Lit { value: Literal::Str { value: text } }),
+        Ty::Str,
+    ))
 }
 
 /// The factory's argument for the permit chain `chain`: `@params`, or,

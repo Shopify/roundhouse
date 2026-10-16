@@ -15,8 +15,11 @@ module ActiveSupport
   def self.present?: (untyped value) -> bool
   def self.to_param: (untyped value) -> String
 
-  def self.to_query: (Hash[String, Roundhouse::ParamValue] value) -> String
-  def self.query_pairs: (Hash[String, Roundhouse::ParamValue] hash, String namespace) -> String
+  # Any key, as Rails' `Hash#to_query` (each is `to_s`'d): a literal
+  # `{ page: 2, q: params[:q] }.to_query` passes Symbols, and spinel
+  # refuses a Symbol-keyed Hash against a declared `Hash[String, _]`.
+  def self.to_query: (Hash[untyped, Roundhouse::ParamValue] value) -> String
+  def self.query_pairs: (Hash[untyped, Roundhouse::ParamValue] hash, String namespace) -> String
   def self.query_escape: (String text) -> String
   def self.query_value: (String name, Roundhouse::ParamValue item) -> String
   def self.presence: (untyped value) -> untyped

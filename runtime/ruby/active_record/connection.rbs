@@ -39,6 +39,8 @@ module ActiveRecord
   end
 
   class Connection
+    self.@shared: Connection?
+    def self.shared: () -> Connection
     def adapter_name: () -> String
     def quote: (String | Symbol | Integer | Float | bool | nil value) -> String
     def quote_string: (String str) -> String
@@ -53,6 +55,14 @@ module ActiveRecord
     def exec_update: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Integer
     def exec_delete: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Integer
     def exec_insert: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Result
+  end
+
+  class EnlistedRecord
+    @record: Base
+    @kind: Integer
+    def record: () -> Base
+    def kind: () -> Integer
+    def initialize: (Base record, Integer kind) -> void
   end
 
   class Base
@@ -73,9 +83,9 @@ module ActiveRecord
     def with_lock: (?(bool | String)? lock, ?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
     def self.delete_all: () -> Integer
     def self.update_counters: (Integer | String id, Hash[Symbol, untyped] counters) -> Integer
-    def self.upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?returning: untyped) -> Integer
+    def self.upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
     def self._conflict_predicate: (String columns) -> String
-    def self.upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?returning: untyped) -> Integer
+    def self.upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?returning: untyped, ?record_timestamps: bool?) -> Integer
     def self.record_timestamps=: (bool value) -> bool
     def self.record_timestamps: () -> bool
     def update_column: (String | Symbol name, untyped value) -> bool
@@ -109,6 +119,20 @@ module ActiveRecord
     def self.take: () -> Base?
     def self._hydrate_all: (String sql) -> Array[Base]
     def update_attribute: (Symbol name, untyped value) -> bool
+    def save: () -> bool
+    def destroy: () -> Base
+    def touch: () -> bool
+    def touch_written: () -> bool
+    def _note_touched: () -> nil
+    @__touch_owner: Base?
+    def _adopt_touch_owner: (Base owner) -> nil
+    def _touch_owner: () -> nil
+    def _save_committed: (bool was_new) -> void
+    def _destroy_committed: () -> void
+    def _run_commit_callbacks: (Integer kind) -> nil
+    def self._commit_enlisted: () -> nil
+    def self._rollback_enlisted: (Integer from) -> nil
+    def _restore_after_rollback: (Integer kind) -> nil
     # Ruby-family overrides of base.rb's dirty-tracking stubs.
     def __track_saved_changes: (bool was_new) -> void
     def saved_changes: () -> Hash[String, untyped]

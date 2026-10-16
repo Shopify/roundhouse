@@ -67,3 +67,16 @@ fn commonmarker_constants_and_nodes_are_typed() {
     assert!(!err.contains("constant not supported"), "{err}");
     assert!(!err.contains("send_dispatch_failed"), "{err}");
 }
+
+/// Nokogiri is cataloged, and so is its HTML5 parser: `Nokogiri::HTML5`
+/// is the module the gem defines (gumbo's, which spinel-nokogiri also
+/// carries), so a helper that parses a fragment with it, walks its text
+/// nodes and serializes it back reads a declared constant, as the
+/// `Nokogiri::HTML` method call already does.
+#[test]
+fn nokogiri_html5_constants_are_typed() {
+    let helper = "module WidgetsHelper\n  def widget_markup(html)\n    fragment = Nokogiri::HTML5.fragment(html)\n    fragment.xpath(\".//text()\").each do |node|\n      node.replace Nokogiri::HTML5.fragment(node.to_html.upcase)\n    end\n    document = Nokogiri::HTML5(html)\n    Nokogiri::HTML5::Document.parse(html)\n    Nokogiri::HTML5::DocumentFragment.parse(html)\n    [fragment.to_html(preserve_newline: true), document]\n  end\nend\n";
+    let err = check(&[("app/models/application_record.rb", RECORD), ("app/helpers/widgets_helper.rb", helper)]);
+    assert!(!err.contains("constant not supported"), "{err}");
+    assert!(!err.contains("send_dispatch_failed"), "{err}");
+}

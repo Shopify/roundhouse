@@ -33,6 +33,7 @@ module ActionView
     def self.strip_tags: (String html) -> String
     def self.sanitize: (String html) -> String
     def self.sanitize_allowing: (String html, Array[String] tags, Array[String] attributes) -> String
+    def self.sanitize_with: (String html, Array[String] tags, Array[String] attributes) -> String
     # The safe-list engine and its ported rule tables.
     def self.sanitize_engine: (String s, Array[String] tags, Array[String] attributes) -> String
     def self.sanitize_default_tags: () -> Array[String]

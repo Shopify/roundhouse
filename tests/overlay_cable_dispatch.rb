@@ -400,6 +400,52 @@ rescue StandardError
 end
 check("an action that raises is contained", survived, true)
 
+# --- remote_connections.where(current_user:).disconnect --------------
+#
+# Rails' two halves: the broadcast on `action_cable/<identifier>`, and
+# the identified connection that subscribed to that internal channel
+# closing itself on it. The transport delivers in line, as the reactor
+# would on its own thread.
+module Broadcasts
+  def self.log_append(entry) = LOG << entry
+end
+Broadcasts::TRANSPORTS[0] = Object.new.tap do |t|
+  t.define_singleton_method(:broadcast) { |stream, payload| Cable::Registry.deliver(stream, payload) }
+end
+class User
+  def to_gid_param = GlobalID.param("User", id)
+end
+
+kicked = User.new(7, [])
+identity = ActionCable::Connection::Base.new(nil)
+identity.current_user = kicked
+bystander_identity = ActionCable::Connection::Base.new(nil)
+bystander_identity.current_user = User.new(8, [])
+
+sent = Hash.new { |h, k| h[k] = [] }
+closed = []
+live = [identity, bystander_identity].map do |ident|
+  conn = Cable::Connection.allocate
+  conn.instance_variable_set(:@identity, ident)
+  conn.define_singleton_method(:send_text) { |text| sent[ident.current_user.id] << JSON.parse(text) }
+  conn.define_singleton_method(:on_writable) { nil }
+  conn.define_singleton_method(:close) { closed << ident.current_user.id; Cable::Registry.unsubscribe_all(self) }
+  conn.subscribe_internal_channel
+  conn
+end
+
+check("an identified connection names its internal channel by gid",
+      live[0].internal_channel?("action_cable/#{kicked.to_gid_param}"), true)
+
+ActionCable.server.remote_connections.where(current_user: kicked).disconnect(reconnect: true)
+check("disconnect broadcasts Rails' internal message",
+      Broadcasts::LOG.last,
+      { action: :message, stream: "action_cable/#{kicked.to_gid_param}",
+        payload: { type: "disconnect", reconnect: true } })
+check("only the selected user's socket is told, then closed",
+      [sent[7], sent[8], closed],
+      [[{ "type" => "disconnect", "reason" => "remote", "reconnect" => true }], [], [7]])
+
 if FAILURES.empty?
   puts "ALL OK"
 else

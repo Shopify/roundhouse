@@ -235,3 +235,67 @@ puts "ALL OK"
     );
     assert!(out.status.success(), "driver exited {:?}", out.status.code());
 }
+
+/// A server can run the drain itself (falcon.rb makes it a task on the
+/// worker's event loop): `start_drainer` hands the runner the drain loop
+/// instead of starting a thread, later enqueues use that drain, and a
+/// forked child, where no runner was given, falls back to a thread.
+#[test]
+fn a_server_supplied_runner_hosts_the_drain() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r##"
+module Db
+  def self.with_connection
+    yield
+  end
+end
+require_relative "runtime/ruby/active_job"
+require_relative "runtime/spinel/thread_state"
+require_relative "runtime/spinel/scaffold/ruby_overlay/runtime/active_job_cruby"
+
+ActiveJob.drain_in_background!
+host = nil
+ActiveJob.start_drainer { |work| host = Thread.new { Thread.current.name = "runner"; work.call } }
+raise "runner was not given the drain" unless host
+threads_before = Thread.list.size
+ran = Queue.new
+5.times { |i| ActiveJob.enqueue(-> { ran << [i, Thread.current.name]; nil }) }
+got = 5.times.map { ran.pop }
+raise "jobs did not run on the runner: #{got.inspect}" unless got.map(&:last).uniq == ["runner"]
+raise "jobs out of order: #{got.inspect}" unless got.map(&:first) == [0, 1, 2, 3, 4]
+raise "enqueue started another drain" unless Thread.list.size == threads_before
+second = false
+ActiveJob.start_drainer { |_| second = true }
+raise "a second start_drainer replaced the drain" if second
+
+r, w = IO.pipe
+pid = fork do
+  r.close
+  q = Queue.new
+  ActiveJob.enqueue(-> { q << Thread.current.name; nil })
+  w.puts(q.pop == "runner" ? "child used the parent's runner" : "child ok")
+  w.close
+  exit!(0)
+end
+w.close
+line = nil
+th = Thread.new { line = r.gets }
+th.join(5) or raise "child drain never ran"
+Process.wait(pid)
+raise "child: #{line.inspect}" unless line&.strip == "child ok"
+puts "ALL OK"
+"##;
+    let out = Command::new("ruby")
+        .arg("-e")
+        .arg(script)
+        .current_dir(root)
+        .output()
+        .expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("ALL OK"),
+        "runner-hosted drain failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+    );
+    assert!(out.status.success(), "driver exited {:?}", out.status.code());
+}

@@ -31,8 +31,10 @@
 #     ruby           roundhouse emit on CRuby, the same Puma shape and
 #                    the same allocator
 #     ruby-falcon    the SAME emitted tree and config.ru under Falcon
-#                    instead of Puma: `falcon serve --forked`, the same
-#                    worker count, jemalloc, YJIT. Falcon is the server
+#                    instead of Puma: the emit's falcon.rb (forked
+#                    workers, ThrusterCache's Protocol::HTTP front ahead
+#                    of the Rack adapter), the same worker count,
+#                    jemalloc, YJIT. Falcon is the server
 #                    tobi's lane runs, and on the box its hello-world
 #                    floor is ~2x Puma's (106k vs 54k req/s, 2026-10-15),
 #                    which is the ceiling the static routes hit. HTTP
@@ -1014,18 +1016,19 @@ start_lane() {
             SERVER_PID=$!
             ;;
         ruby-falcon)
-            # The `ruby` lane's process, env and allocator, with Falcon
-            # forking the workers instead of Puma. Each forked child
-            # loads config.ru itself (no --preload), so each opens its
-            # own SQLite handle — the job puma.rb's before_worker_boot
-            # does for the `ruby` lane.
+            # The `ruby` lane's process, env and allocator, with the
+            # emit's falcon.rb forking the workers instead of Puma. Each
+            # forked child loads config.ru itself, so each opens its own
+            # SQLite handle — the job puma.rb's before_worker_boot does
+            # for the `ruby` lane — and cache hits are answered ahead of
+            # Falcon's Rack adapter (falcon.rb's header says why).
             local jem w; jem="$(find_jemalloc || true)"; w="$(deployed_worker_count)"
-            printf 'server=falcon %s --forked\njemalloc=%s\nworkers=%s\n' \
+            printf 'server=falcon %s via falcon.rb (forked)\njemalloc=%s\nworkers=%s\n' \
                 "$FALCON_VERSION" "${jem:-ABSENT}" "$w" > "$shape"
             ( cd "$EMIT" && exec env RAILS_ENV=production RUBY_YJIT_ENABLE=1 \
                 BUNDLE_GEMFILE="$EMIT/Gemfile.falcon" ${jem:+LD_PRELOAD="$jem"} \
-                bundle exec falcon serve --bind "http://127.0.0.1:$port" \
-                --forked --count "$w" -c config.ru ) > "$log" 2>&1 &
+                BIND=127.0.0.1 PORT="$port" WEB_CONCURRENCY="$w" \
+                bundle exec ruby falcon.rb ) > "$log" 2>&1 &
             SERVER_PID=$!
             ;;
         jruby)
@@ -1912,9 +1915,10 @@ env["notes"] = [
   "the emit lane the WebSocket tier can measure at its full worker count.",
   ("<code>ruby-falcon</code> is the SAME emitted tree and " \
    "<code>config.ru</code> as <code>ruby</code>, served by Falcon " \
-   "(<code>falcon serve --forked</code>, the same worker count and " \
-   "allocator) instead of Puma: the server <code>tobi</code> runs. It " \
-   "isolates what the app server costs. Falcon is added to the emit's " \
+   "(the emit's <code>falcon.rb</code>: forked workers, the same count " \
+   "and allocator, cache hits answered ahead of Falcon's Rack adapter) " \
+   "instead of Puma: the server <code>tobi</code> runs. It isolates what " \
+   "the app server costs. Falcon is added to the emit's " \
    "bundle by this harness, at the version tobi's lock pins; the emitted " \
    "Gemfile names only Puma, and the WebSocket phase still runs Puma." if falcon_ran),
   ("The <code>-1p</code> lanes are the diagnostic, and what they pin is " \

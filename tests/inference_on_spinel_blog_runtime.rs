@@ -390,7 +390,17 @@ fn untyped_subexpressions_baseline() {
     const LIKE_CEILING: usize = 27;
     let existing_untyped = all_untyped.len() - like_untyped;
     eprintln!("inference-only ledger: existing={existing_untyped}, sanitize_sql_like={like_untyped}");
-    const CEILING: usize = 677;
+    // Transactional saves (connection.rb: `save`/`destroy`/`touch` in a
+    // transaction, commit callbacks enlisted until the outermost COMMIT):
+    // 676 -> 757, MEASURED against origin/main 57f9521d3's runtime. The
+    // new `_commit_enlisted` (37), `_rollback_enlisted` (23),
+    // `_save_committed`/`_destroy_committed` (6), `_touch_owner` /
+    // `_adopt_touch_owner` (6), `_restore_after_rollback` (2) and the
+    // `transaction` / `update_attribute` / `changes_to_save` additions
+    // all read the enlisted list through `Db._txn_records` (or the
+    // owner slot) — unmodeled `Db` here, as the depth counter's reads
+    // above are; the RBS-paired gate types them all.
+    const CEILING: usize = 757;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

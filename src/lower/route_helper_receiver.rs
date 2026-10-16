@@ -79,6 +79,10 @@ use std::collections::{HashMap, HashSet};
 const ENGINE_MOUNTED_HELPERS: &[&str] = &[
     "rails_blob_path",
     "rails_blob_url",
+    "rails_storage_proxy_path",
+    "rails_storage_proxy_url",
+    "rails_storage_redirect_path",
+    "rails_storage_redirect_url",
     "rails_representation_path",
     "rails_representation_url",
 ];

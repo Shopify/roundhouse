@@ -79,12 +79,12 @@ use crate::vfs::Vfs;
 use super::app::{
     available_locales_line, default_locale_line, declares_rails_engine, fallbacks_line, extract_autoload_lib_ignores,
     extract_autoload_path_roots, extract_config_assignments, extract_config_time_zone,
-    extract_initializer_filters, extract_module_mixins, extract_session_cookie_key,
+    extract_collection_cache_store, extract_filter_parameters, extract_initializer_filters, extract_module_mixins, extract_session_cookie_key,
     extract_time_formats, extract_variable_content_type_exclusions,
     extract_video_preview_arguments, extract_video_previewer_replacement,
     extract_vips_loader_policy, forgery_strategy_line, kaminari_default_per_page,
     load_defaults_version, raise_on_missing_line, read_rb_files, wrap_parameters_line,
-    InflectEffect, VideoPreviewArgsExtract, FRAMEWORK_CONFIG_KEYS,
+    FilterParametersLine, InflectEffect, VideoPreviewArgsExtract, FRAMEWORK_CONFIG_KEYS,
 };
 use super::util::{
     class_name_path, constant_id_str, constant_path_of, find_all_classes_with_scope,
@@ -189,6 +189,12 @@ const RECOGNIZERS: &[Recognizer] = &[
         reads: |p| mapper_extension(p),
     },
     Recognizer {
+        name: "collection_cache (ActionView::PartialRenderer.collection_cache = Store.reader)",
+        origins: INIT,
+        levels: TOP_HOOK,
+        reads: |p| extract_collection_cache_store(p.text.as_bytes(), PROBE).is_some(),
+    },
+    Recognizer {
         name: "initializer_filters (X.before_action :m, only:)",
         origins: INIT,
         levels: TOP_HOOK,
@@ -235,6 +241,15 @@ const RECOGNIZERS: &[Recognizer] = &[
         origins: APP,
         levels: TOP,
         reads: |p| config_lift(p),
+    },
+    Recognizer {
+        name: "filter_parameters (config.filter_parameters += / = a Symbol or String list)",
+        origins: INIT_APP,
+        levels: ANY,
+        reads: |p| {
+            let lines = extract_filter_parameters(p.text.as_bytes());
+            !lines.is_empty() && lines.iter().all(|l| matches!(l, FilterParametersLine::Literal { .. }))
+        },
     },
     Recognizer {
         name: "active_storage variable_content_types (config.active_storage.variable_content_types -=)",
@@ -439,7 +454,6 @@ fn content_helper_assignment(p: &Probe<'_>) -> bool {
 /// inert for the COMPILED app: ingest never reads it, and the thing it
 /// configures does not exist in the emitted program.
 pub const INERT: &[(&str, &str)] = &[
-    ("config.filter_parameters", "redacts parameter values in Rails' request log lines; the emitted runtime logs no parameters, and its ParameterFilter (active_support_reporters.rb) reads only `Rails.event` payloads, not this setting"),
     ("config.action_dispatch.cookies_serializer", "selects how Rails encodes cookie payloads on the wire (:json / :marshal); the emitted runtime owns one session codec and never reads the setting"),
     ("config.assets.version", "salts the asset digest Sprockets/Propshaft compute; the emitted app serves its own assets and does not read it"),
     ("config.generators", "consulted only by `rails generate`, which is not part of a compiled app (a block here only calls `g.<option>`)"),

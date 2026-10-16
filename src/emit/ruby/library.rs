@@ -1620,6 +1620,8 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         assoc_class_methods: &assoc_class_methods,
         user_returns: &user_returns,
         unique_keys: &unique_keys,
+        // The Ruby family's attrs Hash holds a record (see the field).
+        owner_objects: true,
     };
     for lc in lcs.iter_mut() {
         // Models gain their scope class methods (already chain-normalized).
@@ -2190,13 +2192,20 @@ fn sti_dispatch(base_new: Expr, type_read: &Expr, subs: &[ClassId], span: Span) 
 /// the key stayed 0 and campfire's whole first run died on
 /// `Validation failed: Creator must exist` (four tests, two files).
 ///
-/// Two edits per non-polymorphic belongs_to:
+/// Three edits per non-polymorphic belongs_to:
 ///
-///   1. the writer stashes an UNSAVED value in the reader's cache —
-///      a record with no id yet cannot be found again from the foreign
-///      key, so something has to hold it until the save;
-///   2. `_autosave_<name>` saves it and takes the id, folded into
-///      `before_validation`.
+///   1. the writer keeps the assigned value in the reader's cache, as
+///      Rails' writer sets the association target — an UNSAVED one
+///      because a record with no id yet cannot be found again from the
+///      foreign key, a saved one because the reader then answers that
+///      same object (`room.messages.new` hands its owner in this way,
+///      the automatic inverse, and a singleton method or unsaved change
+///      on the owner is what the record must see);
+///   2. `_autosave_<name>` saves an unsaved one and takes the id,
+///      folded into `before_validation`;
+///   3. the constructor's `attrs[:<name>]` goes through that writer,
+///      as Rails routes every attrs key through its writer, instead of
+///      the shared lowering's bare foreign-key copy.
 ///
 /// ```ruby
 /// def creator=(value)
@@ -2204,10 +2213,8 @@ fn sti_dispatch(base_new: Expr, type_read: &Expr, subs: &[ClassId], span: Span) 
 ///     @creator_id = 0
 ///   else
 ///     @creator_id = value.id
-///     if value.id == 0
-///       @creator_cache = value
-///       @creator_loaded = true
-///     end
+///     @creator_cache = value
+///     @creator_loaded = true
 ///   end
 /// end
 ///
@@ -2219,9 +2226,10 @@ fn sti_dispatch(base_new: Expr, type_read: &Expr, subs: &[ClassId], span: Span) 
 /// end
 /// ```
 ///
-/// A SAVED value deliberately does not populate the cache, so the
-/// reader keeps re-querying by foreign key for those and a later direct
-/// write to the key cannot be answered from a stale object.
+/// A SAVED value once deliberately stayed out of the cache, so that a
+/// later direct write to the key could not be answered from a stale
+/// object. `apply_belongs_to_memoization` closed that hazard: the
+/// foreign-key writer resets the cache, as Rails' does.
 ///
 /// WHY RUBY-FAMILY AND NOT THE SHARED LOWERING. This started shared and
 /// the strict targets refused it, each in its own way — the two of them
@@ -2285,51 +2293,114 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
             let assign = else_branch.clone();
             *else_branch = Expr::new(
                 span,
-                ExprNode::Seq { exprs: vec![assign, stash_unsaved(&name, span)] },
+                ExprNode::Seq { exprs: vec![assign, stash_target(&name, span)] },
             );
             lc.methods.push(autosave_method(&lc.name, &name, &fk));
             fold_before_validation(&mut lc.methods, &lc.name, &name);
+            route_init_through_writer(lc, &name, &fk);
         }
     }
 }
 
-/// `if value.id == 0 then @<name>_cache = value; @<name>_loaded = true end`
-fn stash_unsaved(name: &Symbol, span: Span) -> Expr {
+/// `@<name>_cache = value; @<name>_loaded = true`
+fn stash_target(name: &Symbol, span: Span) -> Expr {
     let syn = |n| Expr::new(span, n);
     let value = || syn(ExprNode::Var { id: VarId(0), name: Symbol::from("value") });
-    let id_read = syn(ExprNode::Send {
-        recv: Some(value()),
-        method: Symbol::from("id"),
-        args: vec![],
-        block: None,
-        parenthesized: false,
-    });
-    syn(ExprNode::If {
-        cond: syn(ExprNode::Send {
-            recv: Some(id_read),
-            method: Symbol::from("=="),
-            args: vec![syn(ExprNode::Lit { value: Literal::Int { value: 0 } })],
-            block: None,
-            parenthesized: false,
-        }),
-        then_branch: syn(ExprNode::Seq {
-            exprs: vec![
-                syn(ExprNode::Assign {
-                    target: LValue::Ivar {
-                        name: Symbol::from(format!("{}_cache", name.as_str())),
-                    },
-                    value: value(),
-                }),
-                syn(ExprNode::Assign {
-                    target: LValue::Ivar {
-                        name: Symbol::from(format!("{}_loaded", name.as_str())),
-                    },
-                    value: syn(ExprNode::Lit { value: Literal::Bool { value: true } }),
-                }),
-            ],
-        }),
-        else_branch: syn(ExprNode::Lit { value: Literal::Nil }),
+    syn(ExprNode::Seq {
+        exprs: vec![
+            syn(ExprNode::Assign {
+                target: LValue::Ivar { name: Symbol::from(format!("{}_cache", name.as_str())) },
+                value: value(),
+            }),
+            syn(ExprNode::Assign {
+                target: LValue::Ivar { name: Symbol::from(format!("{}_loaded", name.as_str())) },
+                value: syn(ExprNode::Lit { value: Literal::Bool { value: true } }),
+            }),
+        ],
     })
+}
+
+/// The constructor's `self.<fk> = attrs[:<name>].id if !attrs[:<name>].nil?`
+/// (the shared `synth_initialize`, which cannot hand a strict target's
+/// attrs bag a record) becomes `self.<name> = attrs[:<name>] if …`: the
+/// writer stores the same key and keeps the object, so
+/// `Message.new(room: room).room` is `room`, as in Rails.
+fn route_init_through_writer(lc: &mut LibraryClass, name: &Symbol, fk: &Symbol) {
+    let Some(init) = lc
+        .methods
+        .iter_mut()
+        .find(|m| m.name.as_str() == "initialize" && m.receiver == MethodReceiver::Instance)
+    else {
+        return;
+    };
+    let fk_writer = format!("{}=", fk.as_str());
+    let writer = Symbol::from(format!("{}=", name.as_str()));
+    fn is_lookup(e: &Expr, name: &Symbol) -> bool {
+        matches!(&*e.node, ExprNode::Send { recv: Some(_), method, args, block: None, .. }
+            if method.as_str() == "[]" && args.len() == 1
+                && matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { value } } if value == name))
+    }
+    fn walk(e: &mut Expr, name: &Symbol, fk_writer: &str, writer: &Symbol, done: &mut bool) {
+        if *done {
+            return;
+        }
+        if let ExprNode::If { then_branch, .. } = &mut *e.node {
+            let lookup = match &*then_branch.node {
+                ExprNode::Send { recv: Some(r), method, args, .. }
+                    if matches!(&*r.node, ExprNode::SelfRef)
+                        && method.as_str() == fk_writer
+                        && args.len() == 1 =>
+                {
+                    match &*args[0].node {
+                        ExprNode::Send { recv: Some(obj), method: id, args: id_args, .. }
+                            if id.as_str() == "id" && id_args.is_empty() =>
+                        {
+                            let inner = match &*obj.node {
+                                ExprNode::Cast { value, .. } => value,
+                                _ => obj,
+                            };
+                            is_lookup(inner, name).then(|| inner.clone())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(lookup) = lookup {
+                let span = then_branch.span;
+                *then_branch = Expr::new(
+                    span,
+                    ExprNode::Send {
+                        recv: Some(Expr::new(span, ExprNode::SelfRef)),
+                        method: writer.clone(),
+                        args: vec![lookup],
+                        block: None,
+                        parenthesized: false,
+                    },
+                );
+                *done = true;
+                return;
+            }
+        }
+        e.node.for_each_child_mut(&mut |c| walk(c, name, fk_writer, writer, done));
+    }
+    let mut done = false;
+    walk(&mut init.body, name, &fk_writer, &writer, &mut done);
+    // The constructor's tail resets `@<name>_loaded = false` for every
+    // association, which would forget the object the writer just kept.
+    // The reset is already done ahead of it: the foreign-key column's
+    // own `self.<fk> = attrs[:<fk>] || 0` runs first, and its writer
+    // clears the cache (`apply_belongs_to_memoization`).
+    if done {
+        let loaded = Symbol::from(format!("{}_loaded", name.as_str()));
+        if let ExprNode::Seq { exprs } = &mut *init.body.node {
+            exprs.retain(|e| {
+                !matches!(&*e.node, ExprNode::Assign { target: LValue::Ivar { name: n }, value }
+                    if n == &loaded
+                        && matches!(&*value.node, ExprNode::Lit { value: Literal::Bool { value: false } }))
+            });
+        }
+    }
 }
 
 fn autosave_method(
@@ -4225,6 +4296,37 @@ fn rewrite_helper_calls(
         }
     }
 
+    // `sanitize(html, tags: T, attributes: A)` → `sanitize_with(html, T,
+    // A)`: the runtime's `sanitize` takes the html alone (its arity is
+    // fixed across targets), and the caller's allow-lists are their own
+    // entry point. Both keywords, or the call is left as written.
+    if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &mut *expr.node {
+        if method.as_str() == "sanitize" && is_view_helpers_const(r) && args.len() == 2 {
+            let lists = match &*args[1].node {
+                ExprNode::Hash { entries, kwargs: true } if entries.len() == 2 => {
+                    let get = |name: &str| {
+                        entries.iter().find_map(|(k, v)| match &*k.node {
+                            ExprNode::Lit { value: crate::expr::Literal::Sym { value } }
+                                if value.as_str() == name =>
+                            {
+                                Some(v.clone())
+                            }
+                            _ => None,
+                        })
+                    };
+                    get("tags").zip(get("attributes"))
+                }
+                _ => None,
+            };
+            if let Some((tags, attributes)) = lists {
+                *method = Symbol::from("sanitize_with");
+                args.truncate(1);
+                args.push(tags);
+                args.push(attributes);
+            }
+        }
+    }
+
     // Unwrap the view walker's default `html_escape(<call>.to_s)` when
     // the call is html_safe (see is_html_safe_call) — Rails doesn't
     // escape safe buffers, and escaping them ships literal &lt;img&gt;.
@@ -4404,16 +4506,28 @@ fn rewrite_layout_wrap(
 // accumulator shape, with non-self receivers on the residue ledger.
 
 /// Ground `Rails.application.routes.url_helpers.<x>_url(record?, host: H,
-/// protocol: P)` → `"#{P}://#{H}#{RouteHelpers.<x>_path(record?)}"`. The
-/// routing object graph behind `url_helpers` isn't modeled (and never
+/// protocol: P, port: N)` → `"#{P}://#{H}:N#{RouteHelpers.<x>_path(record?)}"`.
+/// The routing object graph behind `url_helpers` isn't modeled (and never
 /// needs to be for this shape — an absolute URL is protocol + host + the
 /// generated path helper). Leading positional args (the record in
-/// `user_url(sender, host:)`) and any non-host/protocol kwargs (real
-/// path params) are forwarded to the `<x>_path` helper; the record rides
-/// whole so its custom `to_param` resolves. Non-matching url_helpers
+/// `user_url(sender, host:)`) and any kwargs that are not host options
+/// (real path params) are forwarded to the `<x>_path` helper; the record
+/// rides whole so its custom `to_param` resolves. Non-matching url_helpers
 /// uses are left alone. Applied to the Rails::Application reopen (whose
 /// kwargs-only `root_url` is the original occurrence) and mod_note's
 /// `user_url(sender, host:)`.
+///
+/// Rails' `url_for` keeps its host options for itself (`RESERVED_OPTIONS`,
+/// see `lower::route_url_options`), so none of `host:`, `protocol:`,
+/// `port:` or `only_path:` is ever passed on to the path helper:
+///
+///   * `only_path: true` answers the path alone. An app route's call
+///     arrives here already renamed to `_path` by
+///     `lower::route_url_options`; this arm is for the engine helpers
+///     that pass does not know (Active Storage's `rails_blob_url`).
+///   * `port:` follows the host as `:N`. A literal port that is the
+///     scheme's own (80 for http, 443 for https) or `nil` is left out,
+///     as Rails' `build_host_url` leaves it out.
 pub(crate) fn rewrite_url_helpers_absolute(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite_url_helpers_absolute);
     let matches = matches!(
@@ -4437,6 +4551,8 @@ pub(crate) fn rewrite_url_helpers_absolute(expr: &mut Expr) {
     let ExprNode::Hash { entries, .. } = &*trailing.node else { unreachable!() };
     let mut host: Option<Expr> = None;
     let mut protocol: Option<Expr> = None;
+    let mut port: Option<Expr> = None;
+    let mut only_path = false;
     let mut path_kwargs: Vec<(Expr, Expr)> = Vec::new();
     for (k, v) in entries {
         if let ExprNode::Lit { value: Literal::Sym { value } } = &*k.node {
@@ -4449,10 +4565,18 @@ pub(crate) fn rewrite_url_helpers_absolute(expr: &mut Expr) {
                     protocol = Some(v.clone());
                     continue;
                 }
+                "port" => {
+                    port = Some(v.clone());
+                    continue;
+                }
+                "only_path" => {
+                    only_path = matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: true } });
+                    continue;
+                }
                 _ => {}
             }
         }
-        // Any non-host/protocol key is a real path parameter — forward it.
+        // Any other key is a real path parameter — forward it.
         path_kwargs.push((k.clone(), v.clone()));
     }
     // Forward leading positionals plus any surviving path kwargs to the
@@ -4479,21 +4603,113 @@ pub(crate) fn rewrite_url_helpers_absolute(expr: &mut Expr) {
             parenthesized: true,
         },
     );
+    if only_path {
+        *expr = path_call;
+        expr.ty = Some(crate::ty::Ty::Str);
+        return;
+    }
     let lit = |s: &str| crate::expr::InterpPart::Text { value: s.to_string() };
     let dyn_part = |e: Expr| crate::expr::InterpPart::Expr { expr: e };
+    // The scheme's own port, when the protocol is known at compile time.
+    let https = match protocol.as_ref().map(|p| &*p.node) {
+        None => Some(false),
+        Some(ExprNode::Lit { value: Literal::Str { value } }) => {
+            Some(value.trim_end_matches("://") == "https")
+        }
+        Some(_) => None,
+    };
+    // A protocol known only at run time is read once, into a local the
+    // port's run-time check below can read again.
+    let protocol_var = Symbol::from("__url_protocol");
+    let protocol_part = protocol.map(|p| match https {
+        Some(_) => dyn_part(p),
+        None => dyn_part(Expr::new(
+            p.span,
+            ExprNode::Assign {
+                target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: protocol_var.clone() },
+                value: p,
+            },
+        )),
+    });
+    let port_part = port.and_then(|p| match (&*p.node, https) {
+        (ExprNode::Lit { value: Literal::Nil }, _) => None,
+        (ExprNode::Lit { value: Literal::Int { value } }, Some(https)) => {
+            let standard = if https { *value == 443 } else { *value == 80 };
+            (!standard).then(|| lit(&format!(":{value}")))
+        }
+        (ExprNode::Lit { value: Literal::Str { value } }, Some(https)) => {
+            let standard = if https { value == "443" } else { value == "80" };
+            (!standard).then(|| lit(&format!(":{value}")))
+        }
+        // Known only at run time: decided there, as Rails decides it.
+        _ => Some(dyn_part(runtime_port(p, https, &protocol_var))),
+    });
     let mut parts: Vec<crate::expr::InterpPart> = Vec::new();
-    if let Some(p) = protocol {
-        parts.push(dyn_part(p));
-    } else {
-        parts.push(lit("http"));
+    match protocol_part {
+        Some(p) => parts.push(p),
+        None => parts.push(lit("http")),
     }
     parts.push(lit("://"));
     if let Some(h) = host {
         parts.push(dyn_part(h));
     }
+    if let Some(p) = port_part {
+        parts.push(p);
+    }
     parts.push(dyn_part(path_call));
     *expr.node = ExprNode::StringInterp { parts };
     expr.ty = Some(crate::ty::Ty::Str);
+}
+
+/// `port:` known only at run time, read once:
+///
+/// ```ruby
+/// __url_port = <port>
+/// __url_port.nil? || __url_port.to_i == <default> ? "" : ":#{__url_port}"
+/// ```
+///
+/// Rails' `build_host_url` leaves the port out when it is nil or the
+/// scheme's own (`80` for http, `443` for https), comparing as Integers
+/// (`"80"` is left out too). The default is a literal when the protocol
+/// is, and otherwise read from the `__url_protocol` local the protocol
+/// part assigned.
+fn runtime_port(port: Expr, https: Option<bool>, protocol_var: &Symbol) -> Expr {
+    let span = port.span;
+    let mk = |node: ExprNode| Expr::new(span, node);
+    let int = |v: i64| mk(ExprNode::Lit { value: Literal::Int { value: v } });
+    let str_lit = |v: &str| mk(ExprNode::Lit { value: Literal::Str { value: v.to_string() } });
+    let call = |recv: Expr, m: &str, args: Vec<Expr>| {
+        mk(ExprNode::Send { recv: Some(recv), method: Symbol::from(m), args, block: None, parenthesized: true })
+    };
+    let port_var = Symbol::from("__url_port");
+    let var = |name: &Symbol| mk(ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() });
+    let default = match https {
+        Some(true) => int(443),
+        Some(false) => int(80),
+        None => mk(ExprNode::If {
+            cond: call(call(var(protocol_var), "to_s", vec![]), "start_with?", vec![str_lit("https")]),
+            then_branch: int(443),
+            else_branch: int(80),
+        }),
+    };
+    let leave_out = mk(ExprNode::BoolOp {
+        op: crate::expr::BoolOpKind::Or,
+        surface: Default::default(),
+        left: call(var(&port_var), "nil?", vec![]),
+        right: call(call(var(&port_var), "to_i", vec![]), "==", vec![default]),
+    });
+    let written = mk(ExprNode::StringInterp {
+        parts: vec![
+            crate::expr::InterpPart::Text { value: ":".to_string() },
+            crate::expr::InterpPart::Expr { expr: var(&port_var) },
+        ],
+    });
+    mk(ExprNode::Let {
+        id: crate::ident::VarId(0),
+        name: port_var.clone(),
+        value: port,
+        body: mk(ExprNode::If { cond: leave_out, then_branch: str_lit(""), else_branch: written }),
+    })
 }
 
 fn is_url_helpers_chain(e: &Expr) -> bool {
@@ -5674,6 +5890,124 @@ fn invalidate_parse_memo_on_raw_writes(e: &mut Expr, temporal: &BTreeSet<Symbol>
 /// plain-text conversion walked the markup every time (27% of a room
 /// page). Ruby emit only: the memo is a second ivar, and the strict
 /// targets declare fields from the schema.
+/// Ruby-family pass: Action Text's `belongs_to :record, polymorphic:
+/// true, touch: true`.
+///
+/// Rails' `has_rich_text` declares its `has_one` with `inverse_of:
+/// :record`, so a rich text read or built through its record knows that
+/// record object, and saving it (`message.body.update!(body: …)`)
+/// touches it: `updated_at` moves, `after_touch` cascades (a message's
+/// own `belongs_to :room, touch: true`), and the record's update commit
+/// callbacks run — campfire's `Message::Searchable` rewrites the search
+/// index from `after_update_commit`, which is how a body edited through
+/// the rich text reaches the index.
+///
+/// Two edits:
+///
+///   1. every owner-side write of the rich-text slot (`rich_text_<attr>`,
+///      `build_rich_text_<attr>`, `_preload_rich_text_<attr>`) hands the
+///      record to it — `@__rich_text_body._adopt_touch_owner(self)` — the
+///      inverse;
+///   2. `ActionText::RichText`'s `after_save` and `after_destroy` end in
+///      `_touch_owner` (connection.rb), which touches that record when
+///      it is persisted.
+///
+/// A rich text loaded on its own (not through its record) has no owner
+/// object and touches nothing: the polymorphic `record` lookup Rails
+/// would make is not modeled. Ruby-family only — the owner slot is a
+/// `Base` reference, which the strict targets' plain structs have no
+/// supertype for.
+pub(crate) fn apply_rich_text_record_touch(lcs: &mut [LibraryClass], app: &App) {
+    let record = crate::lower::rich_text::record_class();
+    let span = Span::synthetic();
+    let syn = |n| Expr::new(span, n);
+    let touch_call = || {
+        syn(ExprNode::Send {
+            recv: None,
+            method: Symbol::from("_touch_owner"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        })
+    };
+    for lc in lcs.iter_mut() {
+        if lc.name == record {
+            let Some(model) = app.models.iter().find(|m| m.name == record) else { continue };
+            crate::lower::model_to_library::markers::fold_into_or_push(
+                &mut lc.methods,
+                model,
+                "after_save",
+                touch_call(),
+            );
+            crate::lower::model_to_library::markers::fold_into_or_push(
+                &mut lc.methods,
+                model,
+                "after_destroy",
+                touch_call(),
+            );
+            continue;
+        }
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        for (_, attr) in crate::lower::rich_text::rich_text_attrs(model) {
+            let slot = Symbol::from(format!("__rich_text_{}", attr.as_str()));
+            let writers = [
+                format!("rich_text_{}", attr.as_str()),
+                format!("build_rich_text_{}", attr.as_str()),
+                format!("_preload_rich_text_{}", attr.as_str()),
+            ];
+            for m in lc.methods.iter_mut() {
+                if m.receiver != MethodReceiver::Instance || !writers.iter().any(|w| w == m.name.as_str()) {
+                    continue;
+                }
+                adopt_after_slot_writes(&mut m.body, &slot);
+            }
+        }
+    }
+}
+
+/// After each `@<slot> = …` statement in a sequence, insert
+/// `@<slot>._adopt_touch_owner(self) if !@<slot>.nil?`.
+fn adopt_after_slot_writes(e: &mut Expr, slot: &Symbol) {
+    e.node.for_each_child_mut(&mut |c| adopt_after_slot_writes(c, slot));
+    let ExprNode::Seq { exprs } = &mut *e.node else { return };
+    let mut i = 0;
+    while i < exprs.len() {
+        let writes = matches!(&*exprs[i].node, ExprNode::Assign { target: LValue::Ivar { name }, .. } if name == slot);
+        if writes {
+            let span = exprs[i].span;
+            let syn = |n| Expr::new(span, n);
+            let ivar = || syn(ExprNode::Ivar { name: slot.clone() });
+            let adopt = syn(ExprNode::If {
+                cond: syn(ExprNode::Send {
+                    recv: Some(syn(ExprNode::Send {
+                        recv: Some(ivar()),
+                        method: Symbol::from("nil?"),
+                        args: vec![],
+                        block: None,
+                        parenthesized: false,
+                    })),
+                    method: Symbol::from("!"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                }),
+                then_branch: syn(ExprNode::Send {
+                    recv: Some(ivar()),
+                    method: Symbol::from("_adopt_touch_owner"),
+                    args: vec![syn(ExprNode::SelfRef)],
+                    block: None,
+                    parenthesized: true,
+                }),
+                else_branch: syn(ExprNode::Lit { value: Literal::Nil }),
+            });
+            exprs.insert(i + 1, adopt);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+}
+
 pub(crate) fn apply_rich_text_content_memo(lcs: &mut [LibraryClass]) {
     for lc in lcs.iter_mut() {
         let memoized: BTreeSet<Symbol> = lc
@@ -9227,6 +9561,31 @@ fn expr_mentions_includes(expr: &Expr) -> bool {
     found
 }
 
+/// Whether `model`'s primary key is a uuid / string column, which an
+/// `IN (...)` lists quoted and a batch keys by its String (the integer
+/// helper would `to_i` it to its leading digits and find nothing; cf.
+/// #310 for `Relation#ids`).
+fn string_primary_key(app: &App, model: &crate::dialect::Model) -> bool {
+    app.schema
+        .tables
+        .get(&model.table.0)
+        .and_then(|t| t.columns.iter().find(|c| c.primary_key))
+        .is_some_and(|c| {
+            matches!(
+                c.col_type,
+                crate::schema::ColumnType::Uuid
+                    | crate::schema::ColumnType::String { .. }
+                    | crate::schema::ColumnType::Text
+            )
+        })
+}
+
+/// The `Db` list helper and the row-key conversion for a batch keyed by
+/// the owner's id.
+fn key_helpers(string_key: bool) -> (&'static str, &'static str) {
+    if string_key { ("escape_string_list", "to_s") } else { ("escape_int_list", "to_i") }
+}
+
 /// One preloadable association, resolved against the app's model set.
 enum PreloadKind {
     /// (fk column on the owner, target class, target table, the `Db`
@@ -9240,19 +9599,19 @@ enum PreloadKind {
     /// Batched form of the through-reader join:
     /// `SELECT <t>.*, <thr>.<thr_fk> AS __src FROM <t> JOIN <thr> ON
     /// <thr>.<src_fk> = <t>.id WHERE <thr>.<thr_fk> IN (...)`.
-    Through { target: String, join: String, group_col: String, order: Option<String> },
+    Through { target: String, join: String, group_col: String, order: Option<String>, string_key: bool },
     /// `has_one_attached :<attr>`: one join over the attachment and blob
     /// tables for the whole record set, installing a row-bearing
     /// `ActiveStorage::Attached` on each record (`attr`, owner class).
     /// `variations` is the declared-variant list as Ruby source
     /// (`lower::attached::variations_ruby_source`), the proxy's fourth
     /// constructor argument.
-    Attached { attr: String, owner: String, variations: String },
+    Attached { attr: String, owner: String, variations: String, string_key: bool },
     /// `has_many_attached :<attr>`: one join over the attachment and blob
     /// tables for the whole record set, installing a proxy per record
     /// that answers its rows (`AttachedMany#_preload_rows`) without
     /// asking again.
-    AttachedMany { attr: String, owner: String },
+    AttachedMany { attr: String, owner: String, string_key: bool },
     /// `has_rich_text :<attr>`: one `IN` over `action_text_rich_texts`,
     /// installed through the owner's load-once setter.
     RichText { attr: String, owner: String },
@@ -9268,6 +9627,10 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
     use crate::naming::pluralize_snake;
 
     let model_exists = |id: &ClassId| app.models.iter().any(|m| &m.name == id);
+    // The owner's own key is a uuid / string: the batches keyed by it
+    // (attachments, has_many :through) list it quoted and key their rows
+    // by the String, as the belongs_to batch below does for its target.
+    let owner_string_key = string_primary_key(app, model);
     let mut out = Vec::new();
     for assoc in model.associations() {
         // A refused association (`assoc_primary_key`) has no reader to
@@ -9283,19 +9646,7 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 // A uuid / string key is a quoted literal in `IN (...)`;
                 // the integer helper would `to_i` it to its leading
                 // digits and find nothing (cf. #310 for `Relation#ids`).
-                let string_key = app
-                    .schema
-                    .tables
-                    .get(&target_model.table.0)
-                    .and_then(|t| t.columns.iter().find(|c| c.primary_key))
-                    .is_some_and(|c| {
-                        matches!(
-                            c.col_type,
-                            crate::schema::ColumnType::Uuid
-                                | crate::schema::ColumnType::String { .. }
-                                | crate::schema::ColumnType::Text
-                        )
-                    });
+                let string_key = string_primary_key(app, target_model);
                 out.push((
                     name.as_str().to_string(),
                     PreloadKind::BelongsTo {
@@ -9390,6 +9741,7 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                         ),
                         group_col: format!("{thr_table}.{thr_fk}"),
                         order: order.map(|o| o.to_string()),
+                        string_key: owner_string_key,
                     },
                 ));
             }
@@ -9404,6 +9756,7 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 attr: attr.as_str().to_string(),
                 owner: model.name.0.as_str().to_string(),
                 variations: crate::lower::attached::variations_ruby_source(model, &attr),
+                string_key: owner_string_key,
             },
         ));
     }
@@ -9415,6 +9768,7 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
             PreloadKind::AttachedMany {
                 attr: attr.as_str().to_string(),
                 owner: model.name.0.as_str().to_string(),
+                string_key: owner_string_key,
             },
         ));
     }
@@ -9568,7 +9922,8 @@ end
 "#
                 );
             }
-            PreloadKind::Through { target, join, group_col, order } => {
+            PreloadKind::Through { target, join, group_col, order, string_key } => {
+                let (key_list, to_key) = key_helpers(*string_key);
                 let table = crate::naming::pluralize_snake(target.as_str());
                 let order_sql = match order {
                     Some(o) => format!(" ORDER BY {o}"),
@@ -9585,11 +9940,11 @@ def self._preload_batch_{name}(records)
   grouped = {{}}
   loaded = []
   if ids.length > 0
-    rows = ActiveRecord.adapter.select_rows("SELECT {table}.*, {group_col} AS __src FROM {table} {join} WHERE {group_col} IN (" + Db.escape_int_list(ids) + "){order_sql}")
+    rows = ActiveRecord.adapter.select_rows("SELECT {table}.*, {group_col} AS __src FROM {table} {join} WHERE {group_col} IN (" + Db.{key_list}(ids) + "){order_sql}")
     rows.each do |row|
       rec = {target}.instantiate(row)
       loaded << rec
-      k = row["__src"].to_i
+      k = row["__src"].{to_key}
       grouped[k] = [] if grouped[k].nil?
       grouped[k] << rec
     end
@@ -9609,7 +9964,8 @@ end
             // this query and the proxy's own cannot disagree about the
             // row shape; two typed hashes (attachment id, blob) rather
             // than one hash of rows so every value keeps its own type.
-            PreloadKind::Attached { attr, owner, variations } => {
+            PreloadKind::Attached { attr, owner, variations, string_key } => {
+                let (key_list, to_key) = key_helpers(*string_key);
                 let _ = write!(
                     src,
                     r#"
@@ -9621,8 +9977,8 @@ def self._preload_batch_{name}(records)
   att_ids = {{}}
   blobs = {{}}
   if ids.length > 0
-    ActiveRecord.adapter.select_rows("SELECT a.record_id AS record_id, a.id AS attachment_id, " + ActiveStorage::Blob.columns("b") + " FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = '{owner}' AND a.name = '{attr}' AND a.record_id IN (" + Db.escape_int_list(ids) + ")").each do |row|
-      rid = row["record_id"].to_i
+    ActiveRecord.adapter.select_rows("SELECT a.record_id AS record_id, a.id AS attachment_id, " + ActiveStorage::Blob.columns("b") + " FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = '{owner}' AND a.name = '{attr}' AND a.record_id IN (" + Db.{key_list}(ids) + ")").each do |row|
+      rid = row["record_id"].{to_key}
       att_ids[rid] = row["attachment_id"].to_i
       blobs[rid] = ActiveStorage::Blob.from_row(row)
     end
@@ -9642,7 +9998,8 @@ end
 "#
                 );
             }
-            PreloadKind::AttachedMany { attr, owner } => {
+            PreloadKind::AttachedMany { attr, owner, string_key } => {
+                let (key_list, to_key) = key_helpers(*string_key);
                 let _ = write!(
                     src,
                     r#"
@@ -9653,8 +10010,8 @@ def self._preload_batch_{name}(records)
   end
   rows_by = {{}}
   if ids.length > 0
-    ActiveRecord.adapter.select_rows("SELECT a.record_id AS record_id, a.id AS attachment_id, " + ActiveStorage::Blob.columns("b") + " FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = '{owner}' AND a.name = '{attr}' AND a.record_id IN (" + Db.escape_int_list(ids) + ") ORDER BY a.id").each do |row|
-      rid = row["record_id"].to_i
+    ActiveRecord.adapter.select_rows("SELECT a.record_id AS record_id, a.id AS attachment_id, " + ActiveStorage::Blob.columns("b") + " FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id = a.blob_id WHERE a.record_type = '{owner}' AND a.name = '{attr}' AND a.record_id IN (" + Db.{key_list}(ids) + ") ORDER BY a.id").each do |row|
+      rid = row["record_id"].{to_key}
       list = rows_by[rid]
       if list.nil?
         list = []

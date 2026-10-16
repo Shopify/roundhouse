@@ -1047,6 +1047,10 @@ class DbPool
       # should still serve, slower, rather than fail to boot — and a pragma
       # that silently did nothing is what the numbers above would reveal.
       PRAGMAS.each { |p| SQL.sqlite3_exec(dbh, p, nil, nil, nil) }
+      # The app's own `pragmas:` from config/database.yml, after PRAGMAS
+      # (generated: `project::apply_database_pragmas`).
+      # >>> generated: database-pragmas
+      # <<< generated: database-pragmas
       @conns.push(DbConn.new(dbh))
       @free.push(i)
       i += 1
@@ -1340,6 +1344,18 @@ module Db
 
   def self._txn_depth=(value)
     Thread.current[:ar_txn_depth] = value
+  end
+
+  # The open transaction's enlisted writes (connection.rb), held in the
+  # same per-thread storage as the depth.
+  def self._txn_records
+    records = Thread.current[:ar_txn_records]
+    if records.nil?
+      records = [ActiveRecord::EnlistedRecord.new(ActiveRecord::Base.new, 0)]
+      records.clear
+      Thread.current[:ar_txn_records] = records
+    end
+    records
   end
 
   # Request-scoped connection lease for the thread-per-connection

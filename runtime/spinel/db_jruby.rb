@@ -147,6 +147,10 @@ module Db
     st.execute("PRAGMA busy_timeout=5000")
     # Not SQLite's default (off): Rails' DEFAULT_PRAGMAS turn it on, as db.rb's PRAGMAS do.
     st.execute("PRAGMA foreign_keys=ON")
+    # The app's own `pragmas:` from config/database.yml, after the pins
+    # above (generated: `project::apply_database_pragmas`).
+    # >>> generated: database-pragmas
+    # <<< generated: database-pragmas
     st.close
     Conn.new(raw)
   end
@@ -173,6 +177,17 @@ module Db
 
   def self._txn_depth=(value)
     Fiber[:ar_txn_depth] = value
+  end
+
+  # The open transaction's enlisted writes (connection.rb), held in the
+  # same per-thread storage as the depth.
+  def self._txn_records
+    records = Fiber[:ar_txn_records]
+    if records.nil?
+      records = []
+      Fiber[:ar_txn_records] = records
+    end
+    records
   end
 
   # Request-scoped connection lease. Mirrors db_cruby.rb: checks out a

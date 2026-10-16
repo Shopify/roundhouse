@@ -91,6 +91,10 @@ SPINEL_TESTS = [
     "jbuilder_array_value_spinel",
     "active_job_payload",
     "render_json_encoder_spinel",
+    "url_helpers_absolute_spinel",
+    "jbuilder_extract_attributes_spinel",
+    "hash_to_query_symbol_keys_spinel",
+    "storage_proxy_path_spinel",
 ]
 # Seconds each suite took in spinel-framework (full run 38665931779), for
 # balancing its shards; a suite not listed counts as one Spinel build.
@@ -105,7 +109,8 @@ SPINEL_TEST_SECONDS = {
     "spinel_pg_db": 11,
     "pessimistic_locking": 46,
     "not_found_parity_spinel": 118,
-    "spinel_transaction_connection": 98,
+    # Upstream run 38915016729: the transactional-saves cases tripled it.
+    "spinel_transaction_connection": 339,
     **dict.fromkeys(
         [
             "spinel_web_push_crypto",

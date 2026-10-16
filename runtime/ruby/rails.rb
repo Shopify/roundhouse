@@ -613,6 +613,15 @@ module Rails
       "UTC"
     end
 
+    # `config.filter_parameters`: the keys `request.filtered_parameters`
+    # masks (Rails' `rails new` initializer lists `:passw`, `:token`,
+    # ...). Same framework-default shape as `config_time_zone` above:
+    # Rails' default list is empty, and ingest lifts an app's Symbol and
+    # String filters, each as its String, into an override on the reopen.
+    def config_filter_parameters
+      []
+    end
+
     # `config.active_storage.variable_content_types -= %w[…]` — the
     # image types an app REMOVES from Rails' default variable list
     # (campfire: bmp/ico/psd). Same framework-default shape as the two

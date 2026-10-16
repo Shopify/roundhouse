@@ -136,6 +136,8 @@ mod params_helper_no_permit;
 mod rails_parity;
 #[path = "spinel_toolchain/api_parity_round3.rs"]
 mod api_parity_round3;
+#[path = "spinel_toolchain/api_parity_round4.rs"]
+mod api_parity_round4;
 #[path = "spinel_toolchain/server_binding.rs"]
 mod server_binding;
 #[path = "support/request_id_runtime.rs"]

@@ -305,6 +305,44 @@ module ActionView
       value
     end
 
+    # Every element's fragment in one lookup, as Rails' collection
+    # renderer asks its `collection_cache.read_multi`: the hits in the
+    # order of `names`, `nil` for a miss.
+    def self.collection_fragment_read_multi(names)
+      names.map { |name| ActionView::ViewHelpers.collection_fragment_read(name) }
+    end
+
+    # Told once a cached collection has rendered: the partial's template
+    # (`app/views/messages/_message.html.erb`) and what the store
+    # answered for each element. Rails reports the same facts as its
+    # `render_collection.action_view` event; nothing listens here, and
+    # the ruby family's test support reports them.
+    def self.collection_rendered(_identifier, _hits)
+      nil
+    end
+
+    # A jbuilder template wrapped in `json.cache! key do … end` reads and
+    # writes its JSON through these (`lower::jbuilder_to_library`,
+    # `walk_cached_template`). Caching is off here, so the lowering
+    # renders the block; the ruby family and spinel reopen them with the
+    # controller and Jbuilder's own `_read_fragment_cache` /
+    # `_write_fragment_cache`.
+    def self.jbuilder_caching?
+      false
+    end
+
+    def self.jbuilder_cache_key(template, _key)
+      template
+    end
+
+    def self.jbuilder_fragment_read(_key)
+      nil
+    end
+
+    def self.jbuilder_fragment_write(_key, value)
+      value
+    end
+
     def self.to_query(params)
       to_query_pairs(params, "")
     end

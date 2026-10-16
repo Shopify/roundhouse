@@ -1912,7 +1912,10 @@ module ActiveRecord
       else
         updates.to_s
       end
-      sql = "UPDATE #{@table} SET #{set_sql}#{scoped_write_where}"
+      # The table quoted, as Rails' Arel renders it (`UPDATE "memberships"
+      # SET ...`): a test that picks the statement out of the SQL log
+      # (campfire's creation-commit test) matches that spelling.
+      sql = "UPDATE \"#{@table}\" SET #{set_sql}#{scoped_write_where}"
       ActiveRecord.adapter.execute_ddl(sql)
       ActiveRecord.adapter.changes
     end
@@ -1931,7 +1934,7 @@ module ActiveRecord
       parts.push("updated_at = #{now}") if @model.schema_columns.include?(:updated_at)
       parts.push("#{name} = #{now}") unless name.nil?
       return 0 if parts.empty?
-      ActiveRecord.adapter.execute_ddl("UPDATE #{@table} SET #{parts.join(", ")}#{scoped_write_where}")
+      ActiveRecord.adapter.execute_ddl("UPDATE \"#{@table}\" SET #{parts.join(", ")}#{scoped_write_where}")
       ActiveRecord.adapter.changes
     end
 

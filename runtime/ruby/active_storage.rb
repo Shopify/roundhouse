@@ -858,7 +858,37 @@ module ActiveStorage
     # The blob's own route: `rails_blob_path(blob)`. A `disposition` of
     # "attachment" rides as the query Rails puts it in.
     def redirect_url(disposition)
-      base = "/rails/active_storage/blobs/redirect/" + signed_id + "/" +
+      service_route("redirect", disposition)
+    end
+
+    # `rails_storage_proxy_path(blob)`: the engine's other blob route,
+    # whose controller answers with the bytes instead of a redirect.
+    def proxy_url(disposition)
+      service_route("proxy", disposition)
+    end
+
+    # Rails' `Blob::Servable`, with activestorage 8.1.4's default
+    # lists: an uploaded type a browser would RUN (HTML, SVG, XML, ...)
+    # is served as `application/octet-stream`, and any type outside the
+    # inline list is an attachment whatever the URL asks. The content
+    # type is the uploader's word, so serving it inline as declared lets
+    # an upload script the app's origin.
+    def content_type_for_serving
+      ActiveStorage.content_types_to_serve_as_binary.include?(@content_type) ? "application/octet-stream" : @content_type
+    end
+
+    # "attachment" when Rails forces it, "" when the caller's
+    # disposition stands.
+    def forced_disposition_for_serving
+      if ActiveStorage.content_types_to_serve_as_binary.include?(@content_type) || !ActiveStorage.content_types_allowed_inline.include?(@content_type)
+        "attachment"
+      else
+        ""
+      end
+    end
+
+    def service_route(kind, disposition)
+      base = "/rails/active_storage/blobs/" + kind + "/" + signed_id + "/" +
              ActiveStorage.url_filename(@filename)
       disposition == "" ? base : base + "?disposition=" + disposition
     end
@@ -919,9 +949,12 @@ module ActiveStorage
       [parts[0].to_s, parts[1].to_s]
     end
 
+    # Rails' `Blob#url` signs `forced_disposition_for_serving ||
+    # disposition`, so a forced attachment holds on the disk route too.
     def self.disk_url(blob, disposition)
+      forced = blob.forced_disposition_for_serving
       ActiveStorage::Current.base_url + "/rails/active_storage/disk/" +
-        encode(blob.key, disposition) + "/" + ActiveStorage.url_filename(blob.filename.to_s)
+        encode(blob.key, forced == "" ? disposition : forced) + "/" + ActiveStorage.url_filename(blob.filename.to_s)
     end
 
     # The token a direct upload's PUT carries (Rails' `DiskService#
@@ -998,6 +1031,21 @@ module ActiveStorage
   # the last path segment (`*filename`, cosmetic — the key is in the
   # signed id). URI-component encoded so a name with a space or a
   # slash cannot break the path.
+  # activestorage 8.1.4's `content_types_to_serve_as_binary` and
+  # `content_types_allowed_inline` defaults (engine.rb), read by
+  # `Blob#content_type_for_serving` / `#forced_disposition_for_serving`.
+  def self.content_types_to_serve_as_binary
+    ["text/html", "image/svg+xml", "application/postscript",
+     "application/x-shockwave-flash", "text/xml", "application/xml",
+     "application/xhtml+xml", "application/mathml+xml", "text/cache-manifest"]
+  end
+
+  def self.content_types_allowed_inline
+    ["image/webp", "image/avif", "image/png", "image/gif", "image/jpeg",
+     "image/tiff", "image/bmp", "image/vnd.adobe.photoshop",
+     "image/vnd.microsoft.icon", "application/pdf"]
+  end
+
   def self.url_filename(filename)
     ActionView::ViewHelpers.url_encode_component(filename)
   end
@@ -1699,6 +1747,7 @@ end
 # controllers), which is why the URL shapes here are Rails' own:
 #
 #   /rails/active_storage/blobs/redirect/:signed_id/*filename
+#   /rails/active_storage/blobs/proxy/:signed_id/*filename
 #   /rails/active_storage/representations/redirect/:signed_blob_id/:variation_key/*filename
 #   /rails/active_storage/disk/:encoded_key/*filename
 #   /rails/active_storage/direct_uploads              (POST)
@@ -1725,6 +1774,33 @@ module RouteHelpers
 
   def self.rails_blob_url(attachment, disposition: nil, only_path: nil)
     rails_blob_path(attachment, disposition: disposition, only_path: only_path)
+  end
+
+  # The engine's two `direct` routes over a blob. `rails_storage_redirect`
+  # is the route `rails_blob` resolves to under Rails' default
+  # `resolve_model_to_route`; `rails_storage_proxy` names the proxy
+  # route, which serves the bytes through the app. Rails' blocks take
+  # whatever answers `signed_id`: the Blob itself or its attachment.
+  def self.rails_storage_proxy_path(model, disposition: nil, only_path: nil)
+    b = storage_blob(model)
+    b.nil? ? "" : b.proxy_url(disposition.to_s)
+  end
+
+  def self.rails_storage_proxy_url(model, disposition: nil, only_path: nil)
+    rails_storage_proxy_path(model, disposition: disposition, only_path: only_path)
+  end
+
+  def self.rails_storage_redirect_path(model, disposition: nil, only_path: nil)
+    b = storage_blob(model)
+    b.nil? ? "" : b.redirect_url(disposition.to_s)
+  end
+
+  def self.rails_storage_redirect_url(model, disposition: nil, only_path: nil)
+    rails_storage_redirect_path(model, disposition: disposition, only_path: only_path)
+  end
+
+  def self.storage_blob(model)
+    model.is_a?(ActiveStorage::Blob) ? model : model.blob
   end
 
   def self.rails_representation_path(variant, only_path: nil)

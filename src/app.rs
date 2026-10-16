@@ -373,6 +373,15 @@ pub struct App {
     /// kept mixin supplies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initializer_filters: Vec<InitializerFilter>,
+    /// `ActionView::PartialRenderer.collection_cache = Store.reader` from
+    /// a `config/initializers/` file (bare or inside `to_prepare`): the
+    /// store cached collection renders read and write. campfire points
+    /// it at its bounded `FragmentCache.store`. Recorded at ingest as the
+    /// receiver constant and its argument-less class method (or
+    /// `Rails.cache`), resolved by `lower::module_mixins`, written at the
+    /// end of the ruby family's and spinel's `boot.rb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_cache_store: Option<CollectionCacheStore>,
     /// Standard libraries the app's own files require (`require
     /// "io/console"` at the top of a channel, `require "pty"` in a
     /// service), sorted and deduplicated. The emitted files do not carry
@@ -391,6 +400,12 @@ pub struct App {
     /// [`SqlFunction`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sql_functions: Vec<SqlFunction>,
+    /// `config/database.yml`'s per-environment `pragmas:` for the
+    /// primary database, as `PRAGMA name = value` statements the Db
+    /// shims run on every connection after their own (see
+    /// `ingest::database_yml`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub database_pragmas: Vec<(String, Vec<String>)>,
     /// The app's `Rails::Application` subclass from
     /// `config/application.rb` (e.g. `Lobsters::Application`),
     /// reparented at ingest onto `Rails::Application` itself. Its
@@ -676,6 +691,15 @@ pub struct ModuleMixin {
     pub kind: MixinKind,
 }
 
+/// `ActionView::PartialRenderer.collection_cache = <receiver>.<reader>`:
+/// a constant and an argument-less class method on it, as the
+/// initializer spells them (`FragmentCache` / `store`, `Rails` / `cache`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CollectionCacheStore {
+    pub receiver: Symbol,
+    pub reader: Symbol,
+}
+
 /// `X.before_action :m, only: [:a, …]` from a `config/initializers/`
 /// file. `only` empty means every action, as Rails reads it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -876,8 +900,10 @@ impl App {
             time_formats: BTreeMap::new(),
             module_mixins: Vec::new(),
             initializer_filters: Vec::new(),
+            collection_cache_store: None,
             app_requires: Vec::new(),
             sql_functions: Vec::new(),
+            database_pragmas: Vec::new(),
             rails_application: None,
             concern_filters: HashMap::new(),
             graphql_types: Vec::new(),
