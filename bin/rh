@@ -68,7 +68,7 @@ def print_usage
       test <target>       Transpile, then run target's native tests (ruby only for now).
       run <target>        Transpile, then run main (ruby only for now).
       compare [<target>]  End-to-end Rails-vs-target HTTP compare (wraps scripts/compare).
-      verify             Sequential local checks; --plan previews without execution.
+      verify             Local checks; --all runs the complete default suite concurrently.
       bench [<target>...] HTTP throughput + RSS benchmark (wraps scripts/bench).
       site                Build the full GitHub Pages site (all targets).
 
@@ -311,14 +311,15 @@ end
 def cmd_verify(argv)
   tests = []
   toolchains = []
-  plan_only = json = ignored_tests = false
+  plan_only = json = ignored_tests = all_tests = false
   base = 'HEAD'
   jobs = ENV.fetch('CARGO_BUILD_JOBS', [Etc.nprocessors, 4].min.to_s)
   OptionParser.new do |o|
-    o.banner = 'Usage: bin/rh verify [--plan] [--base REF] [--test NAME] [--ignored] [--toolchain TARGET] [--json]'
-    o.separator 'Build and run library tests, then only explicit integration/toolchain suites.'
-    o.separator 'This is partial local verification, not the hosted CI floor or merge approval.'
+    o.banner = 'Usage: bin/rh verify [--all | --test NAME] [--plan] [--base REF] [--ignored] [--toolchain TARGET] [--json]'
+    o.separator 'Run library tests and selected suites, or the complete default suite with --all.'
+    o.separator 'Local verification is not hosted CI or merge approval.'
     o.on('--plan', 'Read-only preview; no Cargo, installs, or test execution') { plan_only = true }
+    o.on('--all', 'Run all targets with cargo-nextest, then documentation tests; skips ignored tests') { all_tests = true }
     o.on('--base REF', 'Compare the working tree with REF (default: HEAD)') { |v| base = v }
     o.on('--test NAME', 'Integration test stem; repeatable; skips ignored tests by default') { |v| tests << v }
     o.on('--ignored', 'Run only ignored tests in selected --test suites (not library tests)') { ignored_tests = true }
@@ -328,6 +329,9 @@ def cmd_verify(argv)
   end.parse!(argv)
   raise ArgumentError, "unexpected arguments: #{argv.join(' ')}" unless argv.empty?
   raise ArgumentError, 'jobs must be a positive integer' unless jobs.match?(/\A[1-9]\d*\z/)
+  if all_tests && (!tests.empty? || !toolchains.empty? || ignored_tests)
+    raise ArgumentError, '--all cannot be combined with --test, --toolchain, or --ignored'
+  end
   raise ArgumentError, '--ignored requires at least one --test suite' if ignored_tests && tests.empty?
   suites = tests.map { |name| [name, ignored_tests] } + toolchains.map { |name| ["#{name}_toolchain", true] }
   suites.uniq.each do |name, _ignored|
@@ -361,16 +365,25 @@ def cmd_verify(argv)
     hosted = nil
     hosted_error = e.message
   end
-  commands = [['cargo', 'test', '--locked', '--lib', '--', '--test-threads=1']]
-  suites.uniq.each do |name, ignored|
-    command = ['cargo', 'test', '--locked', '--test', name, '--']
-    command << '--ignored' if ignored
-    commands << command + ['--test-threads=1']
+  if all_tests
+    commands = [
+      ['cargo', 'nextest', 'run', '--locked', '--lib', '--bins', '--test', 'all_tests',
+       '--no-fail-fast', '--ignore-default-filter'],
+      ['cargo', 'test', '--locked', '--doc']
+    ]
+  else
+    commands = [['cargo', 'test', '--locked', '--lib', '--', '--test-threads=1']]
+    suites.uniq.each do |name, ignored|
+      command = ['cargo', 'test', '--locked', '--test', name, '--']
+      command << '--ignored' if ignored
+      commands << command + ['--test-threads=1']
+    end
   end
   build_env = {
     'CARGO_BUILD_JOBS' => jobs,
-    'CARGO_INCREMENTAL' => ENV.fetch('CARGO_INCREMENTAL', '0')
+    'CARGO_INCREMENTAL' => ENV.fetch('CARGO_INCREMENTAL', all_tests ? '1' : '0')
   }
+  build_env['ROUNDHOUSE_TEST_BUNDLE_ROOT'] = ROUNDHOUSE_ROOT if all_tests
   # Record caller-selected size/speed tradeoffs without inventing a profile
   # or overriding Cargo configuration when these settings are absent.
   %w[CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG CARGO_PROFILE_DEV_STRIP CARGO_PROFILE_TEST_STRIP
@@ -379,9 +392,10 @@ def cmd_verify(argv)
   end
   missing = %w[real-blog store].reject { |name| File.directory?(File.join(ROUNDHOUSE_ROOT, 'fixtures', name)) }
   report = {
-    scope: 'partial local verification; hosted coverage is informational, not executed',
+    scope: "#{all_tests ? 'complete default suite; ignored tests excluded' : 'partial local verification'}; hosted coverage is informational, not executed",
     head: head, base: base_sha, changes: changes, build_environment: build_env,
-    prerequisites: ['Pinned Rust via rust-toolchain.toml, Ruby and test gems; selected toolchains must be installed'],
+    prerequisites: ['Pinned Rust via rust-toolchain.toml, Ruby and test gems; selected toolchains must be installed'] +
+      (all_tests ? ['cargo-nextest: cargo install cargo-nextest --locked'] : []),
     missing_fixtures: missing, hosted_coverage: hosted, hosted_coverage_error: hosted_error,
     checks: commands.map { |command| { command: command, status: 'not-run' } },
     disk_space: { warning_threshold_bytes: VERIFY_DISK_WARNING_BYTES, before: nil, after: nil },

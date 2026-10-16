@@ -72,7 +72,6 @@ pub fn tiny_blog_uuid() -> Overlay {
 /// shape the blog cannot be edited into, such as an app with no views.
 pub fn empty_app() -> Overlay {
     let base = scratch_dir();
-    std::fs::create_dir_all(&base).expect("mkdir");
     Overlay { base, scratch_base: true, edits: Vec::new() }
 }
 
@@ -378,13 +377,20 @@ pub fn ruby() -> Command {
 /// A fresh directory per run: tests in one binary run in parallel.
 fn scratch_dir() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "roundhouse-emit-and-run-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+    loop {
+        let dir = std::env::temp_dir().join(format!(
+            "roundhouse-emit-and-run-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Combined suites contain independent copies of this module. Reserve
+        // the path atomically instead of deleting another copy's live tree.
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return dir,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create scratch directory {}: {error}", dir.display()),
+        }
+    }
 }
 
 fn copy_tree(src: &Path, dst: &Path) {

@@ -197,6 +197,21 @@ class RhVerifyTest < Minitest::Test
     assert_equal 24_000_000 * 1024, report['disk_space']['after']['workspace']['available_bytes']
   end
 
+  def test_full_suite_failures_preserve_exit_status_and_release_the_lock
+    { 'nextest' => %w[failed not-run], '--doc' => %w[passed failed] }.each do |failure, statuses|
+      out, err, status = invoke('--all', '--json', env: { 'VERIFY_FAIL' => failure })
+      assert_equal 17, status.exitstatus, err
+      report = JSON.parse(out)
+      assert_equal 'failed', report['status']
+      assert_equal statuses, report['checks'].map { |check| check['status'] }
+      assert_includes report['scope'], 'complete default suite'
+      assert_includes report['scope'], 'ignored tests excluded'
+    end
+    out, err, status = invoke('--all', '--json')
+    assert status.success?, err
+    assert_equal 'passed', JSON.parse(out)['status']
+  end
+
   def test_explicit_environment_is_respected
     out, err, status = invoke('--json', env: { 'CARGO_BUILD_JOBS' => '3', 'CARGO_PROFILE_TEST_DEBUG' => '1' })
     assert status.success?, err
@@ -373,6 +388,7 @@ class RhVerifyTest < Minitest::Test
 
   def test_invalid_inputs_never_start_cargo
     [%w[--test ../example], %w[--toolchain unknown], %w[--jobs 0],
+     %w[--all --test example], %w[--all --toolchain ruby], %w[--all --ignored],
      %w[--base nonexistent], %w[--base --help], %w[--ignored], %w[extra]].each do |args|
       _out, err, status = invoke(*args)
       assert_equal 2, status.exitstatus, args.inspect

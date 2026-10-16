@@ -1,3 +1,7 @@
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[path = "support/test_subprocess.rs"]
+mod test_subprocess;
+
 use std::fs;
 
 #[test]
@@ -465,7 +469,7 @@ fn test_backtraces_retain_library_and_integration_source_locations() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "test_backtraces_retain_library_and_integration_source_locations",
+            test_subprocess::name!("test_backtraces_retain_library_and_integration_source_locations"),
             "--nocapture",
         ])
         .env(PROBE, "1")

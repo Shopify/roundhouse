@@ -42,11 +42,65 @@ The generated trees are ignored by Git; a fresh clone has neither. Accessors in
 Missing Ruby, gems, or SDKs can cause a harness to skip or fail; read the
 executed test output rather than assuming exit zero means coverage.
 
+## Complete local verification
+
+1. Install [cargo-nextest](https://nexte.st/docs/running/) once:
+
+   ```sh
+   cargo install cargo-nextest --locked
+   ```
+
+2. Run the complete default suite:
+
+   ```sh
+   bin/rh verify --all
+   ```
+
+This command runs library and binary tests plus every integration suite with
+Nextest. It then runs `cargo test --locked --doc`, because Nextest does not run
+documentation tests. Ignored tests remain ignored. It does not use a result
+cache, and it bypasses Nextest's default filter to prevent omitted tests.
+
+The full run compiles integration sources into one executable. `build.rs`
+discovers every `tests/*.rs` suite; no second list needs maintenance.
+Only full verification enables this target. Normal Cargo commands and
+`bin/rh verify --test NAME` keep the individual targets.
+
+Rust tests that start their own executable use the
+[`name!` helper](../../tests/support/test_subprocess.rs) for `--exact` selection.
+It preserves the test name in both layouts.
+[`tests/test_subprocess.rs`](../../tests/test_subprocess.rs) checks that the
+child executes its test body, not just that the child exits successfully.
+
+`--all` cannot be combined with `--test`, `--toolchain`, or `--ignored`.
+`NEXTEST_TEST_THREADS` controls test processes; `--jobs` controls Cargo workers.
+Full verification defaults incremental compilation on and preserves an explicit
+`CARGO_INCREMENTAL` value. `--all --plan` remains read-only.
+
+An ARM64 macOS run produced these measurements with the optimized test profile:
+
+| Measurement | Separate integration targets | Combined integration target |
+|---|---:|---:|
+| Test executables | 867 | 9 |
+| Nextest-reported test execution | 382.188 s | 262.323 s |
+
+The complete combined command took 265.837 s with a warm build, including
+discovery and documentation checks. The first combined build in this work took
+188.84 s. That build cost is not included in the warm-run time.
+Switching between full and focused modes can rebuild the library and test target.
+The final run passed 5,985 tests. All 6,334 existing test identities and their
+ignored status matched the separate targets; one new regression test checks
+child selection. The same 350 tests remained ignored.
+
+The macOS verification used `TMPDIR=/private/tmp`. The default `/var/...`
+temporary path caused existing assertions against canonical `/private/var/...`
+paths to fail.
+
 ## Focused verification
 
-`bin/rh verify` runs library tests, then only the integration suites you select,
-sequentially and fail-fast. It is a foreground developer loop, **not** a hosted
-CI emulator or merge approval.
+Without `--all`, `bin/rh verify` runs library tests, then only the integration
+suites you select, sequentially and fail-fast. Neither mode is a hosted CI
+emulator or merge approval.
 
 ```sh
 bin/rh verify --plan --base main --test ingest
@@ -98,9 +152,26 @@ Focused checks do not replace the default-suite commit bar. Native toolchain
 and framework integrations are generally ignored so local default tests do not
 require every SDK. They are not all separate GitHub jobs; see [CI](../ci/README.md).
 
-Keep repository debug profiles intact for readable backtraces. For debugger
-locals, opt into `CARGO_PROFILE_TEST_DEBUG=2`; suites that assert file/line
-backtraces need symbols. Neither the verifier nor a passing subset cleans old
-build artifacts. If space is exhausted, stop builds and inspect the dedicated
-target directory before removing disposable outputs; never strip live programs
-or clean a cache shared with another checkout.
+The test profile uses `opt-level = 1` to reduce compiler pipeline costs across
+the integration suites. It keeps debug assertions, overflow checks, and
+file/line backtraces. No test selection or ignored-test rule changes.
+The first build costs more; later runs reuse the optimized artifacts.
+
+On an ARM64 macOS checkout, three runs of each built test binary gave these
+median times. These measurements exclude compilation:
+
+| Suite | Unoptimized | Test profile |
+|---|---:|---:|
+| `ingest` | 0.394 s | 0.142 s |
+| `analyze` | 4.015 s | 1.330 s |
+| `real_blog` | 0.872 s | 0.499 s |
+| `runtime_src_integration` | 0.702 s | 0.394 s |
+| `emit_and_run` | 127.186 s | 88.074 s |
+
+For debugger locals, use `CARGO_PROFILE_TEST_DEBUG=2`. To step through
+unoptimized test code, also use `CARGO_PROFILE_TEST_OPT_LEVEL=0`.
+Suites that assert file/line backtraces need symbols.
+Neither the verifier nor a passing subset cleans old build artifacts.
+If space is exhausted, stop builds and inspect the dedicated target directory
+before removing disposable outputs. Never strip live programs or clean a cache
+shared with another checkout.
