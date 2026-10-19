@@ -117,6 +117,48 @@ pub(super) fn dispatcher_bodies<'a>(
     out
 }
 
+/// Callbacks need the same explicit response and parameter rewrites as methods.
+/// They have no implicit render or statically selected routed action.
+pub(super) fn lower_callback_bodies(
+    preamble: &mut [PreambleStmt],
+    wraps: &mut WrapFilters,
+    mut lower: impl FnMut(&Expr) -> Expr,
+) {
+    fn explicit_calls(expr: &mut Expr) {
+        if let ExprNode::Send { recv, args, block: None, .. } = &mut *expr.node
+            && recv.is_none() && args.is_empty()
+        {
+            // Keep a method call distinct from an earlier callback's local.
+            *recv = Some(Expr::new(expr.span, ExprNode::SelfRef));
+        }
+        expr.node.for_each_child_mut(&mut explicit_calls);
+    }
+    fn lower_body(expr: &mut Expr, lower: &mut impl FnMut(&Expr) -> Expr) {
+        *expr = lower(expr);
+        explicit_calls(expr);
+    }
+    fn guards(filter: &mut Filter, lower: &mut impl FnMut(&Expr) -> Expr) {
+        for condition in [&mut filter.if_cond_expr, &mut filter.unless_cond_expr].into_iter().flatten() {
+            lower_body(condition, lower);
+        }
+    }
+    for statement in preamble.iter_mut().chain(wraps.after.iter_mut()) {
+        match statement {
+            PreambleStmt::Call { filter, .. } => guards(filter, &mut lower),
+            PreambleStmt::Block { body, if_cond_expr, unless_cond_expr, .. } => {
+                lower_body(body, &mut lower);
+                for condition in [if_cond_expr, unless_cond_expr].into_iter().flatten() {
+                    lower_body(condition, &mut lower);
+                }
+            }
+            PreambleStmt::Lead { .. } => {}
+        }
+    }
+    for filter in &mut wraps.around {
+        guards(filter, &mut lower);
+    }
+}
+
 pub(super) fn synthesize_process_action(
     preamble: &[PreambleStmt],
     publics: &[Action],
@@ -203,6 +245,11 @@ pub(super) fn synthesize_process_action(
                 unless_cond_expr,
                 halt_check,
             } => {
+                let body = if *halt_check {
+                    syn(ExprNode::Seq { exprs: vec![body.clone(), halt_if_performed()] })
+                } else {
+                    body.clone()
+                };
                 let stmt = match cond_from_guards(
                     only,
                     except,
@@ -214,12 +261,12 @@ pub(super) fn synthesize_process_action(
                 ) {
                     Some(cond) => syn(ExprNode::If {
                         cond,
-                        then_branch: body.clone(),
+                        then_branch: body,
                         else_branch: empty_seq(),
                     }),
-                    None => body.clone(),
+                    None => body,
                 };
-                (stmt, *halt_check)
+                (stmt, false)
             }
             PreambleStmt::Lead { body } => (body.clone(), false),
         };

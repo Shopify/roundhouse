@@ -283,6 +283,15 @@ Anything not in that section that differs from Rails is a bug, and the
 
 ## Security posture
 
+The `ruby` target supports direct controller `content_security_policy`
+declarations for `frame_src`. These callbacks run for each request, including
+requests that use inherited actions. Policy copies keep request state separate.
+Either manual CSP header prevents automatic policy building.
+A final `304` response gets no automatic CSP header.
+Global policies, nonce settings, report-only declarations, and concern or
+custom macro declarations remain unsupported. Other targets report an error.
+The `roundhouse-nonce` value is not a secure nonce.
+
 **CSRF is verified on the ruby family** — the CRuby and Spinel lanes,
 which is where Campfire deploys. Rails' `load_defaults` 5.2+ implicit
 `protect_from_forgery with: :exception` heads every

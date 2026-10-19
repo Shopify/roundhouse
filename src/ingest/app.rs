@@ -324,6 +324,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     let path_gems = path_gem_dirs(vfs, dir);
     let source_vfs = PathGemVfs { inner: vfs, root: dir, dirs: &path_gems };
     let vfs = &source_vfs;
+    super::content_security_policy_config::validate(vfs, dir)?;
     let engine_routes = engine_route_sources(vfs, dir, &path_gems);
     let config = roundhouse_config(vfs, dir)?;
     let additional_test_paths = additional_test_paths(dir, &config)?;
@@ -2164,6 +2165,14 @@ end
     super::impersonates::lower_impersonates(&mut app);
     super::inertia::lower_inertia(&mut app);
     super::vite::lower_vite_tags(&mut app);
+    // Accepted `content_security_policy` class-body declarations become
+    // dispatcher-only `before_action` blocks, and every concern or
+    // custom-macro carrier of the macro is refused - both before the
+    // concern splice and macro expansion can consume or hide a
+    // declaration, and before the source drain, while the thread-local
+    // source registry the located refusals resolve against still holds
+    // every file.
+    super::content_security_policy::synthesize(&mut app, &sources)?;
     // The real drain, now that every pass re-ingesting synthesized
     // Ruby has run. A synthesized `"<label>"` re-ingest never takes a
     // slot (`sources::register` refuses a label starting with `<`), so
@@ -3478,6 +3487,12 @@ fn qualify_model_class_method_ar_calls(app: &mut App) {
 /// here: `parse_filter_call` types the forms that are modeled, and one
 /// left in the body — `with: :null_session`, say — is a real gap.)
 const CONSUMED_CONTROLLER_MACROS: &[&str] = &[
+    // Accepted declarations are rewritten to a dispatcher `before_action`
+    // by `content_security_policy::synthesize`; a refused form records its
+    // own located gap there. Either way this generic bucket must not also
+    // flag the leftover call.
+    "content_security_policy",
+    "content_security_policy_report_only",
     "include",
     "extend",
     "layout",

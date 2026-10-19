@@ -1,0 +1,10 @@
+# Typing contract for content_security_policy.rb beside this file. Both
+# methods are Base reopens; they type against Base's declared surface
+# (`request` in current.rbs, `status`/`headers` in base.rbs), so no ivar
+# re-declaration is needed here.
+module ActionController
+  class Base
+    def current_content_security_policy: () -> ActionDispatch::ContentSecurityPolicy
+    def complete_content_security_policy: () -> void
+  end
+end

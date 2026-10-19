@@ -72,6 +72,14 @@ unchanged. This reviewed inventory change records recovered source and its
 remaining limits, not runnable Writebook helper or whole-app support. The
 corpus pin and the manual inventory are unchanged.
 
+## Controller Content Security Policy
+
+Controller `content_security_policy` declarations for `frame_src` have an emitted Ruby contract.
+The [implementation record](content-security-policy-plan.md#implementation-record--2026-10-16)
+lists the executed checks and the remaining survey results.
+This does not claim that Writebook emits or runs.
+The pinned inventory remains separate from a survey of a local working tree.
+
 ## Roadmap, not a support claim
 
 1. **Routes (resolved).** Empty resource action lists are supported, including

@@ -1051,7 +1051,7 @@ fn subclass_template_hooks(
                         parenthesized: true,
                     },
                 );
-                rewrites::rewrite_render_to_views(&render, Some(&module), &[], view_ivars, partials, &template, &[])
+                rewrites::rewrite_render_to_views(&render, Some(&module), &[], view_ivars, partials, Some(&template), &[])
             };
             methods.push(MethodDef {
                 visibility: crate::dialect::MethodVisibility::Public,
@@ -1363,7 +1363,14 @@ fn build_methods(
             &privs,
             /*own_privs_inlined=*/ inlining_ordered,
         );
-        let (mut stmts, wraps) = preamble;
+        let (mut stmts, mut wraps) = preamble;
+        process_action::lower_callback_bodies(&mut stmts, &mut wraps, |body| {
+            lower_action_body(
+                body, controller, "", &privs, &params_privs, false,
+                params_specs, &[], view_ivars, partials, format_breadth,
+                &shadows, route_id_segments, false, false, None, None, &[],
+            ).0
+        });
         // ParamsWrapper runs before every callback in Rails (it wraps
         // `process_action` outside them), so it leads as `Lead` — not a
         // filter `Block` with empty guards.
@@ -1995,7 +2002,19 @@ fn build_filter_preamble(
                     };
                     let is_after = target.is_after();
                     let is_prepend = target.is_prepend();
-                    let halt_check = can_respond(&target.body);
+                    // A successful callback also halts after a responding guard.
+                    let responds = |body: &Expr| can_respond_within(
+                        body,
+                        &|name, visit| {
+                            if let Some(a) = find_target(name) {
+                                visit(&a.body);
+                            }
+                        },
+                        &mut std::collections::BTreeSet::new(),
+                    );
+                    let halt_check = responds(&target.body)
+                        || target.if_cond_expr.as_ref().is_some_and(&responds)
+                        || target.unless_cond_expr.as_ref().is_some_and(&responds);
                     let stmt = PreambleStmt::Block {
                         body: target.body,
                         only: target.only,
@@ -2355,14 +2374,6 @@ fn reads_action_name(controller: &Controller, all: &[Controller], dispatched: &[
                         .any(reads)
                 })
         })
-}
-
-/// Does this filter body contain a respond-capable call (render /
-/// redirect_to / head / render_404)? Scopes the `return if performed?`
-/// halting check to filters that need it — pure-assignment filters
-/// (and every blog controller) add no dispatch noise.
-fn can_respond(body: &Expr) -> bool {
-    can_respond_within(body, &|_, _| {}, &mut std::collections::BTreeSet::new())
 }
 
 /// Whether this body can render/redirect/head — DIRECTLY, or through a
@@ -3155,7 +3166,7 @@ fn lower_action_body(
             &ivars,
             view_ivars,
             partials,
-            action_name,
+            (!action_name.is_empty()).then_some(action_name),
             inheritor_modules,
         )
     };

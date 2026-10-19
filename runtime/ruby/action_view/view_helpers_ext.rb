@@ -11,12 +11,8 @@ require_relative "../action_view_number_helper"
 
 module ActionView
   module ViewHelpers
-    # `content_security_policy_nonce` — the per-request CSP script
-    # nonce Rails interpolates into `<script nonce=…>`. The CSP HEADER
-    # pipeline isn't modeled (no Content-Security-Policy response
-    # header is emitted), so the nonce is inert to browsers; a stable
-    # token keeps the layout's interpolation rendering without pulling
-    # a randomness primitive into every target runtime.
+    # This compatibility value is not a secure CSP nonce. Controller
+    # frame-src support does not admit nonce configuration or script-src.
     def self.content_security_policy_nonce
       "roundhouse-nonce"
     end

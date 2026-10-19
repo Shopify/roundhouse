@@ -141,6 +141,11 @@ module ActionDispatch
     # read). A reader, not a re-parse here: this file is shared with
     # every target and names neither parser.
     attr_accessor :query_parameters
+    # The optional per-request Content Security Policy. nil until a
+    # controller CSP callback stores one — lazy, so no empty policy is
+    # allocated per request. `current_content_security_policy` reads it;
+    # the callback writes it back after mutating a copy.
+    attr_accessor :content_security_policy
 
     def initialize
       @remote_ip = "127.0.0.1"
@@ -175,6 +180,7 @@ module ActionDispatch
       # defect `@params` had, one read away from surfacing.
       @user_agent = +""
       @session_options = {}
+      @content_security_policy = nil
     end
 
     # Rack's per-request session options. The one key the corpus writes

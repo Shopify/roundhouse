@@ -121,7 +121,7 @@ pub(super) fn rewrite_render_to_views(
     ivars: &[Symbol],
     view_ivars: &super::ViewIvarMap,
     partials: &super::PartialMap,
-    current_action: &str,
+    current_action: Option<&str>,
     // The Views modules of every controller that INHERITS this one —
     // where a template this controller lacks may still live. See the
     // `subclass_template_hook` arm below.
@@ -138,7 +138,7 @@ pub(super) fn rewrite_render_to_views(
     // Controller-context literals every view can read (see
     // extra_params.rs): the current action name and the controller's
     // resource name (`HomeController` → module "Home" → "home").
-    let current_action = current_action.to_string();
+    let current_action = current_action.map(str::to_owned);
     let controller_name = crate::naming::snake_case(&module_name_owned);
     map_expr(expr, &|e| match &*e.node {
         ExprNode::Send { recv: None, method, args, block, .. }
@@ -740,7 +740,16 @@ pub(super) fn rewrite_render_to_views(
                 view_args.push(flash_lookup(e.span, "notice"));
                 view_args.push(flash_lookup(e.span, "alert"));
                 if pass_action_name {
-                    view_args.push(str_lit(e.span, &current_action));
+                    view_args.push(match current_action.as_deref() {
+                        Some(action) => str_lit(e.span, action),
+                        None => Expr::new(e.span, ExprNode::Send {
+                            recv: None,
+                            method: Symbol::from("action_name"),
+                            args: vec![],
+                            block: None,
+                            parenthesized: false,
+                        }),
+                    });
                 }
                 if pass_controller_name {
                     view_args.push(str_lit(e.span, &controller_name));

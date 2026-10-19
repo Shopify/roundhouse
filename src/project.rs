@@ -1689,6 +1689,64 @@ fn report_ruby_only_sends(app: &App, target: BuildTarget) {
     crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, target, &kernel));
 }
 
+/// Only Ruby has executed the complete controller CSP response contract.
+/// Shared runtime packaging does not establish support on another target.
+fn reject_content_security_policy(app: &App, target: BuildTarget) -> Result<(), String> {
+    if target == BuildTarget::Ruby {
+        return Ok(());
+    }
+    fn has_class(ty: &crate::ty::Ty, class: &str) -> bool {
+        match ty {
+            crate::ty::Ty::Class { id, .. } => id.0.as_str() == class,
+            crate::ty::Ty::Union { variants } => variants.iter().any(|ty| has_class(ty, class)),
+            _ => false,
+        }
+    }
+    fn visit(expr: &crate::expr::Expr, refuse: &mut impl FnMut(crate::span::Span)) {
+        use crate::expr::{ExprNode, LValue};
+        const POLICY: &str = "ActionDispatch::ContentSecurityPolicy";
+        const REQUEST: &str = "ActionDispatch::Request";
+        let uses_policy = match &*expr.node {
+            ExprNode::Const { path } => path.len() >= 2
+                && path[0].as_str() == "ActionDispatch" && path[1].as_str() == "ContentSecurityPolicy",
+            ExprNode::Send { recv, method, .. } => expr.ty.as_ref().is_some_and(|ty| has_class(ty, POLICY))
+                || recv.as_ref().and_then(|recv| recv.ty.as_ref()).is_some_and(|ty| has_class(ty, POLICY))
+                || (matches!(method.as_str(), "content_security_policy" | "content_security_policy=")
+                    && recv.as_ref().and_then(|recv| recv.ty.as_ref()).is_some_and(|ty| has_class(ty, REQUEST))),
+            ExprNode::Assign { target: LValue::Attr { recv, name }, .. } => name.as_str() == "content_security_policy"
+                && recv.ty.as_ref().is_some_and(|ty| has_class(ty, REQUEST)),
+            _ => false,
+        };
+        if uses_policy {
+            refuse(expr.span);
+        }
+        expr.node.for_each_child(&mut |child| visit(child, refuse));
+    }
+    let mut found = false;
+    let mut refuse = |span| {
+        found = true;
+        crate::emit::diagnostics::report_unsupported(
+            span, target.as_str(), "content_security_policy",
+            "only the Ruby target has verified request policy storage and final-response header completion",
+        );
+    };
+    let declarations = crate::ingest::content_security_policy::declaration_spans(app);
+    for span in declarations {
+        refuse(*span);
+    }
+    // Typed policy APIs must not bypass admission when no macro was written.
+    if declarations.is_empty() {
+        crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, &mut refuse));
+    }
+    if !found {
+        return Ok(());
+    }
+    Err(format!(
+        "{} target does not support controller content_security_policy; only Ruby has verified the complete response contract",
+        target.as_str()
+    ))
+}
+
 /// `case/in` is not equivalent to the targets' existing `case/when`
 /// renderers, even for nil or a plain binding. Refuse before file emission
 /// rather than lose bindings, skip evaluation, or turn a test into a wildcard.
@@ -1924,6 +1982,7 @@ fn target_files_inner(
     // errors than the app has.
     report_unsupported_bundled_constants(app, target);
     report_i18n_table_sites(app, target);
+    reject_content_security_policy(app, target)?;
     reject_unsupported_pattern_matches(app, target)?;
     reject_file_blob_fixtures(app, target)?;
     reject_unsupported_data_factories(app, target)?;

@@ -7,7 +7,7 @@
 use crate::App;
 use crate::ide::render_ty;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::expr::{Expr, ExprNode, LValue};
+use crate::expr::{Expr, ExprNode, Literal, LValue};
 use crate::ty::Ty;
 use crate::ident::{ClassId, Symbol};
 use std::collections::HashMap;
@@ -172,6 +172,27 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
         for method in controller.class_methods() {
             diagnose_expr(&method.body, &mut out);
         }
+        // A controller's `before_action`/`after_action` BLOCK callbacks (and
+        // the `content_security_policy` macro's synthesized equivalent) live as
+        // `Unknown` body items the loops above never reach. Phase 0 types their
+        // block body and `if:`/`unless:` guards in place; diagnose them so an
+        // error inside one surfaces instead of hiding. The callback's return is
+        // discarded like any filter tail, so its body gets unused-tail
+        // semantics; the guard values ARE read, so they get an ordinary tail.
+        // Only a recognized callback shape is walked - an arbitrary macro keeps
+        // its survey gap and is never diagnosed as an instance call.
+        for item in &controller.body {
+            let crate::dialect::ControllerBodyItem::Unknown { expr, .. } = item else {
+                continue;
+            };
+            let Some((body, guards)) = filter_callback_parts(expr) else {
+                continue;
+            };
+            diagnose_expr_in(body, &mut out, false);
+            for guard in guards {
+                diagnose_expr(guard, &mut out);
+            }
+        }
     }
     for model in &app.models {
         for scope in model.scopes() {
@@ -222,6 +243,56 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     let mut seen = std::collections::HashSet::new();
     out.retain(|d| seen.insert((d.span.file, d.span.start, d.code(), d.message.clone())));
     (out, coverage)
+}
+
+/// The body and `if:`/`unless:` guard expressions of a recognized block-form
+/// filter callback, borrowed from the TYPED controller IR. Recognizes the same
+/// `before_action`/`after_action`/`prepend_before_action` block shape as
+/// `ingest::controller::lambda_filter_target` (and the `content_security_policy`
+/// macro's synthesized equivalent), but returns references into the analyzed
+/// nodes rather than the clone that function re-lowers - so the walker reads the
+/// types Phase 0 stamped. `None` for anything else, so an arbitrary unsupported
+/// macro keeps its survey gap and is never diagnosed as an instance call.
+fn filter_callback_parts(expr: &Expr) -> Option<(&Expr, Vec<&Expr>)> {
+    let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else {
+        return None;
+    };
+    if !crate::ingest::controller::is_lambda_filter_macro(method.as_str()) {
+        return None;
+    }
+    let (body, option_args): (&Expr, &[Expr]) = match block {
+        Some(block) => (lambda_body(block)?, args.as_slice()),
+        None => (lambda_body(args.first()?)?, &args[1..]),
+    };
+    let mut guards = Vec::new();
+    for arg in option_args {
+        let arg = match &*arg.node {
+            ExprNode::KeywordSplat { value } => value,
+            _ => arg,
+        };
+        let ExprNode::Hash { entries, .. } = &*arg.node else {
+            continue;
+        };
+        for (key, value) in entries {
+            let ExprNode::Lit { value: Literal::Sym { value: name } } = &*key.node else {
+                continue;
+            };
+            if matches!(name.as_str(), "if" | "unless") {
+                if let Some(guard) = lambda_body(value) {
+                    guards.push(guard);
+                }
+            }
+        }
+    }
+    Some((body, guards))
+}
+
+/// The body expression of a lambda/proc literal, borrowed.
+fn lambda_body(expr: &Expr) -> Option<&Expr> {
+    match &*expr.node {
+        ExprNode::Lambda { body, .. } => Some(body),
+        _ => None,
+    }
 }
 
 /// A type is "unknown" if it's `None` or `Ty::Var(n)` (a placeholder the

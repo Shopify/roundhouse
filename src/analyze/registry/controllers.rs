@@ -409,6 +409,7 @@ pub(in crate::analyze) fn register(
         app_ctrl.class_methods.insert(Symbol::from("request"), request_ty);
     }
     register_inertia(classes, &mut app_ctrl);
+    register_content_security_policy(classes, &mut app_ctrl);
     // HTTP Basic and Token auth (runtime/spinel/http_authentication.rb):
     // each yields the credentials the client sent and answers what the
     // block decided; the `or_request` forms render the 401 challenge
@@ -660,4 +661,71 @@ fn register_inertia(classes: &mut HashMap<ClassId, ClassInfo>, app_ctrl: &mut Cl
             effects: crate::effect::EffectSet::default(),
         },
     );
+}
+
+/// The controller CSP surface the `content_security_policy` macro lowering
+/// relies on, typed from the runtime RBS sidecars rather than re-hand-coded
+/// here: the `ActionDispatch::ContentSecurityPolicy` value the block receives
+/// (`frame_src`/`copy`/`build`), the two `ActionController::Base` helpers the
+/// generated `before_action` calls bare (`current_content_security_policy` /
+/// `complete_content_security_policy`), and the `ActionDispatch::Request`
+/// policy accessor pair the callback assigns the rebuilt policy through.
+/// Registered before source analysis so a `roundhouse check` / LSP / MCP run
+/// that types the generated callback WITHOUT the post-analyze lowering still
+/// resolves every call - the same reason the macro rewrite runs during ingest.
+fn register_content_security_policy(
+    classes: &mut HashMap<ClassId, ClassInfo>,
+    app_ctrl: &mut ClassInfo,
+) {
+    // The typed policy value. `policy.frame_src(...)` / `.copy` / `.build`
+    // dispatch on the policy INSTANCE, so its signatures land instance-side.
+    {
+        const RBS: &str =
+            include_str!("../../../runtime/ruby/action_dispatch/content_security_policy.rbs");
+        let parsed = crate::rbs::parse_app_signatures(RBS)
+            .expect("ActionDispatch::ContentSecurityPolicy RBS must parse");
+        let csp_id = ClassId(Symbol::from("ActionDispatch::ContentSecurityPolicy"));
+        if let Some(methods) = parsed.get(&csp_id) {
+            let csp = classes.entry(csp_id.clone()).or_default();
+            for (name, ty) in methods {
+                csp.instance_methods.insert(name.clone(), ty.clone());
+            }
+        }
+    }
+    // The two controller helpers the generated callback calls bare. The
+    // controller surface resolves a bare self-send against `class_methods`
+    // (as `request`/`render`/`params` do), and `app_ctrl` folds into
+    // `ActionController::Base` below, so they go there.
+    {
+        const RBS: &str =
+            include_str!("../../../runtime/ruby/action_controller/content_security_policy.rbs");
+        let parsed = crate::rbs::parse_app_signatures(RBS)
+            .expect("ActionController CSP RBS must parse");
+        if let Some(methods) = parsed.get(&ClassId(Symbol::from("ActionController::Base"))) {
+            for (name, ty) in methods {
+                app_ctrl.class_methods.insert(name.clone(), ty.clone());
+            }
+        }
+    }
+    // The request accessor pair: the callback assigns the rebuilt policy
+    // (`request.content_security_policy = policy`) and a source consumer may
+    // read the current one. Added to the already-registered Request instance
+    // table; the getter is nilable (no policy until one is set). Taken from the
+    // request RBS so the single contract stays authoritative.
+    {
+        const RBS: &str = include_str!("../../../runtime/ruby/action_dispatch/request.rbs");
+        let parsed = crate::rbs::parse_app_signatures(RBS)
+            .expect("ActionDispatch::Request RBS must parse");
+        let request_id = ClassId(Symbol::from("ActionDispatch::Request"));
+        if let (Some(methods), Some(request)) =
+            (parsed.get(&request_id), classes.get_mut(&request_id))
+        {
+            for name in ["content_security_policy", "content_security_policy="] {
+                let key = Symbol::from(name);
+                if let Some(ty) = methods.get(&key) {
+                    request.instance_methods.insert(key, ty.clone());
+                }
+            }
+        }
+    }
 }

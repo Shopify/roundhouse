@@ -633,6 +633,8 @@ module Main
     # changes all three.
     controller.commit_cache_control!
     controller.commit_conditional_get!(req.verb, req.req_headers.fetch("if-none-match", ""))
+    # Complete automatic CSP after the final response status is known.
+    controller.complete_content_security_policy
 
     res.status = controller.status
     # The layout wrap happens at the controller's render call sites

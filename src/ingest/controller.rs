@@ -1186,8 +1186,11 @@ fn ingest_controller_with_options(
                 ingest_with_options_filter_call(&inner, &merged, file)?
             }
             Some(inner) if inner.receiver().is_none() => {
+                let location = super::sources::line_at(file, inner.location().start_offset())
+                    .map(|line| format!("{file}:{line}"))
+                    .unwrap_or_else(|| file.to_string());
                 return Err(with_options_gap(
-                    file,
+                    &location,
                     &format!(
                         "`{}` with a block is not composed (Rails merges the options into its nested calls too)",
                         constant_id_str(&inner.name())

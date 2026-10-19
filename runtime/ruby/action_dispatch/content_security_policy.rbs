@@ -1,0 +1,25 @@
+# Typing contract for content_security_policy.rb beside this file. The
+# typed CSP policy: a `frame-src` directive store, its `#copy`/`#build`,
+# and the private source-mapping and build-time validation helpers.
+module ActionDispatch
+  class ContentSecurityPolicy
+    class InvalidDirectiveError < StandardError
+    end
+
+    MAPPINGS: Hash[Symbol, String]
+
+    @directives: Hash[String, Array[String]]
+
+    def initialize: () -> void
+    def frame_src: (*(String | Symbol | bool | nil) sources) -> Array[String]?
+    def copy: () -> ActionDispatch::ContentSecurityPolicy
+    def build: () -> String
+    def replace_directives: (Hash[String, Array[String]] source_directives) -> void
+
+    private def apply_mappings: (Array[String | Symbol | bool | nil] sources) -> Array[String]
+    private def apply_mapping: (Symbol source) -> String
+    private def hash_source?: (String source) -> bool
+    private def validate: (String directive, Array[String] sources) -> void
+    private def invalid_source?: (String source) -> bool
+  end
+end

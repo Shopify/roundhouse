@@ -886,6 +886,25 @@ pub fn insert_params_stub(
         value: std::sync::Arc::new(param_value),
     };
     let mut info = crate::analyze::ClassInfo::default();
+    // ParamsWrapper replaces @params before dispatcher callbacks run.
+    // Keep that assignment's String-keyed contract from params.rbs.
+    info.class_methods.insert(
+        Symbol::from("wrap"),
+        fn_sig(
+            vec![
+                (Symbol::from("params"), hash.clone()),
+                (Symbol::from("request"), Ty::Union { variants: vec![
+                    Ty::Class { id: ClassId(Symbol::from("ActionDispatch::Request")), args: vec![].into() },
+                    Ty::Nil,
+                ].into() }),
+                (Symbol::from("key"), Ty::Str),
+                (Symbol::from("use_include"), Ty::Bool),
+                (Symbol::from("include"), Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
+                (Symbol::from("exclude"), Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
+            ],
+            hash.clone(),
+        ),
+    );
     info.class_methods.insert(
         Symbol::from("sub"),
         fn_sig(
@@ -911,7 +930,7 @@ pub fn insert_params_stub(
             Ty::Bool,
         ),
     );
-    for name in ["sub", "str", "provided"] {
+    for name in ["wrap", "sub", "str", "provided"] {
         info.class_method_kinds
             .insert(Symbol::from(name), crate::dialect::AccessorKind::Method);
     }

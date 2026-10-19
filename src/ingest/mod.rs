@@ -30,6 +30,8 @@ mod representable;
 mod action_cable_config;
 pub(crate) mod database_yml;
 mod public_file_server_config;
+mod content_security_policy_config;
+pub(crate) mod content_security_policy;
 pub mod allow_browser;
 pub mod app;
 mod concern_accessors;

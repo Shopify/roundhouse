@@ -54,6 +54,32 @@ the modeled constructs on the selected target. A clean target-independent
 On a covered app the command prints nothing and exits 0. Otherwise it
 stops, and the two flags decide how.
 
+### Controller Content Security Policy
+
+The `ruby` target supports direct controller `content_security_policy`
+declarations for `frame_src`.
+Declarations use the controller class body, with no receiver or `self`.
+
+```ruby
+content_security_policy if: -> { EmbedProvider.configured? } do |policy|
+  policy.frame_src(*EmbedProvider.csp_frame_sources)
+end
+```
+
+The callback runs for each request. It supports inherited declarations and
+actions, literal `only:` and `except:` scopes, and symbol or zero-argument
+lambda guards. An empty `only: []` scope runs no callback.
+Strings and supported source symbols replace the directive. No arguments
+remove the directive. A `false` declaration clears the policy after its block runs.
+
+Either manual CSP response header prevents automatic policy building.
+A final `304` response gets no automatic CSP header.
+Global policies, nonce settings, report-only declarations, directive-level
+Proc sources, and concern or custom macro declarations remain unsupported.
+Unsupported declarations report errors without survey mode.
+Other targets refuse these declarations; shared runtime files do not prove support.
+See [the implementation record](../content-security-policy-plan.md).
+
 ### Date-only values
 
 `t.date` is modeled as `Date` (nullable as `Date?`), not `Time`.

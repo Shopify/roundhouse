@@ -34,6 +34,8 @@ require_relative "action_controller/cache_control"
 # (`commit_conditional_get!`), the step after `commit_cache_control!`
 # in both wire paths. Ruby-family only, as the file above.
 require_relative "action_controller/conditional_get"
+# Request-time policy copies and final-response CSP completion.
+require_relative "action_controller/content_security_policy"
 # The error `Params.require_key` raises; travels with its consumer for
 # the same reason message_digest does.
 require_relative "action_controller/parameter_missing"

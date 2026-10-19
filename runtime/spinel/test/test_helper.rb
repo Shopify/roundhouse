@@ -2051,6 +2051,8 @@ module RequestDispatch
     # holds onto the buffered header store, right before the copy
     # below — same contract as the two production wire paths.
     controller.commit_cache_control!
+    # Complete CSP without changing this helper's conditional-GET contract.
+    controller.complete_content_security_policy
     copied_headers = {}
     hi = 0
     hn = controller.headers.size

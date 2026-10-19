@@ -38,6 +38,7 @@ module ActionDispatch
     @user_agent: String
     @session_options: Hash[Symbol, bool]
     @params: Hash[String, untyped]
+    @content_security_policy: ActionDispatch::ContentSecurityPolicy?
 
     def remote_ip: () -> String
     def remote_ip=: (String) -> String
@@ -91,6 +92,8 @@ module ActionDispatch
     def params: () -> Hash[String, untyped]
     def filtered_parameters: () -> Hash[String, untyped]
     def params=: (Hash[String, untyped]) -> Hash[String, untyped]
+    def content_security_policy: () -> ActionDispatch::ContentSecurityPolicy?
+    def content_security_policy=: (ActionDispatch::ContentSecurityPolicy?) -> ActionDispatch::ContentSecurityPolicy?
     def self.for: (Hash[String, untyped] env, ?Hash[String, untyped] params) -> Request
   end
 end

@@ -171,6 +171,35 @@ and a text-level tree-shake (`emit::ruby::shake`, run from
 `src/project.rs::target_files`) trims what the app doesn't reference
 — while every other target gets the IR transpile described above.
 
+## Controller Content Security Policy
+
+Only the `ruby` target admits controller `content_security_policy`
+declarations. `src/ingest/content_security_policy.rs` converts accepted
+declarations into dispatcher-only block callbacks before source analysis.
+It keeps action scopes and runtime guards in Rails evaluation order.
+It does not copy these callbacks into action bodies.
+Source consumers use the same declarations without application lowering.
+
+`runtime/ruby/action_dispatch/content_security_policy.rb` stores typed
+`frame-src` sources. Setters replace or remove the directive.
+Setters return the assigned or removed source list, as Rails does.
+Unknown symbols fail during assignment. Whitespace and semicolons fail
+when `build` runs. A callback copies arrays and strings, then assigns
+the policy to its request only after its block returns.
+Request constructors initialize the optional policy to `nil`.
+
+`ActionController::Base#complete_content_security_policy` runs after
+conditional GET sets the final response status and before header copying.
+It returns without building for `304`, either manual CSP header, or no policy.
+The integration helper calls the same method but keeps its existing
+conditional-GET behavior. Production status checks use `Main.run_rack`.
+
+The existing recursive runtime walk packages both new subdirectory files.
+The root aggregators require the implementations; adjacent RBS files supply
+their types. This shared packaging does not establish native target support.
+Global policy configuration, nonces, report-only declarations, other
+directives, and directive-level Proc sources remain unsupported.
+
 ## Why hand-write the primitives?
 
 1. **Framework integration is language-idiomatic.** axum middleware,

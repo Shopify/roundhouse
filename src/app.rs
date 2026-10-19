@@ -164,6 +164,14 @@ pub struct App {
     /// render: without it, editor markup (`s`/`u`/table) is stripped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content_helper_allowed_tags: Vec<String>,
+    /// Source spans of accepted controller `content_security_policy`
+    /// declarations (block, `true`, and `false` forms), recorded by
+    /// `ingest::content_security_policy::synthesize` when it rewrites
+    /// each to a dispatcher `before_action`. Read by
+    /// `project::reject_content_security_policy` to gate every target
+    /// but Ruby. Recomputed each ingest, like the other site lists.
+    #[serde(skip)]
+    pub content_security_policy_spans: Vec<crate::span::Span>,
     /// Call-site-unified parameter types, written by the analyzer's
     /// fixpoint (`unify_params_from_call_sites`) as its last act and
     /// read by lowerings that build method signatures — the controller
@@ -884,6 +892,7 @@ impl App {
             extensions: Default::default(),
             content_helper_allowed_attributes: Vec::new(),
             content_helper_allowed_tags: Vec::new(),
+            content_security_policy_spans: Vec::new(),
             inferred_method_params: HashMap::new(),
             helper_method_index: HashMap::new(),
             view_visible_controller_methods: BTreeSet::new(),

@@ -37,6 +37,10 @@ module ActionDispatch
     # runtime/ruby/action_dispatch/request.rb.
     attr_accessor :request_parameters
     attr_reader :path_parameters
+    # The optional per-request Content Security Policy — see the twin in
+    # runtime/ruby/action_dispatch/request.rb. nil until a controller CSP
+    # callback stores one.
+    attr_accessor :content_security_policy
 
     def initialize(env, params = {})
       @env = env
@@ -44,6 +48,7 @@ module ActionDispatch
       @request_parameters = {}
       @path_parameters = RequestPathParameters.new({})
       @session_options = {}
+      @content_security_policy = nil
     end
 
     # Rack's per-request session options — see the twin in

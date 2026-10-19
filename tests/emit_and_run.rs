@@ -196,6 +196,8 @@ mod autoload_once_paths;
 mod defined_const_fold;
 #[path = "emit_and_run/job_payload.rs"]
 mod job_payload;
+#[path = "emit_and_run/content_security_policy.rs"]
+mod content_security_policy;
 
 #[test]
 fn markdown_templates_render_with_their_mime_type_and_erb_escaping() {
