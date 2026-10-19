@@ -2992,8 +2992,11 @@ fn splice_concerns_into_controllers(app: &mut App) {
     use crate::ty::{Row, Ty};
 
     // Instance methods per concern module, the constants those bodies
-    // resolve lexically, and the modules it includes.
-    let mut module_methods: HashMap<crate::ident::ClassId, Vec<crate::dialect::MethodDef>> =
+    // resolve lexically, and the modules it includes. The methods are
+    // borrowed, not copied: this indexes every library class, most of
+    // which no controller includes, and a method that is spliced has
+    // its body cloned below anyway.
+    let mut module_methods: HashMap<crate::ident::ClassId, Vec<&crate::dialect::MethodDef>> =
         HashMap::new();
     let mut module_constants: HashMap<
         crate::ident::ClassId,
@@ -3007,7 +3010,6 @@ fn splice_concerns_into_controllers(app: &mut App) {
             lc.methods
                 .iter()
                 .filter(|m| matches!(m.receiver, MethodReceiver::Instance))
-                .cloned()
                 .collect(),
         );
         module_constants
