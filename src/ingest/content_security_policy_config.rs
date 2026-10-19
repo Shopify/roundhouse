@@ -525,7 +525,13 @@ pub(super) fn validate<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<()>
         let result = super::prism::parse_silent(&source);
         let mut scan = Scan::default();
         scan.visit(&result.node());
+        let supported_global = path == dir.join("config/initializers/content_security_policy.rb")
+            && vfs.exists(&dir.join("config/application.rb"))
+            && global_policy_method(&String::from_utf8_lossy(&source)).is_some();
         for (offset, construct) in scan.sites {
+            if supported_global && construct == "global content_security_policy" {
+                continue;
+            }
             let line = source[..offset].iter().filter(|&&byte| byte == b'\n').count() + 1;
             let column = offset
                 - source[..offset].iter().rposition(|&byte| byte == b'\n').map_or(0, |index| index + 1)
@@ -533,11 +539,141 @@ pub(super) fn validate<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<()>
             let file = path.display().to_string();
             survey::continue_or_fail(IngestError::Unsupported {
                 message: format!(
-                    "{construct} is not supported at {file}:{line}:{column}; only direct controller frame_src declarations have a verified runtime"
+                    "{construct} is not supported at {file}:{line}:{column}; only controller frame_src and canonical literal global policies have a verified runtime"
                 ),
                 file,
             })?;
         }
     }
     Ok(())
+}
+
+/// The global policy subset emitted by the existing canonical initializer hook.
+/// Validate the whole AST before generating a factory; never drop a source.
+pub(super) fn global_policy_method(source: &str) -> Option<String> {
+    const DIRECTIVES: &[&str] = &[
+        "base_uri", "child_src", "connect_src", "default_src", "font_src",
+        "form_action", "frame_ancestors", "frame_src", "img_src", "manifest_src",
+        "media_src", "object_src", "prefetch_src", "require_trusted_types_for",
+        "script_src", "script_src_attr", "script_src_elem", "style_src",
+        "style_src_attr", "style_src_elem", "trusted_types", "worker_src",
+    ];
+    const SYMBOLS: &[&str] = &[
+        "self", "unsafe_eval", "wasm_unsafe_eval", "unsafe_hashes", "unsafe_inline",
+        "none", "http", "https", "data", "mediastream", "allow_duplicates",
+        "blob", "filesystem", "report_sample", "script", "strict_dynamic", "ws", "wss",
+    ];
+    fn one<'pr>(statements: ruby_prism::StatementsNode<'pr>) -> Option<Node<'pr>> {
+        let mut body = statements.body().iter();
+        let statement = body.next()?;
+        body.next().is_none().then_some(statement)
+    }
+    fn env_lookup(node: &Node<'_>) -> bool {
+        let Some(call) = node.as_call_node() else { return false };
+        if constant_id_str(&call.name()) != "[]" { return false; }
+        let Some(receiver) = call.receiver().and_then(|receiver| receiver.as_constant_read_node()) else { return false };
+        if constant_id_str(&receiver.name()) != "ENV" { return false; }
+        let Some(arguments) = call.arguments() else { return false };
+        let mut args = arguments.arguments().iter();
+        let Some(key) = args.next().and_then(|node| node.as_string_node()) else { return false };
+        args.next().is_none() && key.unescaped() == b"DISABLE_CONTENT_SECURITY_POLICY"
+    }
+    fn env_condition(node: &Node<'_>) -> bool {
+        if env_lookup(node) { return true; }
+        let Some(call) = node.as_call_node() else { return false };
+        if !matches!(constant_id_str(&call.name()), "==" | "!=") { return false; }
+        if !call.receiver().is_some_and(|receiver| env_lookup(&receiver)) { return false; }
+        let Some(arguments) = call.arguments() else { return false };
+        let mut args = arguments.arguments().iter();
+        args.next().is_some_and(|node| node.as_string_node().is_some()) && args.next().is_none()
+    }
+    fn policy<'pr>(node: Node<'pr>, configured: bool, out: &mut String) -> Option<()> {
+        if let Some(unless) = node.as_unless_node() {
+            if unless.else_clause().is_some() || !env_condition(&unless.predicate()) { return None; }
+            let condition = String::from_utf8_lossy(unless.predicate().location().as_slice()).into_owned();
+            out.push_str(&format!("  return nil if ({condition})\n"));
+            return policy(one(unless.statements()?)?, configured, out);
+        }
+        if let Some(if_node) = node.as_if_node() {
+            if if_node.subsequent().is_some() || !env_condition(&if_node.predicate()) { return None; }
+            let condition = String::from_utf8_lossy(if_node.predicate().location().as_slice()).into_owned();
+            out.push_str(&format!("  return nil unless ({condition})\n"));
+            return policy(one(if_node.statements()?)?, configured, out);
+        }
+        let call = node.as_call_node()?;
+        let name = constant_id_str(&call.name());
+        let block = call.block()?.as_block_node()?;
+        if name == "configure"
+            && call.arguments().is_none()
+            && call.receiver().is_some_and(|receiver| application(&receiver))
+            && block.parameters().is_none()
+        {
+            return policy(one(block.body()?.as_statements_node()?)?, true, out);
+        }
+        if name != "content_security_policy" || call.arguments().is_some() { return None; }
+        let receiver = call.receiver()?.as_call_node()?;
+        let receiver_is_config = match constant_id_str(&receiver.name()) {
+            "config" => receiver.arguments().is_none() && match receiver.receiver() {
+                None => configured,
+                Some(app) => application(&app),
+            },
+            "configuration" => receiver.arguments().is_none()
+                && receiver.receiver().is_some_and(|root| rails(&root)),
+            _ => false,
+        };
+        if !receiver_is_config { return None; }
+        let parameters = block.parameters()?.as_block_parameters_node()?;
+        if parameters.locals().iter().next().is_some() { return None; }
+        let params = parameters.parameters()?;
+        if params.optionals().iter().next().is_some() || params.rest().is_some()
+            || params.posts().iter().next().is_some() || params.keywords().iter().next().is_some()
+            || params.keyword_rest().is_some() || params.block().is_some()
+        { return None; }
+        let mut required = params.requireds().iter();
+        let parameter = required.next()?.as_required_parameter_node()?;
+        if required.next().is_some() { return None; }
+        let parameter = constant_id_str(&parameter.name());
+        let body = block.body()?.as_statements_node()?;
+        if body.body().iter().next().is_none() { return None; }
+        out.push_str("  policy = ActionDispatch::ContentSecurityPolicy.new\n");
+        for statement in body.body().iter() {
+            let directive = statement.as_call_node()?;
+            if directive.block().is_some() { return None; }
+            let owner = directive.receiver()?.as_local_variable_read_node()?;
+            if constant_id_str(&owner.name()) != parameter { return None; }
+            let name = constant_id_str(&directive.name());
+            if !DIRECTIVES.contains(&name) { return None; }
+            let mut sources = Vec::new();
+            if let Some(arguments) = directive.arguments() {
+                for (index, argument) in arguments.arguments().iter().enumerate() {
+                    let value = if let Some(string) = argument.as_string_node() {
+                        crate::expr::Literal::Str { value: String::from_utf8_lossy(string.unescaped()).into_owned() }
+                    } else if let Some(symbol) = argument.as_symbol_node() {
+                        let value = String::from_utf8_lossy(symbol.unescaped());
+                        if !SYMBOLS.contains(&value.as_ref()) { return None; }
+                        crate::expr::Literal::Sym { value: crate::ident::Symbol::from(value.as_ref()) }
+                    } else if index == 0 && argument.as_false_node().is_some() {
+                        crate::expr::Literal::Bool { value: false }
+                    } else if index == 0 && argument.as_nil_node().is_some() {
+                        crate::expr::Literal::Nil
+                    } else {
+                        return None;
+                    };
+                    sources.push(crate::emit::ruby::emit_expr(&crate::expr::Expr::new(
+                        crate::span::Span::synthetic(), crate::expr::ExprNode::Lit { value },
+                    )));
+                }
+            }
+            out.push_str(&format!("  policy.set_directive({:?}, [{}])\n", name.replace('_', "-"), sources.join(", ")));
+        }
+        out.push_str("  policy\n");
+        Some(())
+    }
+    let parsed = super::prism::parse_silent(source.as_bytes());
+    if parsed.errors().next().is_some() { return None; }
+    let statement = one(parsed.node().as_program_node()?.statements())?;
+    let mut method = String::from("def content_security_policy\n");
+    policy(statement, false, &mut method)?;
+    method.push_str("end\n");
+    Some(method)
 }

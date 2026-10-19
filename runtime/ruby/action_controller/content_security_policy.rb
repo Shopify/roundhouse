@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 # Request-time policy copies and final-response CSP completion.
-# Only Ruby has verified the complete response contract.
+# Controller declaration admission remains target-specific.
 module ActionController
   class Base
     def current_content_security_policy
@@ -8,7 +8,7 @@ module ActionController
       return ActionDispatch::ContentSecurityPolicy.new if r.nil?
       existing = r.content_security_policy
       return ActionDispatch::ContentSecurityPolicy.new if existing.nil?
-      existing.copy
+      existing.dup
     end
 
     def complete_content_security_policy

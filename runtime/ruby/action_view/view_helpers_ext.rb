@@ -17,6 +17,32 @@ module ActionView
       "roundhouse-nonce"
     end
 
+    # Rails' `csp_meta_tag`: a `<meta name="csp-nonce">` when a policy
+    # is configured, nothing when it is not. The content attribute is
+    # the nonce, and Rails' tag helper omits a nil one — campfire
+    # configures no generator, so the tag is the name alone. ` />` is
+    # `tag("meta")`'s void spelling; the compare canonicalizer drops
+    # the slash.
+    #
+    # The signal is `Rails.application.content_security_policy`, the
+    # object the request duplicates. This unit's require list does not
+    # load `ActionController::Current`, and a strict target's helper
+    # has no request, so the universal body stays "". `@csp_policy_for_test`
+    # is the stand-in a unit test sets: spinel cannot reopen
+    # `Application`, and `Rails.application` is a fresh instance per
+    # call. Production leaves the flag false.
+    @csp_policy_for_test = false
+
+    def self.csp_policy_for_test=(present)
+      @csp_policy_for_test = present
+    end
+
+    def self.csp_meta_tag
+      return "<meta name=\"csp-nonce\" />" if @csp_policy_for_test
+      return "" if Rails.application.content_security_policy.nil?
+      "<meta name=\"csp-nonce\" />"
+    end
+
     # The ruby family's `url_for_path` (see the universal body in
     # view_helpers.rb): absolute, on the request's scheme and host —
     # `Rails.application.protocol` / `.domain`, the grounding an ERB

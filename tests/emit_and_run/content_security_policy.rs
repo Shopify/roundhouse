@@ -238,7 +238,7 @@ expected = "frame-src 'self' 'none' https: 'unsafe-eval' 'wasm-unsafe-eval' 'uns
 raise policy.build unless policy.build == expected
 original = +"https://one.example"
 policy.frame_src(original)
-copy = policy.copy
+copy = policy.dup
 original.replace("https://mutated.example")
 raise "copy shared string" unless copy.build == "frame-src https://one.example"
 copy.frame_src(:none)
@@ -474,6 +474,107 @@ status, headers, = request_csp("/direct", "apply=no")
 raise "false guard response #{status}" unless status == 403
 raise "skipped callback changed halt behavior #{headers.inspect}" unless header_csp(headers, "X-Action") == "ran"
 raise "skipped policy installed #{headers.inspect}" if header_csp(headers, "Content-Security-Policy")
+"#);
+    app.run_ruby(&script).assert_passes();
+}
+
+fn global_policy_overlay() -> emit_and_run::Overlay {
+    overlay().write("config/initializers/content_security_policy.rb", r#"Rails.application.config.content_security_policy do |policy|
+  policy.default_src :self
+  policy.script_src :self
+end
+"#)
+}
+
+#[test]
+fn content_security_policy_global_defaults_survive_controller_copies_and_explicit_clear() {
+    let app = global_policy_overlay().write("app/controllers/child_controller.rb", r#"class ChildController < ParentController
+  content_security_policy false
+end
+"#);
+    let script = format!("{REQUEST_HELPER}{}", r#"
+_, headers, = request_csp("/direct")
+raise headers.inspect unless header_csp(headers, "Content-Security-Policy") == "default-src 'self'; script-src 'self'; frame-src 'self' https://embed.example"
+_, headers, = request_csp("/child")
+raise "global policy revived after clear #{headers.inspect}" if header_csp(headers, "Content-Security-Policy")
+_, headers, = request_csp("/direct")
+raise "clear leaked to next request #{headers.inspect}" unless header_csp(headers, "Content-Security-Policy") == "default-src 'self'; script-src 'self'; frame-src 'self' https://embed.example"
+"#);
+    app.run_ruby(&script).assert_passes();
+}
+
+#[test]
+fn content_security_policy_cached_concern_response_keeps_script_hashes_without_yield() {
+    let app = global_policy_overlay()
+        .write("app/controllers/concerns/cached_policy.rb", r#"module CachedPolicy
+  extend ActiveSupport::Concern
+  included do
+    content_security_policy if: -> { request.content_security_policy } do |policy|
+      sources = policy.directives["script-src"]
+      if sources
+        policy.directives["script-src"] = sources - ["'self'"] + ["'sha256-cached'"]
+      end
+      policy.worker_src "blob:"
+    end
+    around_action :serve_cached
+  end
+  def serve_cached
+    render plain: "cached response"
+  end
+end
+"#)
+        .write("app/controllers/direct_controller.rb", r#"class DirectController < ApplicationController
+  include CachedPolicy
+  def index
+    response.headers["X-Action"] = "ran"
+    render plain: "uncached"
+  end
+end
+"#);
+    let script = format!("{REQUEST_HELPER}{}", r#"
+status, headers, body = request_csp("/direct")
+raise "cached response lost #{body.inspect}" unless status == 200 && body.join == "cached response"
+raise "around filter yielded #{headers.inspect}" if header_csp(headers, "X-Action")
+raise "cached script hashes lost #{headers.inspect}" unless header_csp(headers, "Content-Security-Policy") == "default-src 'self'; script-src 'sha256-cached'; worker-src blob:"
+etag = header_csp(headers, "ETag")
+status, headers, = request_csp("/direct", "", "HTTP_IF_NONE_MATCH" => etag)
+raise "cached final status #{status}" unless status == 304
+raise "automatic CSP on cached 304 #{headers.inspect}" if header_csp(headers, "Content-Security-Policy")
+"#);
+    app.run_ruby(&script).assert_passes();
+}
+
+#[test]
+fn content_security_policy_global_guard_and_final_header_precedence_are_preserved() {
+    let app = global_policy_overlay()
+        .write("config/initializers/content_security_policy.rb", r#"unless ENV["DISABLE_CONTENT_SECURITY_POLICY"] == "true"
+  Rails.application.config.content_security_policy do |policy|
+    policy.script_src "invalid source"
+  end
+end
+"#)
+        .write("app/controllers/direct_controller.rb", r#"class DirectController < ApplicationController
+  def index
+    if params[:manual] == "yes"
+      response.headers["Content-Security-Policy-Report-Only"] = "manual report"
+    end
+    render plain: "stable"
+  end
+end
+"#);
+    let script = format!("{REQUEST_HELPER}{}", r#"
+ENV["DISABLE_CONTENT_SECURITY_POLICY"] = "true"
+status, headers, = request_csp("/direct")
+raise headers.inspect unless status == 200 && !header_csp(headers, "Content-Security-Policy")
+etag = header_csp(headers, "ETag")
+ENV["DISABLE_CONTENT_SECURITY_POLICY"] = "false"
+status, headers, = request_csp("/direct", "manual=yes")
+raise headers.inspect unless status == 200 && header_csp(headers, "Content-Security-Policy-Report-Only") == "manual report"
+raise headers.inspect if header_csp(headers, "Content-Security-Policy")
+status, headers, = request_csp("/direct", "", "HTTP_IF_NONE_MATCH" => etag)
+raise "global policy built before final status #{status}" unless status == 304
+raise headers.inspect if header_csp(headers, "Content-Security-Policy")
+ENV.delete("DISABLE_CONTENT_SECURITY_POLICY")
 "#);
     app.run_ruby(&script).assert_passes();
 }

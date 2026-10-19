@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use super::super::EmittedFile;
 use crate::App;
 use crate::dialect::{AccessorKind, LibraryClass, LibraryClassOrigin, MethodDef, MethodReceiver, MethodVisibility};
-use crate::expr::{Expr, ExprNode, InterpPart, LValue, Literal};
+use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, VarId};
 use crate::span::Span;
 use crate::ty::Ty;
@@ -160,7 +160,6 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     apply_rich_text_content_memo(&mut lcs);
     apply_boolean_lowering(&mut lcs, app);
     apply_hydration_nil_lowering(&mut lcs, app);
-    apply_nilsafe_empty_lowering(&mut lcs);
     apply_time_format_lowering(&mut lcs, app);
     // Same rooting the view pipeline applies, for the same reason one
     // step over: a class nested in a namespace that SHADOWS what it
@@ -170,14 +169,19 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     // head is skipped), so running it in both pipelines is safe.
 
     apply_constant_rooting(&mut lcs, app, RootingScope::RuntimeOnly);
-    let context;
-    let app = if lcs.iter().any(|lc| matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. }))) {
-        context = App { library_classes: lcs.clone(), ..app.clone() };
-        &context
+    // Lifted factories are lowered on `lcs`. Lookups that splice their methods
+    // or read neighboring classes have to see that slice. Index it in place
+    // instead of cloning the rest of the App (models, routes, views, assets).
+    let lowered_classes = lcs.iter().any(|lc| {
+        matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. }))
+    });
+    let classes: &[LibraryClass] = if lowered_classes { &lcs } else { &app.library_classes };
+    let factories = if lowered_classes {
+        associate_data_factories(classes)
     } else {
-        app
+        Vec::new()
     };
-    let _context_indexes = context_indexes(app);
+    let _factory_indexes = lowered_classes.then(|| install_lookup_indexes_for(app, classes));
     // A nested class goes in its parent's file, as the source wrote
     // it. Given its own, each part-file re-opened the outer class and
     // CLOSED it again, and `TracePoint(:end)` — how a gem implements
@@ -197,31 +201,32 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     // a library class of X's name (`ingest::library_class::
     // data_block_classes`) and render back into the block, the one place
     // they run before anything reads the class.
-    let (data_blocks, lcs): (Vec<LibraryClass>, Vec<LibraryClass>) = {
-        let all = std::mem::take(&mut lcs);
-        let factories: std::collections::HashSet<String> = all
-            .iter()
-            .flat_map(|lc| {
-                lc.constants.iter().filter(|(_, value)| is_data_factory(value)).map(move |(name, _)| {
-                    format!("{}::{}", lc.name.0.as_str(), name.as_str())
-                })
+    let spliced_factories: std::collections::HashSet<String> = lcs
+        .iter()
+        .flat_map(|lc| {
+            lc.constants.iter().filter(|(_, value)| is_data_factory(value)).map(move |(name, _)| {
+                format!("{}::{}", lc.name.0.as_str(), name.as_str())
             })
-            .collect();
-        all.into_iter().partition(|lc| {
-            !lc.is_module && lc.parent.is_none() && factories.contains(lc.name.0.as_str())
         })
+        .collect();
+    let is_spliced_factory = |lc: &LibraryClass| {
+        !lc.is_module && lc.parent.is_none() && spliced_factories.contains(lc.name.0.as_str())
     };
-    let emitted_here: std::collections::HashSet<&str> =
-        lcs.iter().map(|lc| lc.name.0.as_str()).collect();
+    let data_blocks: Vec<&LibraryClass> = lcs.iter().filter(|lc| is_spliced_factory(lc)).collect();
+    let emitted_here: std::collections::HashSet<&str> = lcs
+        .iter()
+        .filter(|lc| !is_spliced_factory(lc))
+        .map(|lc| lc.name.0.as_str())
+        .collect();
     let owner_in_this_tree = |lc: &LibraryClass| -> Option<String> {
-        let owner = file_owner(lc.name.0.as_str(), app);
+        let owner = file_owner(lc.name.0.as_str(), app, classes);
         (owner != lc.name.0.as_str() && emitted_here.contains(owner.as_str())).then_some(owner)
     };
 
     let mut children: std::collections::HashMap<String, Vec<&LibraryClass>> =
         std::collections::HashMap::new();
     for lc in &lcs {
-        if matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. })) {
+        if is_spliced_factory(lc) || matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. })) {
             continue;
         }
         if let Some(owner) = owner_in_this_tree(lc) {
@@ -230,6 +235,7 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     }
 
     lcs.iter()
+        .filter(|lc| !is_spliced_factory(lc))
         .filter(|lc| !matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. })))
         .filter(|lc| owner_in_this_tree(lc).is_none())
         .flat_map(|lc| {
@@ -240,12 +246,12 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             // Makefile's dependency list.
             let file_stem = crate::naming::underscore(lc.name.0.as_str());
             let out_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
-            let mut files = emit_library_class_pair(lc, app, out_path);
-            if let Some(kids) = children.get(lc.name.0.as_str()) {
-                splice_nested(&mut files, lc, kids, app);
-            }
+            let mut files = match children.get(lc.name.0.as_str()) {
+                Some(kids) => emit_library_class_with_nested(lc, kids, app, classes, &factories, out_path),
+                None => emit_library_class_pair_in(lc, app, classes, &factories, out_path),
+            };
             for block in &data_blocks {
-                splice_data_block(&mut files, block, app);
+                splice_data_block(&mut files, block, app, classes, &factories);
             }
             files
         })
@@ -263,14 +269,75 @@ fn is_data_factory(value: &crate::expr::Expr) -> bool {
     )
 }
 
+/// One lifted `Data.define` block, tied to the owner constant whose
+/// declaration span is the factory's `LibraryClassOrigin::DataFactory`.
+pub(super) struct DataFactoryOwner {
+    pub owner: String,
+    pub constant: String,
+    pub index: usize,
+}
+
+/// Pair each lifted factory with its owner constant once. Later Ruby and
+/// RBS emission look up this list instead of scanning every library class
+/// per constant.
+fn associate_data_factories(classes: &[LibraryClass]) -> Vec<DataFactoryOwner> {
+    let mut by_span: HashMap<Span, usize> = HashMap::new();
+    for (index, class) in classes.iter().enumerate() {
+        if let Some(LibraryClassOrigin::DataFactory { declaration_span }) = class.origin {
+            by_span.entry(declaration_span).or_insert(index);
+        }
+    }
+    let mut owners = Vec::new();
+    for class in classes {
+        for (name, value) in &class.constants {
+            let Some(&index) = by_span.get(&value.span) else { continue };
+            let owner = class.name.0.as_str();
+            let constant = name.as_str();
+            if owners.iter().any(|link: &DataFactoryOwner| link.owner == owner && link.constant == constant) {
+                continue;
+            }
+            owners.push(DataFactoryOwner {
+                owner: owner.to_string(),
+                constant: constant.to_string(),
+                index,
+            });
+        }
+    }
+    owners
+}
+
+pub(super) fn lifted_data_factory<'a>(
+    owner: &LibraryClass,
+    constant: &str,
+    classes: &'a [LibraryClass],
+    factories: &[DataFactoryOwner],
+) -> Option<&'a LibraryClass> {
+    if !factories.is_empty() {
+        let owner_name = owner.name.0.as_str();
+        let index = factories.iter().find(|link| link.owner == owner_name && link.constant == constant)?.index;
+        return classes.get(index);
+    }
+    let span = owner.constants.iter().find(|(name, _)| name.as_str() == constant)?.1.span;
+    classes.iter().find(|class| {
+        matches!(class.origin, Some(LibraryClassOrigin::DataFactory { declaration_span })
+            if declaration_span == span)
+    })
+}
+
 /// Render `block`'s methods into the `X = Data.define(…)` line that
 /// declares it, as the `do … end` the source wrote, and into the
 /// sidecar's `class X < ::Data` declaration. The line is the one
 /// `emit_library_class_decl` wrote for the owner, at the owner's body
 /// indentation; a file that does not hold it is not the owner's.
-fn splice_data_block(files: &mut [EmittedFile], block: &LibraryClass, app: &App) {
+fn splice_data_block(
+    files: &mut [EmittedFile],
+    block: &LibraryClass,
+    app: &App,
+    classes: &[LibraryClass],
+    factories: &[DataFactoryOwner],
+) {
     let name = block.name.0.as_str();
-    let owner = file_owner(name, app);
+    let owner = file_owner(name, app, classes);
     let owner_stem = crate::naming::underscore(&owner);
     let owner_rb_path = PathBuf::from(format!("app/models/{owner_stem}.rb"));
     let owner_rbs_path = PathBuf::from(format!("app/models/{owner_stem}.rbs"));
@@ -279,7 +346,7 @@ fn splice_data_block(files: &mut [EmittedFile], block: &LibraryClass, app: &App)
     let indent = "  ".repeat(depth - 1);
     let stem = crate::naming::underscore(name);
     let rb_path = PathBuf::from(format!("app/models/{stem}.rb"));
-    let rendered = emit_library_class_decl(block, app, rb_path.clone());
+    let rendered = emit_library_class_decl_in(block, app, classes, factories, rb_path.clone(), &[], &[]);
     let lines: Vec<&str> = rendered.content.lines().collect();
     let mut hoisted = Vec::new();
     for line in lines.iter().filter(|line| line.starts_with("require_relative ")) {
@@ -440,9 +507,8 @@ fn spliced_after_header(content: &str, header_indent: &str, blocks: &[String]) -
     inserted.then(|| out.join("\n"))
 }
 
-/// Put each nested class's block inside its parent's file, before the
-/// parent's own body — the order the source has, and the only one that
-/// works when the parent's class body references them.
+/// Put each nested class's block inside its parent's file, immediately
+/// before its first load-time reference, or at the end of the body.
 ///
 /// The child is rendered by the same function as before and its outer
 /// wrapper removed by COUNT, not by pattern: the parent's name has D
@@ -456,12 +522,14 @@ fn spliced_after_header(content: &str, header_indent: &str, blocks: &[String]) -
 /// the tree lost every nested class while the `.rb` kept them all.
 /// Spelled nested inside the parent's `class`, which is what the
 /// standalone sidecar's `module Parent` wrapper said too.
-fn splice_nested(
-    files: &mut [EmittedFile],
+fn emit_library_class_with_nested(
     parent: &LibraryClass,
     kids: &[&LibraryClass],
     app: &App,
-) {
+    classes: &[LibraryClass],
+    factories: &[DataFactoryOwner],
+    out_path: PathBuf,
+) -> Vec<EmittedFile> {
     let depth = parent.name.0.as_str().split("::").count();
     // Order the children so a superclass precedes its subclass. They
     // share one file now, so `class Image < Sound::ImageStruct` runs
@@ -503,13 +571,13 @@ fn splice_nested(
         ordered
     };
     let kids = &kids[..];
-    let mut blocks: Vec<String> = Vec::new();
+    let mut blocks: Vec<NestedBlock> = Vec::new();
     let mut sidecar_blocks: Vec<String> = Vec::new();
     let mut hoisted: Vec<String> = Vec::new();
     for kid in kids {
         let stem = crate::naming::underscore(kid.name.0.as_str());
         let rb_path = PathBuf::from(format!("app/models/{stem}.rb"));
-        let rendered = emit_library_class_decl(kid, app, rb_path.clone());
+        let rendered = emit_library_class_decl_in(kid, app, classes, factories, rb_path.clone(), &[], &[]);
         let lines: Vec<&str> = rendered.content.lines().collect();
         // Requires belong at the top of the file that now holds the
         // class, not buried inside a class body where they would still
@@ -556,7 +624,11 @@ fn splice_nested(
             .filter(|l| !l.starts_with("require"))
             .collect();
         let Some(block) = child_block(&body, depth, kid.name.0.as_str()) else { continue };
-        blocks.push(block);
+        blocks.push(NestedBlock {
+            name: kid.name.0.as_str().to_string(),
+            requires: nested_dependencies(kid, kids),
+            content: block,
+        });
         // The sidecar `emit_library_class_pair` would have written for
         // the child's own file, minus the same wrapper. Its type names
         // were resolved inside the child's enclosing segments, which
@@ -569,39 +641,17 @@ fn splice_nested(
         }
     }
     if blocks.is_empty() {
-        return;
+        return emit_library_class_pair_in(parent, app, classes, factories, out_path);
     }
     let own_header_indent = "  ".repeat(depth - 1);
-    let Some(rb) = files.iter_mut().find(|f| f.path.extension().is_some_and(|e| e == "rb")) else {
-        return;
-    };
-    // The parent opens either nested (`module WebPush` / `  class
-    // Connections`), its header `depth - 1` levels in, or compact
-    // (`class WebPush::Connections`) at the margin with a body one level
-    // in. The blocks are cut at the nested body's indentation, so the
-    // compact form takes them `depth - 1` levels shallower. Without this
-    // arm the splice found no header and the children, already left out
-    // of the tree as files of their own, were silently gone.
-    // The blocks are cut at column 0 (`child_block`); each header form
-    // wants them at its own body's indentation.
+    let mut rb = emit_library_class_decl_in(parent, app, classes, factories, out_path.clone(), &[], &blocks);
     let compact = |blocks: &[String]| -> Vec<String> {
         blocks.iter().map(|b| indent_lines(b, 1)).collect()
     };
-    let blocks: Vec<String> = blocks.iter().map(|b| indent_lines(b, depth)).collect();
     let sidecar_blocks: Vec<String> = sidecar_blocks.iter().map(|b| indent_lines(b, depth)).collect();
-    let raw_blocks: Vec<String> = blocks.iter().map(|b| dedent_lines(b, depth)).collect();
     let raw_sidecar: Vec<String> = sidecar_blocks.iter().map(|b| dedent_lines(b, depth)).collect();
     let compact_header = format!("class {}", parent.name.0.as_str());
-    let (spliced, compact_form) = match spliced_after_header(&rb.content, &own_header_indent, &blocks) {
-        Some(spliced) => (spliced, false),
-        None if rb.content.lines().any(|l| l == compact_header || l.starts_with(&format!("{compact_header} "))) => {
-            match spliced_after_header(&rb.content, "", &compact(&raw_blocks)) {
-                Some(spliced) => (spliced, true),
-                None => return,
-            }
-        }
-        None => return,
-    };
+    let compact_form = rb.content.lines().any(|l| l == compact_header || l.starts_with(&format!("{compact_header} ")));
     // A require the parent's own file already carries is not repeated.
     hoisted.retain(|r| !rb.content.lines().any(|l| l == r));
     let mut content = String::new();
@@ -612,17 +662,13 @@ fn splice_nested(
     if !hoisted.is_empty() {
         content.push('\n');
     }
-    content.push_str(&spliced);
-    content.push('\n');
+    content.push_str(&rb.content);
     rb.content = content;
 
     // Only once the `.rb` took the body: a sidecar must describe the
     // file beside it, and a child left out of the one stays out of the
     // other.
-    let Some(rbs) = files.iter_mut().find(|f| f.path.extension().is_some_and(|e| e == "rbs"))
-    else {
-        return;
-    };
+    let mut rbs = super::rbs::emit_library_class_rbs(parent, &out_path);
     let (indent, sidecar_blocks) = if compact_form {
         (String::new(), compact(&raw_sidecar))
     } else {
@@ -630,6 +676,162 @@ fn splice_nested(
     };
     if let Some(spliced) = spliced_after_header(&rbs.content, &indent, &sidecar_blocks) {
         rbs.content = format!("{spliced}\n");
+    }
+    vec![rb, rbs]
+}
+
+struct NestedBlock {
+    name: String,
+    requires: BTreeSet<String>,
+    content: String,
+}
+
+fn nested_dependencies(kid: &LibraryClass, kids: &[&LibraryClass]) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for value in kid.constants.iter().map(|(_, value)| value)
+        .chain(&kid.class_ivar_initializers).chain(&kid.unknown_calls)
+    {
+        walk_load_time_paths(value, kid, &mut BTreeSet::new(), &mut paths);
+    }
+    for class in kid.parent.iter().chain(&kid.includes) {
+        paths.insert(class.0.as_str().split("::").map(str::to_string).collect());
+    }
+    let names: BTreeSet<String> = kids.iter().map(|class| class.name.0.as_str().to_string())
+        .collect();
+    nested_names_in_paths(kid, &paths, &names)
+}
+
+fn nested_names_in_paths(owner: &LibraryClass, paths: &BTreeSet<Vec<String>>, names: &BTreeSet<String>) -> BTreeSet<String> {
+    let local: BTreeSet<&str> = owner.constants.iter().map(|(name, _)| name.as_str()).collect();
+    let mut out = BTreeSet::new();
+    for path in paths {
+        if path.len() == 1 && local.contains(path[0].as_str()) {
+            continue;
+        }
+        let rooted = path.first().is_some_and(String::is_empty);
+        let path = path.iter().filter(|part| !part.is_empty()).cloned().collect::<Vec<_>>().join("::");
+        let mut scope = Some(owner.name.0.as_str());
+        let mut candidates = Vec::new();
+        if !rooted {
+            while let Some(prefix) = scope {
+                candidates.push(format!("{prefix}::{path}"));
+                scope = prefix.rsplit_once("::").map(|(outer, _)| outer);
+            }
+        }
+        candidates.push(path);
+        if let Some(name) = candidates.iter().find_map(|candidate| {
+            names.iter().filter(|name| name.as_str() != owner.name.0.as_str()
+                && (candidate == *name || candidate.starts_with(&format!("{name}::"))))
+                .max_by_key(|name| name.len()).cloned()
+        }) {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+/// Lambda or proc invoked in this expression: `-> { … }.call`,
+/// `lambda { … }.call`, `proc { … }[]`. A stored closure runs later;
+/// one invoked here runs while the parent statement loads.
+fn invoked_lambda(expr: &Expr) -> Option<&Expr> {
+    let ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node else {
+        return None;
+    };
+    if !matches!(method.as_str(), "call" | "[]") {
+        return None;
+    }
+    match &*recv.node {
+        ExprNode::Lambda { .. } => Some(recv),
+        ExprNode::Send { recv: None, method, args, block: Some(block), .. }
+            if args.is_empty() && matches!(method.as_str(), "lambda" | "proc") =>
+        {
+            Some(block)
+        }
+        _ => None,
+    }
+}
+
+fn walk_param_defaults(params: &[crate::dialect::Param], owner: &LibraryClass, visited: &mut BTreeSet<String>, paths: &mut BTreeSet<Vec<String>>) {
+    for param in params {
+        if let Some(default) = &param.default {
+            walk_load_time_paths(default, owner, visited, paths);
+        }
+    }
+}
+
+fn walk_load_time_paths(expr: &Expr, owner: &LibraryClass, visited: &mut BTreeSet<String>, paths: &mut BTreeSet<Vec<String>>) {
+    if let Some(lambda) = invoked_lambda(expr) {
+        if let ExprNode::Lambda { extra_params, body, .. } = &*lambda.node {
+            walk_param_defaults(extra_params, owner, visited, paths);
+            walk_load_time_paths(body, owner, visited, paths);
+        } else {
+            walk_load_time_paths(lambda, owner, visited, paths);
+        }
+    }
+    if let ExprNode::Lambda { .. } = &*expr.node {
+        return;
+    }
+    if let ExprNode::Const { path } = &*expr.node {
+        paths.insert(path.iter().map(|part| part.as_str().to_string()).collect());
+    }
+    if let ExprNode::Send { recv, method, args, block, .. } = &*expr.node {
+        let own = recv.is_none() || recv.as_ref().is_some_and(|recv| match &*recv.node {
+            ExprNode::SelfRef => true,
+            ExprNode::Const { path } => path.iter().map(|part| part.as_str()).filter(|part| !part.is_empty()).collect::<Vec<_>>().join("::") == owner.name.0.as_str(),
+            _ => false,
+        });
+        let called = if method.as_str() == "new" { "initialize" } else { method.as_str() };
+        if own && visited.insert(called.to_string()) {
+            for method in owner.methods.iter().filter(|method| method.name.as_str() == called) {
+                walk_param_defaults(&method.params, owner, visited, paths);
+                if let Some(block) = &method.block_param {
+                    walk_param_defaults(std::slice::from_ref(block), owner, visited, paths);
+                }
+                walk_load_time_paths(&method.body, owner, visited, paths);
+            }
+        }
+        for value in recv.iter().chain(args) {
+            walk_load_time_paths(value, owner, visited, paths);
+        }
+        let stores_block = matches!(method.as_str(), "proc" | "lambda")
+            || (method.as_str() == "new" && matches!(recv.as_ref().map(|recv| &*recv.node),
+                Some(ExprNode::Const { path }) if path.len() == 1 && path[0].as_str() == "Proc"));
+        if !stores_block {
+            if let Some(block) = block {
+                let body = match &*block.node { ExprNode::Lambda { body, .. } => body, _ => block };
+                walk_load_time_paths(body, owner, visited, paths);
+            }
+        }
+        return;
+    }
+    expr.node.for_each_child(&mut |child| walk_load_time_paths(child, owner, visited, paths));
+}
+
+struct NestedEmitter<'a> {
+    pending: Vec<&'a NestedBlock>,
+    names: BTreeSet<String>,
+}
+
+impl NestedEmitter<'_> {
+    fn write_names(&mut self, out: &mut String, depth: usize, names: &BTreeSet<String>) {
+        while let Some(at) = self.pending.iter().position(|block| names.contains(&block.name)) {
+            let block = self.pending.remove(at);
+            self.write_names(out, depth, &block.requires);
+            writeln!(out, "{}", indent_lines(&block.content, depth)).unwrap();
+        }
+    }
+
+    fn write_expr(&mut self, out: &mut String, depth: usize, owner: &LibraryClass, expr: &Expr) {
+        if self.pending.is_empty() { return; }
+        let mut paths = BTreeSet::new();
+        walk_load_time_paths(expr, owner, &mut BTreeSet::new(), &mut paths);
+        self.write_names(out, depth, &nested_names_in_paths(owner, &paths, &self.names));
+    }
+
+    fn write_include(&mut self, out: &mut String, depth: usize, owner: &LibraryClass, include: &ClassId) {
+        if self.pending.is_empty() { return; }
+        let paths = BTreeSet::from([include.0.as_str().split("::").map(str::to_string).collect()]);
+        self.write_names(out, depth, &nested_names_in_paths(owner, &paths, &self.names));
     }
 }
 
@@ -2603,7 +2805,7 @@ fn resolve_through_chain(
     if depth > 4 {
         return None;
     }
-    let Association::HasMany { target, through: Some(thr_name), .. } = assoc else {
+    let Association::HasMany { name, target, through: Some(thr_name), .. } = assoc else {
         return None;
     };
     // The through association on the owner (`:votes`, `:taggings`, `:tags`).
@@ -2618,6 +2820,8 @@ fn resolve_through_chain(
     };
     // How the join model's rows tie back to the owner: directly by the
     // sibling's fk, or through the sibling's own chain.
+    // Owner edge is the sibling's foreign key. `through_writer_join`
+    // copies that same key; asking it again cannot change the edge.
     let (back_joins, edge_table, edge_fk) = match thr_through {
         None => (Vec::new(), pluralize_snake(thr_target.0.as_str()), thr_fk.clone()),
         Some(_) => resolve_through_chain(models, model, thr, depth + 1)?,
@@ -2630,9 +2834,19 @@ fn resolve_through_chain(
         // The source belongs_to on the join model (`Vote.belongs_to
         // :story`). A polymorphic one needs a type predicate this join
         // does not write, so it stays on the shared reader.
-        Association::BelongsTo { foreign_key: src_fk, polymorphic: false, .. } => vec![format!(
-            "INNER JOIN {thr_table} ON {thr_table}.{src_fk} = {target_table}.id{owner_type}"
-        )],
+        Association::BelongsTo { foreign_key: src_fk, polymorphic: false, .. } => {
+            let src_fk = if thr_through.is_none() {
+                match crate::lower::model_to_library::through_writer_join(model, models, name) {
+                    crate::lower::model_to_library::ThroughWriterJoin::Resolved(_, _, src_fk, _) => src_fk,
+                    _ => return None,
+                }
+            } else {
+                src_fk.clone()
+            };
+            vec![format!(
+                "INNER JOIN {thr_table} ON {thr_table}.{src_fk} = {target_table}.id{owner_type}"
+            )]
+        }
         // The source is a plain `has_many` on the join model, so the
         // foreign key is on the TARGET table and the join points the
         // other way (campfire: `has_many :reachable_messages, through:
@@ -2851,6 +3065,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
     // whether some unrelated file existed.
     let helper_modules: BTreeSet<ClassId> =
         app.helper_method_index.values().cloned().collect();
+    PLAIN_HELPERS.with(|p| *p.borrow_mut() = plain_text_helpers(&app.library_classes, &helper_modules, &app.html_safe_method_owners));
     // Generated route-helper names (`active_path`, `story_path`, …) —
     // bare calls to these in layout/helper bodies resolve to the
     // generated `RouteHelpers` module. (The view walker rewrites route
@@ -2973,6 +3188,22 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                 MethodReceiver::Instance => inherited_instance.iter().cloned(),
                 MethodReceiver::Class => inherited_class.iter().cloned(),
             });
+            for default in m.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+                rewrite_url_helpers_absolute(default);
+                rewrite_helper_calls(
+                    default,
+                    &app.helper_method_index,
+                    &route_helpers,
+                    &url_helper_classes,
+                    rewrite_request,
+                    &own_methods,
+                    &own_params,
+                    &app.view_visible_controller_methods,
+                );
+                if is_helper_module {
+                    rewrite_helper_ivars(default, &helper_ivars);
+                }
+            }
             rewrite_helper_calls(
                 &mut m.body,
                 &app.helper_method_index,
@@ -3054,6 +3285,9 @@ fn helper_read_ivars(app: &App) -> std::collections::BTreeSet<Symbol> {
             continue;
         }
         for m in &lc.methods {
+            for default in m.params.iter().filter_map(|p| p.default.as_ref()) {
+                collect_ivar_reads(default, &mut out);
+            }
             collect_ivar_reads(&m.body, &mut out);
         }
     }
@@ -3682,6 +3916,127 @@ fn strip_to_s(e: &Expr) -> &Expr {
     e
 }
 
+thread_local! {
+    /// What each app helper `(module, method)` returns, when the walk can
+    /// read it (`plain_text_helpers`), set per `apply_helper_lowering` run.
+    static PLAIN_HELPERS: std::cell::RefCell<HashMap<(String, String), HelperReturn>> = Default::default();
+}
+
+/// A helper's return as a template sees it.
+#[derive(Clone, Debug, PartialEq)]
+enum HelperReturn {
+    /// Plain text on every path: Rails escapes it.
+    Plain,
+    /// Plain text or one of these positional arguments as given: safe
+    /// exactly when each such argument is.
+    Args(Vec<usize>),
+}
+
+/// The app helper methods whose every return is plain text — a String
+/// literal, an interpolation, a number, or another such helper's
+/// result — which Rails escapes in a template like any String, and those
+/// that may instead hand back a required positional argument
+/// (`def label(v) = v || "—"`), which Rails escapes unless the argument
+/// was safe. Anything the walk cannot read stays out, keeping the safe
+/// default below, and so does a method whose `.html_safe` was erased
+/// (`App::html_safe_methods`).
+fn plain_text_helpers(
+    lcs: &[LibraryClass],
+    helper_modules: &BTreeSet<ClassId>,
+    html_safe: &BTreeSet<(String, String)>,
+) -> HashMap<(String, String), HelperReturn> {
+    fn tails<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match &*e.node {
+            ExprNode::Seq { exprs } => match exprs.last() {
+                Some(last) => tails(last, out),
+                None => out.push(e),
+            },
+            ExprNode::If { then_branch, else_branch, .. } => {
+                tails(then_branch, out);
+                tails(else_branch, out);
+            }
+            ExprNode::Case { arms, .. } => {
+                for arm in arms {
+                    tails(&arm.body, out);
+                }
+                out.push(e);
+            }
+            ExprNode::Return { value } => tails(value, out),
+            _ => out.push(e),
+        }
+    }
+    fn returns<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        e.node.for_each_child(&mut |c| returns(c, out));
+        if let ExprNode::Return { value } = &*e.node {
+            tails(value, out);
+        }
+    }
+    let methods: Vec<(String, &crate::dialect::MethodDef)> = lcs
+        .iter()
+        .filter(|lc| helper_modules.contains(&lc.name))
+        .flat_map(|lc| lc.methods.iter().map(move |m| (lc.name.0.as_str().to_string(), m)))
+        .collect();
+    let mut read: HashMap<(String, String), HelperReturn> = HashMap::new();
+    loop {
+        let before = read.len();
+        for (module, m) in &methods {
+            let key = (module.clone(), m.name.as_str().to_string());
+            // Not one `lower::html_safe` or the tag builder recorded: its `.html_safe` mark was erased, not absent.
+            if read.contains_key(&key) || html_safe.contains(&key) {
+                continue;
+            }
+            let mut out = Vec::new();
+            tails(&m.body, &mut out);
+            returns(&m.body, &mut out);
+            let is_plain = |e: &Expr| match &*e.node {
+                ExprNode::Lit { value: Literal::Str { .. } | Literal::Int { .. } | Literal::Float { .. } } => true,
+                ExprNode::StringInterp { .. } => true,
+                ExprNode::Send { recv: None, method, .. } => methods.iter().any(|(md, other)| md == module && other.name == *method)
+                    && read.get(&(module.clone(), method.as_str().to_string())) == Some(&HelperReturn::Plain),
+                _ => false,
+            };
+            // An optional or rest positional shifts which argument binds which parameter by the call's arity.
+            let fixed_arity = m.params.iter().all(|p| p.keyword || (p.default.is_none() && !p.rest && !p.forwarding));
+            let positional = |e: &Expr| match &*e.node {
+                ExprNode::Var { name, .. } if fixed_arity => {
+                    m.params.iter().position(|p| p.name == *name && !p.keyword)
+                }
+                _ => None,
+            };
+            let arg_or_plain = |e: &Expr| -> Option<Option<usize>> {
+                if is_plain(e) {
+                    return Some(None);
+                }
+                if let Some(i) = positional(e) {
+                    return Some(Some(i));
+                }
+                match &*e.node {
+                    ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, left, right, .. } => {
+                        match (positional(left), is_plain(right)) {
+                            (Some(i), true) => Some(Some(i)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            if out.is_empty() {
+                continue;
+            }
+            let Some(each) = out.iter().map(|e| arg_or_plain(e)).collect::<Option<Vec<_>>>() else {
+                continue;
+            };
+            let mut args: Vec<usize> = each.into_iter().flatten().collect();
+            args.sort_unstable();
+            args.dedup();
+            read.insert(key, if args.is_empty() { HelperReturn::Plain } else { HelperReturn::Args(args) });
+        }
+        if read.len() == before {
+            return read;
+        }
+    }
+}
+
 /// Calls whose result Rails treats as an html_safe buffer: tag-producing
 /// framework helpers, `raw`, and app-helper module functions (which
 /// compose those). The view walker's default `html_escape(<call>.to_s)`
@@ -3693,7 +4048,7 @@ fn strip_to_s(e: &Expr) -> &Expr {
 /// return tag-helper compositions, and per-method safety inference can
 /// refine this when a counterexample shows up.
 fn is_html_safe_call(e: &Expr, index: &HashMap<Symbol, ClassId>) -> bool {
-    let ExprNode::Send { recv: Some(r), method, .. } = &*e.node else {
+    let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node else {
         return false;
     };
     let ExprNode::Const { path } = &*r.node else {
@@ -3744,7 +4099,21 @@ fn is_html_safe_call(e: &Expr, index: &HashMap<Symbol, ClassId>) -> bool {
                 | "time_zone_options_for_select"
         );
     }
-    index.values().any(|cid| cid.0.as_str() == joined)
+    // Not every app helper: one whose every return is plain text is a String Rails escapes.
+    if !index.values().any(|cid| cid.0.as_str() == joined) {
+        return false;
+    }
+    match PLAIN_HELPERS.with(|p| p.borrow().get(&(joined.clone(), method.as_str().to_string())).cloned()) {
+        None => true,
+        Some(HelperReturn::Plain) => false,
+        Some(HelperReturn::Args(idxs)) => idxs.iter().all(|&i| {
+            args.get(i).is_some_and(|a| {
+                let a = strip_to_s(a);
+                // An interpolation may be a tag helper the walker inlined (`link_to` → `"<a href=…>"`).
+                matches!(&*a.node, ExprNode::StringInterp { .. }) || is_html_safe_call(a, index)
+            })
+        }),
+    }
 }
 
 /// `<Const ending in Base>.helpers` — the Rails idiom
@@ -6313,14 +6682,6 @@ fn widen_fk_zero_guards(expr: &mut Expr, fks: &BTreeSet<Symbol>) {
     );
 }
 
-/// Ruby-family pre-emit pass, companion to
-/// `apply_hydration_nil_lowering`: once nullable columns hydrate to
-/// real nil, the `.empty?` forms the predicate lowering synthesized
-/// from `present?`/`blank?` (which assumed never-nil reads) crash.
-/// Rewrite `<recv>.empty?` → `(<recv> || "").empty?` — single
-/// evaluation, transparent for arrays/strings that are never nil, and
-/// nil reads get Rails' blank-when-nil semantics. Only the
-/// zero-arg `empty?` shape is touched.
 /// `<time>.rfc2822` → `ActiveSupport.rfc2822(<time>)`.
 ///
 /// `Time#rfc2822` is stdlib `time`, not core Ruby — `require "time"`
@@ -6498,14 +6859,6 @@ fn rewrite_rfc2822(expr: &mut Expr) {
     };
 }
 
-pub(crate) fn apply_nilsafe_empty_lowering(lcs: &mut [LibraryClass]) {
-    for lc in lcs.iter_mut() {
-        for m in &mut lc.methods {
-            rewrite_empty_nilsafe(&mut m.body);
-        }
-    }
-}
-
 /// `::`-root a view body's constant references when the view's own
 /// namespace shadows the constant.
 ///
@@ -6565,7 +6918,7 @@ pub(crate) fn apply_constant_rooting(
     // ITSELF. One authority for "is this the runtime's" —
     // `require_path_for_body_const`, which already had to know.
     let runtime_owned = |name: &str| {
-        require_path_for_body_const(&[name.to_string()], app, "")
+        require_path_for_body_const(&[name.to_string()], app, &app.library_classes, "")
             .is_some_and(|p| p.starts_with("runtime/"))
     };
     let shadows = |name: &str| {
@@ -6756,51 +7109,6 @@ fn rewrite_render_options_assign(expr: &mut Expr) {
     }
 }
 
-fn rewrite_empty_nilsafe(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut |c| rewrite_empty_nilsafe(c));
-    let ExprNode::Send { recv: Some(r), method, args, .. } = &mut *expr.node else {
-        return;
-    };
-    if method.as_str() != "empty?" || !args.is_empty() {
-        return;
-    }
-    // THE GUARD GOES ON THE VALUE, NOT ON THE STRIP. `lower::blank`
-    // grounds a String `blank?` as `r.strip.empty?` (ActiveSupport's
-    // is a whitespace match, not `empty?`), so the receiver of
-    // `empty?` is now `r.strip` at half the sites — and `nil.strip`
-    // raises before any guard wrapped around it could answer. Descend
-    // one link so a nullable column still reads `(r || "").strip.empty?`.
-    // This is the interaction the whitespace form used to be deferred
-    // behind; four lines is the whole of it.
-    let target: &mut Expr = match &mut *r.node {
-        ExprNode::Send { recv: Some(inner), method, args, .. }
-            if method.as_str() == "strip" && args.is_empty() =>
-        {
-            inner
-        }
-        _ => r,
-    };
-    // Idempotence: an already-guarded `(x || "").empty?` keeps its shape.
-    if matches!(&*target.node, ExprNode::BoolOp { right, .. }
-        if matches!(&*right.node, ExprNode::Lit { value: Literal::Str { value } } if value.is_empty()))
-    {
-        return;
-    }
-    let guarded = Expr::new(
-        target.span,
-        ExprNode::BoolOp {
-            op: crate::expr::BoolOpKind::Or,
-            surface: crate::expr::BoolOpSurface::Symbol,
-            left: target.clone(),
-            right: Expr::new(
-                target.span,
-                ExprNode::Lit { value: Literal::Str { value: String::new() } },
-            ),
-        },
-    );
-    *target = guarded;
-}
-
 /// True when a reader body is exactly `@<name>` — the untouched
 /// hand-written `attr_reader` shape (vs a synthesized parsing body).
 fn is_plain_ivar_read(body: &Expr, name: &Symbol) -> bool {
@@ -6916,8 +7224,18 @@ pub(super) fn emit_library_class_pair(
     app: &App,
     out_path: PathBuf,
 ) -> Vec<EmittedFile> {
-    let rb = emit_library_class_decl(lc, app, out_path.clone());
-    let rbs = super::rbs::emit_library_class_rbs_with_factories(lc, &out_path, &app.library_classes);
+    emit_library_class_pair_in(lc, app, &app.library_classes, &[], out_path)
+}
+
+fn emit_library_class_pair_in(
+    lc: &LibraryClass,
+    app: &App,
+    classes: &[LibraryClass],
+    factories: &[DataFactoryOwner],
+    out_path: PathBuf,
+) -> Vec<EmittedFile> {
+    let rb = emit_library_class_decl_in(lc, app, classes, factories, out_path.clone(), &[], &[]);
+    let rbs = super::rbs::emit_library_class_rbs_with_factories(lc, &out_path, classes, factories);
     vec![rb, rbs]
 }
 
@@ -6934,7 +7252,7 @@ pub(super) fn emit_library_class_pair_with_synthesized(
         out_path.clone(),
         synthesized_siblings,
     );
-    let rbs = super::rbs::emit_library_class_rbs_with_factories(lc, &out_path, &app.library_classes);
+    let rbs = super::rbs::emit_library_class_rbs_with_factories(lc, &out_path, &app.library_classes, &[]);
     vec![rb, rbs]
 }
 
@@ -7126,6 +7444,17 @@ fn module_adapter_preserves_parameter_declaration_facts() {
         Some(crate::dialect::UnsupportedFormal::Destructured));
 }
 
+thread_local! {
+    static RENDERED: std::cell::RefCell<Option<Vec<LibraryClass>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub fn record_rendered<T>(f: impl FnOnce() -> T) -> (T, Vec<LibraryClass>) {
+    let previous = RENDERED.with(|r| r.borrow_mut().replace(Vec::new()));
+    let out = f();
+    let rendered = RENDERED.with(|r| std::mem::replace(&mut *r.borrow_mut(), previous)).unwrap_or_default();
+    (out, rendered)
+}
+
 /// Emit a single library-shape file. `out_path` is the project-root-relative
 /// destination for the file; the require resolver computes paths relative to
 /// `out_path`'s parent, so files emitted to `app/views/<plural>/` get
@@ -7136,6 +7465,30 @@ pub(super) fn emit_library_class_decl(
     out_path: PathBuf,
 ) -> EmittedFile {
     emit_library_class_decl_with_synthesized(lc, app, out_path, &[])
+}
+
+fn emit_library_class_decl_in(
+    lc: &LibraryClass,
+    app: &App,
+    classes: &[LibraryClass],
+    factories: &[DataFactoryOwner],
+    out_path: PathBuf,
+    synthesized_siblings: &[(String, String)],
+    nested: &[NestedBlock],
+) -> EmittedFile {
+    RENDERED.with(|rendered| {
+        if let Some(rendered) = rendered.borrow_mut().as_mut() {
+            rendered.push(lc.clone());
+        }
+    });
+    let guarded = read_statement_cleanup(lc);
+    let lc = guarded.as_ref();
+    let path = out_path.clone();
+    super::expr::with_emitted_file(&path, || {
+        super::expr::with_core_class_reopen(is_core_class_name(lc.name.0.as_str()), || {
+            emit_library_class_decl_inner(lc, app, classes, factories, out_path, synthesized_siblings, nested)
+        })
+    })
 }
 
 /// Variant that also accepts a list of (class_name, anchor) pairs for
@@ -7151,19 +7504,22 @@ pub(super) fn emit_library_class_decl_with_synthesized(
     out_path: PathBuf,
     synthesized_siblings: &[(String, String)],
 ) -> EmittedFile {
-    let guarded = read_statement_cleanup(lc);
-    let lc = guarded.as_ref();
+    emit_library_class_decl_with_nested(lc, app, out_path, synthesized_siblings, &[])
+}
+
+fn emit_library_class_decl_with_nested(
+    lc: &LibraryClass,
+    app: &App,
+    out_path: PathBuf,
+    synthesized_siblings: &[(String, String)],
+    nested: &[NestedBlock],
+) -> EmittedFile {
     // The one chokepoint every library-shape file goes through, and the
     // only place that knows which class is being emitted — the send
     // emitter is a free function reached from a dozen callers. A reopen
     // of a core class needs its `self.` receivers kept (see the elision
     // in `expr.rs`); everything else is emitted exactly as before.
-    let path = out_path.clone();
-    super::expr::with_emitted_file(&path, || {
-        super::expr::with_core_class_reopen(is_core_class_name(lc.name.0.as_str()), || {
-            emit_library_class_decl_inner(lc, app, out_path, synthesized_siblings)
-        })
-    })
+    emit_library_class_decl_in(lc, app, &app.library_classes, &[], out_path, synthesized_siblings, nested)
 }
 
 /// Render an indented method with named visibility directives that cannot leak
@@ -7204,8 +7560,11 @@ fn render_library_method(s: &mut String, m: &MethodDef, body_pad: &str) {
 fn emit_library_class_decl_inner(
     lc: &LibraryClass,
     app: &App,
+    classes: &[LibraryClass],
+    factories: &[DataFactoryOwner],
     out_path: PathBuf,
     synthesized_siblings: &[(String, String)],
+    nested: &[NestedBlock],
 ) -> EmittedFile {
     let name = lc.name.0.as_str();
     let out_dir = out_path
@@ -7242,8 +7601,13 @@ fn emit_library_class_decl_inner(
     // macro calls: those initializers must run after all collected methods.
     // A `Data.define` block is source too: its `@ivar` writes and
     // constants run in the order that the block gives them.
+    let replayed_in_place: Vec<&Expr> = lc
+        .unknown_calls
+        .iter()
+        .filter(|call| call.decisions & crate::expr::REPLAYED_CLASS_BODY != 0 && !call.span.is_synthetic())
+        .collect();
     let ordered_body = (lc.origin.is_none() || lc.data_define().is_some())
-        && lc.has_source_ivar_initializers()
+        && (lc.has_source_ivar_initializers() || !replayed_in_place.is_empty())
         && !app.controllers.iter().any(|controller| controller.name == lc.name);
     let (mut eager, mut deferred, initializers_call_self) = partition_deferred_constants(lc);
     let load_time_bodies = initializers_call_self || !deferred.is_empty();
@@ -7257,8 +7621,8 @@ fn emit_library_class_decl_inner(
     // so emit works correctly from any output directory.
     let mut requires: Vec<String> = Vec::new();
     if let Some(parent) = lc.parent.as_ref() {
-        let parent = lexical_parent(name, parent, app);
-        if let Some(anchor) = require_path_for_parent(&parent, app) {
+        let parent = lexical_parent(name, parent, app, classes);
+        if let Some(anchor) = require_path_for_parent(&parent, app, classes) {
             if anchor != self_anchor {
                 requires.push(relpath(&out_dir, &anchor));
             }
@@ -7271,8 +7635,8 @@ fn emit_library_class_decl_inner(
     let outer_segments: Vec<&str> = name.split("::").collect();
     for i in 0..outer_segments.len().saturating_sub(1) {
         let qualified = outer_segments[..=i].join("::");
-        let Some(outer_parent) = outer_class_parent(&qualified, app) else { continue };
-        if let Some(anchor) = require_path_for_parent(&outer_parent, app) {
+        let Some(outer_parent) = outer_class_parent(&qualified, app, classes) else { continue };
+        if let Some(anchor) = require_path_for_parent(&outer_parent, app, classes) {
             if anchor != self_anchor {
                 requires.push(relpath(&out_dir, &anchor));
             }
@@ -7298,7 +7662,7 @@ fn emit_library_class_decl_inner(
     // through the models aggregator — so the file that needs the
     // constant requires the file that provides it.
     let outer_runtime_anchor = (outer_segments.len() > 1)
-        .then(|| require_path_for_body_const(&[outer_segments[0].to_string()], app, ""))
+        .then(|| require_path_for_body_const(&[outer_segments[0].to_string()], app, classes, ""))
         .flatten()
         .filter(|p| p.starts_with("runtime/"));
     if let Some(anchor) = outer_runtime_anchor.as_deref() {
@@ -7319,7 +7683,7 @@ fn emit_library_class_decl_inner(
         // own root, matched nothing, and campfire's guarded channel
         // included a module with no require to load it.
         let path: Vec<String> = inc.0.as_str().split("::").map(str::to_string).collect();
-        if let Some(anchor) = require_path_for_body_const(&path, app, name) {
+        if let Some(anchor) = require_path_for_body_const(&path, app, classes, name) {
             if anchor != self_anchor {
                 let nested_prefix = format!("{self_anchor}/");
                 if anchor.starts_with(&nested_prefix) {
@@ -7367,7 +7731,7 @@ fn emit_library_class_decl_inner(
             .iter()
             .find(|(n, _)| n == first)
             .map(|(_, a)| a.clone())
-            .or_else(|| require_path_for_body_const(path, app, name))?;
+            .or_else(|| require_path_for_body_const(path, app, classes, name))?;
         if !load_time && !load_time_bodies && anchor.starts_with("app/models/") {
             return None;
         }
@@ -7399,6 +7763,10 @@ fn emit_library_class_decl_inner(
     }).map(|init| {
         (init.span.start, BodyItem::Initializer(init))
     }));
+    // Where the source has them: a method defined before the call is the macro's to override, one after it overrides the macro's.
+    if ordered_body {
+        body.extend(replayed_in_place.iter().map(|call| (call.span.start, BodyItem::Initializer(call))));
+    }
     // Concern-spliced and other foreign-file methods keep foreign
     // `name_span` offsets; interleave only same-file declarations.
     let body_file = lc.class_ivar_initializers.iter().find_map(|init| {
@@ -7409,7 +7777,7 @@ fn emit_library_class_decl_inner(
                     | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. }
             ))
         .then_some(init.span.file)
-    });
+    }).or_else(|| replayed_in_place.first().map(|call| call.span.file));
     let method_in_ordered_body = |m: &MethodDef| {
         ordered_body
             && !m.name_span.is_synthetic()
@@ -7433,10 +7801,12 @@ fn emit_library_class_decl_inner(
     for &i in &deferred {
         body_requires.extend(resolve_all(&lc.constants[i].1, true));
     }
-    let factory_methods = app.library_classes.iter().filter(|class| {
-        matches!(class.origin, Some(LibraryClassOrigin::DataFactory { declaration_span })
-            if lc.constants.iter().any(|(_, value)| value.span == declaration_span))
-    }).flat_map(|class| &class.methods);
+    let factory_methods: Vec<&MethodDef> = lc
+        .constants
+        .iter()
+        .filter_map(|(name, _)| lifted_data_factory(lc, name.as_str(), classes, factories))
+        .flat_map(|class| class.methods.iter())
+        .collect();
     for m in &lc.methods {
         body_requires.extend(resolve_all(&m.body, false));
     }
@@ -7470,7 +7840,7 @@ fn emit_library_class_decl_inner(
             BodyItem::Constant(_, expr) | BodyItem::Initializer(expr) => resolve_all(expr, true),
             BodyItem::Method(_) => BTreeSet::new(),
         }).collect();
-    let readers = constant_readers(lc, app, &resolve);
+    let readers = constant_readers(lc, app, classes, &resolve);
     let mut splits = std::collections::BTreeMap::new();
     for p in 1..per_body.len() {
         let mut before: BTreeSet<String> = body_requires.clone();
@@ -7558,9 +7928,9 @@ fn emit_library_class_decl_inner(
     // ("Fetch is not a module" at load).
     let outer_header = |i: usize, seg: &str| {
         let qualified = segments[..=i].join("::");
-        let parent = outer_class_parent(&qualified, app);
-        match (is_app_class(&qualified, app), parent) {
-            (true, Some(p)) => format!("class {seg} < {}", lexically_qualified(p.0.as_str(), &segments[..i], app)),
+        let parent = outer_class_parent(&qualified, app, classes);
+        match (is_app_class(&qualified, app, classes), parent) {
+            (true, Some(p)) => format!("class {seg} < {}", lexically_qualified(p.0.as_str(), &segments[..i], app, classes)),
             (true, None) => format!("class {seg}"),
             (false, _) => format!("module {seg}"),
         }
@@ -7606,7 +7976,7 @@ fn emit_library_class_decl_inner(
             }
             match lc.parent.as_ref() {
                 Some(p) => {
-                    let parent = lexically_qualified(p.0.as_str(), &segments[..depth - 1], app);
+                    let parent = lexically_qualified(p.0.as_str(), &segments[..depth - 1], app, classes);
                     writeln!(s, "{pad}class {last} < {parent}").unwrap()
                 }
                 None => writeln!(s, "{pad}class {last}").unwrap(),
@@ -7632,7 +8002,7 @@ fn emit_library_class_decl_inner(
         if data_block {
             format!("::{}", inc.0.as_str())
         } else {
-            lexically_qualified(inc.0.as_str(), &segments, app)
+            lexically_qualified(inc.0.as_str(), &segments, app, classes)
         }
     };
     // Plain `include X` normally; guarded only inside futamura's own
@@ -7648,6 +8018,10 @@ fn emit_library_class_decl_inner(
         }
     };
     open_header(&mut s, data_factory.as_deref());
+    let nested = std::cell::RefCell::new(NestedEmitter {
+        pending: nested.iter().collect(),
+        names: nested.iter().map(|block| block.name.clone()).collect(),
+    });
 
     for require in &nested_include_requires {
         writeln!(s, "{body_pad}require_relative {require:?}").unwrap();
@@ -7667,7 +8041,7 @@ fn emit_library_class_decl_inner(
     if !ordered_body {
         for inc in &lc.includes {
             let floor = positioned.last().map(|(at, _)| *at);
-            if let Some(at) = hooked_include_position(lc, inc, app).max(floor) {
+            if let Some(at) = hooked_include_position(lc, inc, app, classes).max(floor) {
                 positioned.push((at, inc));
             }
         }
@@ -7676,6 +8050,7 @@ fn emit_library_class_decl_inner(
         if positioned.iter().any(|(_, p)| *p == inc) {
             continue;
         }
+        nested.borrow_mut().write_include(&mut s, depth, lc, inc);
         writeln!(s, "{body_pad}{}", include_line(inc)).unwrap();
     }
     if lc.includes.len() > positioned.len() && !lc.methods.is_empty() {
@@ -7695,11 +8070,9 @@ fn emit_library_class_decl_inner(
     let render_constants = |s: &mut String, which: &[usize]| {
         for &i in which {
             let (cname, value) = &lc.constants[i];
+            nested.borrow_mut().write_expr(s, depth, lc, value);
             let rendered = super::emit_expr(&top_level(value));
-            if let Some(factory) = app.library_classes.iter().find(|class| {
-                matches!(class.origin, Some(LibraryClassOrigin::DataFactory { declaration_span })
-                    if declaration_span == value.span)
-            }) {
+            if let Some(factory) = lifted_data_factory(lc, cname.as_str(), classes, factories) {
                 writeln!(s, "{body_pad}{} = {rendered} do", cname.as_str()).unwrap();
                 for method in &factory.methods {
                     render_library_method(s, method, &format!("{body_pad}  "));
@@ -7740,6 +8113,7 @@ fn emit_library_class_decl_inner(
             match item {
                 BodyItem::Constant(i, _) => render_constants(s, &[*i]),
                 BodyItem::Initializer(expr) if ordered_body => {
+                    nested.borrow_mut().write_expr(s, depth, lc, expr);
                     for line in super::emit_expr(&top_level(expr)).lines() {
                         writeln!(s, "{body_pad}{line}").unwrap();
                     }
@@ -7801,17 +8175,20 @@ fn emit_library_class_decl_inner(
     // after it (`app_extension_calls`); every other call stays dropped.
     // Preserved external-gem `include`s are emitted separately and filtered
     // out of both the foreign replay list and the dropped-call reports.
-    let replayed: Vec<&Expr> = if replays_foreign_class_body(lc, app) {
+    let replayed: Vec<&Expr> = if replays_foreign_class_body(lc, app, classes) {
         lc.unknown_calls
             .iter()
             .filter(|call| !is_preserved_external_include(call))
             .collect()
     } else {
-        let own = app_extension_calls(lc, app);
+        let own = app_extension_calls(lc, app, classes);
         for call in &lc.unknown_calls {
             // A payload job's `queue_as` and `discard_on
             // ActiveJob::DeserializationError` are not dropped: the plan
             // carries them (`lower::job_payload`).
+            if call.decisions & crate::expr::REPLAYED_CLASS_BODY != 0 && ordered_body {
+                continue;
+            }
             if !own.iter().any(|c| std::ptr::eq(*c, call))
                 && !is_preserved_external_include(call)
                 && !crate::lower::job_payload::modelled_class_body_call(app, lc, call)
@@ -7822,6 +8199,7 @@ fn emit_library_class_decl_inner(
         own
     };
     for call in &replayed {
+        nested.borrow_mut().write_expr(&mut s, depth, lc, call);
         for line in super::emit_expr(call).lines() {
             if line.is_empty() {
                 writeln!(s).unwrap();
@@ -7845,6 +8223,7 @@ fn emit_library_class_decl_inner(
             }
             first = false;
             for (_, inc) in positioned.iter().filter(|(at, _)| *at == index) {
+                nested.borrow_mut().write_include(&mut s, depth, lc, inc);
                 writeln!(s, "{body_pad}{}", include_line(inc)).unwrap();
                 writeln!(s).unwrap();
             }
@@ -7852,6 +8231,7 @@ fn emit_library_class_decl_inner(
         }
         for (_, inc) in positioned.iter().filter(|(at, _)| *at >= lc.methods.len()) {
             writeln!(s).unwrap();
+            nested.borrow_mut().write_include(&mut s, depth, lc, inc);
             writeln!(s, "{body_pad}{}", include_line(inc)).unwrap();
         }
     }
@@ -7875,6 +8255,7 @@ fn emit_library_class_decl_inner(
         writeln!(s).unwrap();
     }
     for init in lc.class_ivar_initializers.iter().filter(|init| remaining_inits(init)) {
+        nested.borrow_mut().write_expr(&mut s, depth, lc, init);
         for line in super::emit_expr(&top_level(init)).lines() {
             writeln!(s, "{body_pad}{line}").unwrap();
         }
@@ -7886,6 +8267,9 @@ fn emit_library_class_decl_inner(
         }
         render_constants(&mut s, &deferred);
     }
+
+    let remaining = nested.borrow().names.clone();
+    nested.borrow_mut().write_names(&mut s, depth, &remaining);
 
     for i in (0..depth).rev() {
         writeln!(s, "{}end", "  ".repeat(i)).unwrap();
@@ -7913,9 +8297,9 @@ fn emit_library_class_decl_inner(
 /// :store)`. Written first, the include raised NameError (undefined
 /// method 'store') at load. Such an include goes right after the last
 /// method of `lc`, of either side, the hook names. `None` keeps it first.
-fn hooked_include_position(lc: &LibraryClass, inc: &ClassId, app: &App) -> Option<usize> {
+fn hooked_include_position(lc: &LibraryClass, inc: &ClassId, app: &App, classes: &[LibraryClass]) -> Option<usize> {
     let bare = |c: &ClassId| c.0.as_str().trim_start_matches("::").to_string();
-    let module = first_module_bare_named(&bare(inc), app)?;
+    let module = first_module_bare_named(&bare(inc), app, classes)?;
     let hook = module.methods.iter().find(|m| {
         m.receiver == MethodReceiver::Class && m.name.as_str() == "included" && m.params.len() == 1
     })?;
@@ -7984,6 +8368,7 @@ fn hooked_include_position(lc: &LibraryClass, inc: &ClassId, app: &App) -> Optio
 fn constant_readers(
     lc: &LibraryClass,
     app: &App,
+    classes: &[LibraryClass],
     resolve: &dyn Fn(&Vec<String>, bool) -> Option<String>,
 ) -> std::collections::HashMap<String, BTreeSet<String>> {
     let own = lc.name.0.as_str();
@@ -7992,7 +8377,7 @@ fn constant_readers(
         lc.constants.iter().map(|(n, _)| n.as_str()).collect();
     let mut out: std::collections::HashMap<String, BTreeSet<String>> =
         std::collections::HashMap::new();
-    if let Some(index) = ConstantReaderIndex::current(app) {
+    if let Some(index) = ConstantReaderIndex::for_slice(app, classes) {
         // The same reads as the walk below, looked up: a qualified
         // `Own::NAME` from any other class, or a bare `NAME` from a
         // class nested inside this one.
@@ -8003,7 +8388,7 @@ fn constant_readers(
             let qualified_readers = index.get(&qualified).into_iter().flatten().map(|&j| (j, false));
             let bare_readers = index.get(&bare).into_iter().flatten().map(|&j| (j, true));
             for (j, needs_nesting) in qualified_readers.chain(bare_readers) {
-                let other_name = app.library_classes[j].name.0.as_str();
+                let other_name = classes[j].name.0.as_str();
                 if other_name == own || (needs_nesting && !other_name.starts_with(&format!("{own}::"))) {
                     continue;
                 }
@@ -8015,7 +8400,7 @@ fn constant_readers(
         }
         return out;
     }
-    for other in &app.library_classes {
+    for other in classes {
         #[cfg(test)]
         lookup_tests::READER_SCAN_VISITS.with(|n| n.set(n.get() + 1));
         let other_name = other.name.0.as_str();
@@ -8064,14 +8449,18 @@ mod lookup_tests;
 type ReaderIndex = std::rc::Rc<HashMap<Vec<String>, Vec<usize>>>;
 
 thread_local! {
-    static CONSTANT_READER_INDEX: std::cell::RefCell<Option<(usize, ReaderIndex)>> =
+    static CONSTANT_READER_INDEX: std::cell::RefCell<Option<(usize, usize, usize, ReaderIndex)>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Restores the previous index when the emit that installed this one
-/// returns. Borrows the `App` for its whole life, so the address the
-/// index is keyed by cannot be reused by another `App` meanwhile.
-struct ConstantReaderIndexGuard<'a>(Option<(usize, ReaderIndex)>, std::marker::PhantomData<&'a App>);
+/// returns. Borrows the `App` and the library-class slice for its whole
+/// life, so neither address can be reused while the index is installed.
+struct ConstantReaderIndexGuard<'a>(
+    Option<(usize, usize, usize, ReaderIndex)>,
+    std::marker::PhantomData<&'a App>,
+    std::marker::PhantomData<&'a [LibraryClass]>,
+);
 
 impl Drop for ConstantReaderIndexGuard<'_> {
     fn drop(&mut self) {
@@ -8082,10 +8471,14 @@ impl Drop for ConstantReaderIndexGuard<'_> {
 
 impl ConstantReaderIndex {
     fn install(app: &App) -> ConstantReaderIndexGuard<'_> {
+        Self::install_from(app, &app.library_classes)
+    }
+
+    fn install_from<'a>(app: &'a App, classes: &'a [LibraryClass]) -> ConstantReaderIndexGuard<'a> {
         #[cfg(test)]
         lookup_tests::READER_BUILDS.with(|n| n.set(n.get() + 1));
         let mut index: HashMap<Vec<String>, Vec<usize>> = HashMap::default();
-        for (j, other) in app.library_classes.iter().enumerate() {
+        for (j, other) in classes.iter().enumerate() {
             #[cfg(test)]
             lookup_tests::READER_CLASS_VISITS.with(|n| n.set(n.get() + 1));
             let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
@@ -8100,9 +8493,10 @@ impl ConstantReaderIndex {
             }
         }
         let key = app as *const App as usize;
-        let previous =
-            CONSTANT_READER_INDEX.with(|slot| slot.borrow_mut().replace((key, std::rc::Rc::new(index))));
-        ConstantReaderIndexGuard(previous, std::marker::PhantomData)
+        let previous = CONSTANT_READER_INDEX.with(|slot| {
+            slot.borrow_mut().replace((key, classes.as_ptr() as usize, classes.len(), std::rc::Rc::new(index)))
+        });
+        ConstantReaderIndexGuard(previous, std::marker::PhantomData, std::marker::PhantomData)
     }
 
     /// The installed index, when it was built from this `app`.
@@ -8110,8 +8504,23 @@ impl ConstantReaderIndex {
         #[cfg(test)]
         if lookup_tests::UNCACHED.get() { return None; }
         let key = app as *const App as usize;
-        CONSTANT_READER_INDEX
-            .with(|slot| slot.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, index)| index.clone()))
+        CONSTANT_READER_INDEX.with(|slot| {
+            slot.borrow().as_ref().filter(|(k, _, _, _)| *k == key).map(|(_, _, _, index)| index.clone())
+        })
+    }
+
+    /// The installed index when it was built from this exact class slice.
+    fn for_slice(app: &App, classes: &[LibraryClass]) -> Option<ReaderIndex> {
+        #[cfg(test)]
+        if lookup_tests::UNCACHED.get() { return None; }
+        let key = app as *const App as usize;
+        let ptr = classes.as_ptr() as usize;
+        let len = classes.len();
+        CONSTANT_READER_INDEX.with(|slot| {
+            slot.borrow().as_ref().and_then(|(k, source, n, index)| {
+                (*k == key && *source == ptr && *n == len).then(|| index.clone())
+            })
+        })
     }
 }
 
@@ -8126,8 +8535,11 @@ pub(crate) fn install_lookup_indexes(app: &App) -> LookupIndexes<'_> {
     LookupIndexes { _readers: ConstantReaderIndex::install(app), _names: NameIndex::install(app) }
 }
 
-fn context_indexes(app: &App) -> Option<LookupIndexes<'_>> {
-    (NameIndex::current(app).is_none()).then(|| install_lookup_indexes(app))
+fn install_lookup_indexes_for<'a>(app: &'a App, classes: &'a [LibraryClass]) -> LookupIndexes<'a> {
+    LookupIndexes {
+        _readers: ConstantReaderIndex::install_from(app, classes),
+        _names: NameIndex::install_from(app, classes),
+    }
 }
 
 /// The app's class names, for the per-reference lookups: model and
@@ -8141,6 +8553,8 @@ struct NameIndex {
     library_classes: HashMap<String, Vec<usize>>,
     first_modules_bare: std::cell::OnceCell<HashMap<String, usize>>,
     constant_paths: std::cell::OnceCell<std::rc::Rc<std::collections::HashSet<String>>>,
+    source_ptr: usize,
+    source_len: usize,
 }
 
 thread_local! {
@@ -8148,7 +8562,11 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-struct NameIndexGuard<'a>(Option<(usize, std::rc::Rc<NameIndex>)>, std::marker::PhantomData<&'a App>);
+struct NameIndexGuard<'a>(
+    Option<(usize, std::rc::Rc<NameIndex>)>,
+    std::marker::PhantomData<&'a App>,
+    std::marker::PhantomData<&'a [LibraryClass]>,
+);
 
 impl Drop for NameIndexGuard<'_> {
     fn drop(&mut self) {
@@ -8159,10 +8577,14 @@ impl Drop for NameIndexGuard<'_> {
 
 impl NameIndex {
     fn install(app: &App) -> NameIndexGuard<'_> {
+        Self::install_from(app, &app.library_classes)
+    }
+
+    fn install_from<'a>(app: &'a App, classes: &'a [LibraryClass]) -> NameIndexGuard<'a> {
         #[cfg(test)]
         lookup_tests::NAME_BUILDS.with(|n| n.set(n.get() + 1));
         let mut library_classes: HashMap<String, Vec<usize>> = HashMap::new();
-        for (j, lc) in app.library_classes.iter().enumerate() {
+        for (j, lc) in classes.iter().enumerate() {
             #[cfg(test)]
             lookup_tests::NAME_CLASS_VISITS.with(|n| n.set(n.get() + 1));
             library_classes.entry(lc.name.0.as_str().to_string()).or_default().push(j);
@@ -8173,10 +8595,16 @@ impl NameIndex {
             library_classes,
             first_modules_bare: std::cell::OnceCell::new(),
             constant_paths: std::cell::OnceCell::new(),
+            source_ptr: classes.as_ptr() as usize,
+            source_len: classes.len(),
         };
         let key = app as *const App as usize;
         let previous = NAME_INDEX.with(|slot| slot.borrow_mut().replace((key, std::rc::Rc::new(index))));
-        NameIndexGuard(previous, std::marker::PhantomData)
+        NameIndexGuard(previous, std::marker::PhantomData, std::marker::PhantomData)
+    }
+
+    fn covers(&self, classes: &[LibraryClass]) -> bool {
+        self.source_ptr == classes.as_ptr() as usize && self.source_len == classes.len()
     }
 
     fn current(app: &App) -> Option<std::rc::Rc<NameIndex>> {
@@ -8203,44 +8631,44 @@ fn is_controller_named(name: &str, app: &App) -> bool {
     }
 }
 
-/// The library classes named `name`, in `app.library_classes` order.
-fn library_classes_named<'a>(name: &str, app: &'a App) -> Vec<&'a LibraryClass> {
-    match NameIndex::current(app) {
+/// The library classes named `name`, in `classes` order.
+fn library_classes_named<'a>(name: &str, app: &'a App, classes: &'a [LibraryClass]) -> Vec<&'a LibraryClass> {
+    match NameIndex::current(app).filter(|index| index.covers(classes)) {
         Some(index) => index
             .library_classes
             .get(name)
-            .map(|js| js.iter().map(|&j| &app.library_classes[j]).collect())
+            .map(|js| js.iter().map(|&j| &classes[j]).collect())
             .unwrap_or_default(),
-        None => app.library_classes.iter().filter(|lc| lc.name.0.as_str() == name).collect(),
+        None => classes.iter().filter(|lc| lc.name.0.as_str() == name).collect(),
     }
 }
 
 /// The first library module whose name, less any leading `::`, is
 /// `target`.
-fn first_module_bare_named<'a>(target: &str, app: &'a App) -> Option<&'a LibraryClass> {
+fn first_module_bare_named<'a>(target: &str, app: &'a App, classes: &'a [LibraryClass]) -> Option<&'a LibraryClass> {
     let bare = |lc: &'a LibraryClass| lc.name.0.as_str().trim_start_matches("::");
-    match NameIndex::current(app) {
+    match NameIndex::current(app).filter(|index| index.covers(classes)) {
         Some(index) => {
             let first = index.first_modules_bare.get_or_init(|| {
                 #[cfg(test)]
                 lookup_tests::BARE_MODULE_BUILDS.with(|n| n.set(n.get() + 1));
                 let mut first: HashMap<String, usize> = HashMap::new();
-                for (j, lc) in app.library_classes.iter().enumerate() {
+                for (j, lc) in classes.iter().enumerate() {
                     if lc.is_module {
                         first.entry(bare(lc).to_string()).or_insert(j);
                     }
                 }
                 first
             });
-            first.get(target).map(|&j| &app.library_classes[j])
+            first.get(target).map(|&j| &classes[j])
         }
-        None => app.library_classes.iter().find(|lc| lc.is_module && bare(lc) == target),
+        None => classes.iter().find(|lc| lc.is_module && bare(lc) == target),
     }
 }
 
 /// Whether `name` is a model or a library class of this app.
-fn is_model_or_library_class(name: &str, app: &App) -> bool {
-    is_model_named(name, app) || !library_classes_named(name, app).is_empty()
+fn is_model_or_library_class(name: &str, app: &App, classes: &[LibraryClass]) -> bool {
+    is_model_named(name, app) || !library_classes_named(name, app, classes).is_empty()
 }
 
 /// Split a class's constants into the ones that can be initialized
@@ -8451,12 +8879,12 @@ fn runtime_reopen_anchor(name: &str) -> Option<&'static str> {
 ///
 /// A dropped call is no longer silent either way — see
 /// `report_dropped_class_body_call`.
-fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
+fn replays_foreign_class_body(lc: &LibraryClass, app: &App, classes: &[LibraryClass]) -> bool {
     if lc.is_module {
         return false;
     }
     lc.parent.as_ref().is_some_and(|p| {
-        require_path_for_parent(p, app).is_none() && !is_core_class_name(p.0.as_str())
+        require_path_for_parent(p, app, classes).is_none() && !is_core_class_name(p.0.as_str())
     })
 }
 
@@ -8469,24 +8897,24 @@ fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
 /// call, so a call to the class's own `def self.` (defined below it in
 /// the emitted body) is not one of them. Anything else stays dropped and
 /// reported (`replays_foreign_class_body`).
-fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App, classes: &'a [LibraryClass]) -> Vec<&'a Expr> {
     if lc.is_module || lc.parent.as_ref().is_some_and(|p| !is_core_class_name(p.0.as_str())) {
         return Vec::new();
     }
     let app_module = |path: &[Symbol]| -> Option<&LibraryClass> {
         let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
         let nested = format!("{}::{written}", lc.name.0.as_str());
-        match NameIndex::current(app) {
+        match NameIndex::current(app).filter(|index| index.covers(classes)) {
             Some(index) => index.library_classes.get(&written).into_iter().flatten()
                 .chain(index.library_classes.get(&nested).into_iter().flatten())
                 .copied()
                 .filter(|&j| {
-                    let c = &app.library_classes[j];
+                    let c = &classes[j];
                     c.is_module && c.origin.is_none()
                 })
                 .min()
-                .map(|j| &app.library_classes[j]),
-            None => app.library_classes.iter().find(|c| {
+                .map(|j| &classes[j]),
+            None => classes.iter().find(|c| {
                 c.is_module && c.origin.is_none() && (c.name.0.as_str() == written || c.name.0.as_str() == nested)
             }),
         }
@@ -8595,16 +9023,16 @@ fn include_is_unresolved(lc: &LibraryClass, inc: &ClassId) -> bool {
 /// Outermost rather than nearest: `A::B::C::D` with both `A::B` and
 /// `A::B::C` classes belongs in `A::B`'s file, because that is the
 /// body whose end must happen once.
-pub(super) fn file_owner(name: &str, app: &App) -> String {
-    if library_classes_named(name, app).iter().any(|class|
+pub(super) fn file_owner(name: &str, app: &App, classes: &[LibraryClass]) -> String {
+    if library_classes_named(name, app, classes).iter().any(|class|
         matches!(class.origin, Some(LibraryClassOrigin::DataFactory { .. })))
     {
-        return file_owner(name.rsplit_once("::").unwrap().0, app);
+        return file_owner(name.rsplit_once("::").unwrap().0, app, classes);
     }
     let segments: Vec<&str> = name.split("::").collect();
     for i in 0..segments.len().saturating_sub(1) {
         let prefix = segments[..=i].join("::");
-        if owns_a_file(&prefix, app) {
+        if owns_a_file(&prefix, app, classes) {
             return prefix;
         }
     }
@@ -8620,20 +9048,20 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
 /// "same file, no require needed" for `Account::Joinable` nested in
 /// the MODEL `Account` — whose file then referenced a constant nothing
 /// had loaded. Both sides ask this now.
-fn owns_a_file(name: &str, app: &App) -> bool {
-    library_classes_named(name, app).iter().any(|c| !c.is_module)
+fn owns_a_file(name: &str, app: &App, classes: &[LibraryClass]) -> bool {
+    library_classes_named(name, app, classes).iter().any(|c| !c.is_module)
 }
 
 /// Every constant path the app declares (models, controllers, library
 /// classes and modules, test modules) and each namespace enclosing one.
-fn app_constant_paths(app: &App) -> std::rc::Rc<std::collections::HashSet<String>> {
+fn app_constant_paths(app: &App, classes: &[LibraryClass]) -> std::rc::Rc<std::collections::HashSet<String>> {
     let build = || {
         #[cfg(test)]
         lookup_tests::CONSTANT_PATH_BUILDS.with(|n| n.set(n.get() + 1));
         let mut out: std::collections::HashSet<String> = std::collections::HashSet::default();
         let names = app.models.iter().map(|m| m.name.0.as_str())
             .chain(app.controllers.iter().map(|c| c.name.0.as_str()))
-            .chain(app.library_classes.iter().map(|c| c.name.0.as_str()))
+            .chain(classes.iter().map(|c| c.name.0.as_str()))
             .chain(app.test_modules.iter().map(|t| t.name.0.as_str()));
         for name in names {
             let name = name.trim_start_matches("::");
@@ -8646,7 +9074,7 @@ fn app_constant_paths(app: &App) -> std::rc::Rc<std::collections::HashSet<String
         }
         std::rc::Rc::new(out)
     };
-    match NameIndex::current(app) {
+    match NameIndex::current(app).filter(|index| index.covers(classes)) {
         Some(index) => index.constant_paths.get_or_init(build).clone(),
         None => build(),
     }
@@ -8655,13 +9083,13 @@ fn app_constant_paths(app: &App) -> std::rc::Rc<std::collections::HashSet<String
 /// Does the app declare the constant `path`, or a namespace enclosing a
 /// declaration (models, controllers, library classes and modules, test
 /// modules)?
-fn declares_constant_path(path: &str, app: &App) -> bool {
-    if NameIndex::current(app).is_some() {
-        return app_constant_paths(app).contains(path);
+fn declares_constant_path(path: &str, app: &App, classes: &[LibraryClass]) -> bool {
+    if NameIndex::current(app).is_some_and(|index| index.covers(classes)) {
+        return app_constant_paths(app, classes).contains(path);
     }
     let names = app.models.iter().map(|m| m.name.0.as_str())
         .chain(app.controllers.iter().map(|c| c.name.0.as_str()))
-        .chain(app.library_classes.iter().map(|c| c.name.0.as_str()))
+        .chain(classes.iter().map(|c| c.name.0.as_str()))
         .chain(app.test_modules.iter().map(|t| t.name.0.as_str()));
     names.into_iter().any(|name| {
         let name = name.trim_start_matches("::");
@@ -8677,7 +9105,7 @@ fn declares_constant_path(path: &str, app: &App) -> bool {
 /// `uninitialized constant Admin::Api::Base`. A name the innermost
 /// shadowing scope does declare in full is that scope's, as Ruby binds
 /// it, and stays as written; so does a name the app does not declare.
-fn lexically_qualified(written: &str, scopes: &[&str], app: &App) -> String {
+fn lexically_qualified(written: &str, scopes: &[&str], app: &App, classes: &[LibraryClass]) -> String {
     if written.starts_with("::") || scopes.is_empty() {
         return written.to_string();
     }
@@ -8685,25 +9113,25 @@ fn lexically_qualified(written: &str, scopes: &[&str], app: &App) -> String {
     let Some(scope) = (1..=scopes.len())
         .rev()
         .map(|i| scopes[..i].join("::"))
-        .find(|scope| declares_constant_path(&format!("{scope}::{first}"), app))
+        .find(|scope| declares_constant_path(&format!("{scope}::{first}"), app, classes))
     else {
         return written.to_string();
     };
-    if declares_constant_path(&format!("{scope}::{written}"), app) || !declares_constant_path(written, app) {
+    if declares_constant_path(&format!("{scope}::{written}"), app, classes) || !declares_constant_path(written, app, classes) {
         return written.to_string();
     }
     format!("::{written}")
 }
 
-fn is_app_class(name: &str, app: &App) -> bool {
+fn is_app_class(name: &str, app: &App, classes: &[LibraryClass]) -> bool {
     is_model_named(name, app)
         || is_controller_named(name, app)
-        || library_classes_named(name, app).iter().any(|c| !c.is_module)
+        || library_classes_named(name, app, classes).iter().any(|c| !c.is_module)
 }
 
 /// The declared superclass of an app class named by a namespace
 /// segment, so a nested file can reopen it with the same parent.
-fn outer_class_parent(name: &str, app: &App) -> Option<ClassId> {
+fn outer_class_parent(name: &str, app: &App, classes: &[LibraryClass]) -> Option<ClassId> {
     if is_model_named(name, app) {
         if let Some(m) = app.models.iter().find(|m| m.name.0.as_str() == name) {
             return m.parent.clone();
@@ -8714,7 +9142,7 @@ fn outer_class_parent(name: &str, app: &App) -> Option<ClassId> {
             return c.parent.clone();
         }
     }
-    library_classes_named(name, app).into_iter()
+    library_classes_named(name, app, classes).into_iter()
         .find(|c| !c.is_module).and_then(|c| c.parent.clone())
 }
 
@@ -8731,12 +9159,12 @@ fn outer_class_parent(name: &str, app: &App) -> Option<ClassId> {
 /// top-level class can add a require the program does not need; the
 /// innermost match, the case that fixes load order, is the same in both
 /// forms. This only orders `require`s; typing uses `ConstResolver`.
-fn lexical_parent(child: &str, parent: &ClassId, app: &App) -> ClassId {
+fn lexical_parent(child: &str, parent: &ClassId, app: &App, classes: &[LibraryClass]) -> ClassId {
     let written = parent.0.as_str();
     if written.starts_with("::") {
         return parent.clone();
     }
-    let defined = |candidate: &str| is_model_or_library_class(candidate, app) || is_controller_named(candidate, app);
+    let defined = |candidate: &str| is_model_or_library_class(candidate, app, classes) || is_controller_named(candidate, app);
     let mut scope: Vec<&str> = child.split("::").collect();
     scope.pop();
     while !scope.is_empty() {
@@ -8749,7 +9177,7 @@ fn lexical_parent(child: &str, parent: &ClassId, app: &App) -> ClassId {
     parent.clone()
 }
 
-fn require_path_for_parent(parent: &ClassId, app: &App) -> Option<String> {
+fn require_path_for_parent(parent: &ClassId, app: &App, classes: &[LibraryClass]) -> Option<String> {
     let raw = parent.0.as_str();
     if raw == "ActiveRecord::Base" {
         // When the app REOPENS ActiveRecord::Base (lobsters' `q`
@@ -8758,7 +9186,7 @@ fn require_path_for_parent(parent: &ClassId, app: &App) -> Option<String> {
         // itself first, so subclasses see both the framework methods
         // and the app's additions. Without this the reopen dangles:
         // nothing else in the require graph names it.
-        if !library_classes_named("ActiveRecord::Base", app).is_empty()
+        if !library_classes_named("ActiveRecord::Base", app, classes).is_empty()
         {
             return Some("app/models/active_record/base".to_string());
         }
@@ -8787,7 +9215,7 @@ fn require_path_for_parent(parent: &ClassId, app: &App) -> Option<String> {
     if raw == "Logger::Formatter" || raw == "::Logger::Formatter" {
         return Some("runtime/logger".to_string());
     }
-    if is_model_or_library_class(raw, app)
+    if is_model_or_library_class(raw, app, classes)
     {
         // underscore: namespaced parents nest (see emit_library_class_decls).
         return Some(format!("app/models/{}", crate::naming::underscore(raw)));
@@ -8879,6 +9307,7 @@ fn is_core_class_name(name: &str) -> bool {
 fn require_path_for_body_const(
     path: &[String],
     app: &App,
+    classes: &[LibraryClass],
     self_name: &str,
 ) -> Option<String> {
     // A ROOTED head (`::Broadcasts`, `::Sound::Image`) names the same
@@ -8907,7 +9336,7 @@ fn require_path_for_body_const(
     // `Sound::Image` lives at app/models/sound/image.rb even though the
     // reference's first segment is `Sound`. Resolve the full path before
     // the self-reference short-circuit below.
-    let defined = |name: &str| is_model_or_library_class(name, app);
+    let defined = |name: &str| is_model_or_library_class(name, app, classes);
     // A value constant (`Shop::Types::LABEL`) lives in the file of the
     // longest prefix that is a class or module (`Shop::Types`), which
     // neither the whole path nor its first segment (`Shop`, a bare
@@ -8922,7 +9351,7 @@ fn require_path_for_body_const(
         // The file that DEFINES it, which for a nested class is its
         // parent's — and when that is the file being emitted, there is
         // nothing to require: the class is already in it.
-        let owner = file_owner(&holder, app);
+        let owner = file_owner(&holder, app, classes);
         if owner == self_name {
             return None;
         }
@@ -8938,9 +9367,9 @@ fn require_path_for_body_const(
     // the whole app fails to load, so resolve the qualified form before
     // giving up on the bare one.
     let lexical = format!("{self_name}::{joined}");
-    if !self_name.is_empty() && is_model_or_library_class(&lexical, app)
+    if !self_name.is_empty() && is_model_or_library_class(&lexical, app, classes)
     {
-        let owner = file_owner(&lexical, app);
+        let owner = file_owner(&lexical, app, classes);
         if owner == self_name {
             return None;
         }
@@ -8958,7 +9387,7 @@ fn require_path_for_body_const(
     if is_core_class_name(first) {
         return None;
     }
-    if is_model_or_library_class(first, app)
+    if is_model_or_library_class(first, app, classes)
     {
         return Some(format!("app/models/{}", crate::naming::underscore(first)));
     }
@@ -9161,124 +9590,10 @@ fn relpath(from_dir: &Path, to_anchor: &str) -> String {
 }
 
 pub(super) fn walk_const_paths(e: &Expr, out: &mut BTreeSet<Vec<String>>) {
-    match &*e.node {
-        ExprNode::Const { path } => {
-            out.insert(path.iter().map(|s| s.as_str().to_string()).collect());
-        }
-        ExprNode::Send { recv, args, block, .. } => {
-            if let Some(r) = recv {
-                walk_const_paths(r, out);
-            }
-            for a in args {
-                walk_const_paths(a, out);
-            }
-            if let Some(b) = block {
-                walk_const_paths(b, out);
-            }
-        }
-        ExprNode::Apply { fun, args, block } => {
-            walk_const_paths(fun, out);
-            for a in args {
-                walk_const_paths(a, out);
-            }
-            if let Some(b) = block {
-                walk_const_paths(b, out);
-            }
-        }
-        ExprNode::Hash { entries, .. } => {
-            for (k, v) in entries {
-                walk_const_paths(k, out);
-                walk_const_paths(v, out);
-            }
-        }
-        ExprNode::Array { elements, .. } => {
-            for el in elements {
-                walk_const_paths(el, out);
-            }
-        }
-        ExprNode::StringInterp { parts } => {
-            for p in parts {
-                if let InterpPart::Expr { expr } = p {
-                    walk_const_paths(expr, out);
-                }
-            }
-        }
-        ExprNode::BoolOp { left, right, .. } => {
-            walk_const_paths(left, out);
-            walk_const_paths(right, out);
-        }
-        ExprNode::Let { value, body, .. } => {
-            walk_const_paths(value, out);
-            walk_const_paths(body, out);
-        }
-        ExprNode::Lambda { body, .. } => walk_const_paths(body, out),
-        // A type-assertion wrapper is transparent to reference edges —
-        // the broadcast lowerings wrap their `Views::…` payload render
-        // in `Cast { …, Str }`, and skipping it dropped the model →
-        // views require.
-        ExprNode::Cast { value, .. } => walk_const_paths(value, out),
-        ExprNode::If { cond, then_branch, else_branch } => {
-            walk_const_paths(cond, out);
-            walk_const_paths(then_branch, out);
-            walk_const_paths(else_branch, out);
-        }
-        ExprNode::Case { scrutinee, arms } => {
-            walk_const_paths(scrutinee, out);
-            for arm in arms {
-                walk_const_paths(&arm.body, out);
-            }
-        }
-        ExprNode::Seq { exprs } => {
-            for e in exprs {
-                walk_const_paths(e, out);
-            }
-        }
-        ExprNode::Assign { value, .. } => walk_const_paths(value, out),
-        ExprNode::Yield { args } => {
-            for a in args {
-                walk_const_paths(a, out);
-            }
-        }
-        ExprNode::Raise { value } => walk_const_paths(value, out),
-        ExprNode::RescueModifier { expr, fallback } => {
-            walk_const_paths(expr, out);
-            walk_const_paths(fallback, out);
-        }
-        ExprNode::Return { value } => walk_const_paths(value, out),
-        ExprNode::Super { args: Some(args) } => {
-            for a in args {
-                walk_const_paths(a, out);
-            }
-        }
-        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
-            walk_const_paths(body, out);
-            for r in rescues {
-                walk_const_paths(&r.body, out);
-            }
-            if let Some(e) = else_branch {
-                walk_const_paths(e, out);
-            }
-            if let Some(e) = ensure {
-                walk_const_paths(e, out);
-            }
-        }
-        ExprNode::Next { value: Some(v) } => walk_const_paths(v, out),
-        ExprNode::MultiAssign { value, .. } => walk_const_paths(value, out),
-        ExprNode::While { cond, body, .. } => {
-            walk_const_paths(cond, out);
-            walk_const_paths(body, out);
-        }
-        ExprNode::Range { begin, end, .. } => {
-            if let Some(b) = begin {
-                walk_const_paths(b, out);
-            }
-            if let Some(e) = end {
-                walk_const_paths(e, out);
-            }
-        }
-        // Leaves and uninteresting nodes pass through.
-        _ => {}
+    if let ExprNode::Const { path } = &*e.node {
+        out.insert(path.iter().map(|s| s.as_str().to_string()).collect());
     }
+    e.node.for_each_child(&mut |child| walk_const_paths(child, out));
 }
 
 // has_secure_password synthesis moved to the shared model lowering
@@ -9712,20 +10027,19 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                         None => continue,
                     },
                 };
-                let Some(Association::HasMany {
-                    target: thr_target, foreign_key: thr_fk, as_interface, ..
-                }) =
+                let Some(Association::HasMany { target: thr_target, as_interface, .. }) =
                     model.associations().find(|a| {
                         matches!(a, Association::HasMany { name, .. } if name == thr_name)
                     })
                 else {
                     continue;
                 };
-                let Some(thr_model) = app.models.iter().find(|m| &m.name == thr_target) else {
+                // A missing join model is not batched through the convention fallback.
+                if !app.models.iter().any(|m| &m.name == thr_target) {
                     continue;
-                };
-                let Some(Association::BelongsTo { foreign_key: src_fk, polymorphic: false, .. }) =
-                    thr_model.through_source(assoc)
+                }
+                let crate::lower::model_to_library::ThroughWriterJoin::Resolved(_, owner_fk, src_fk, _) =
+                    crate::lower::model_to_library::through_writer_join(model, &app.models, name)
                 else {
                     continue;
                 };
@@ -9739,7 +10053,7 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                         join: format!(
                             "INNER JOIN {thr_table} ON {thr_table}.{src_fk} = {target_table}.id{owner_type}"
                         ),
-                        group_col: format!("{thr_table}.{thr_fk}"),
+                        group_col: format!("{thr_table}.{owner_fk}"),
                         order: order.map(|o| o.to_string()),
                         string_key: owner_string_key,
                     },

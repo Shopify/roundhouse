@@ -180,13 +180,16 @@ It keeps action scopes and runtime guards in Rails evaluation order.
 It does not copy these callbacks into action bodies.
 Source consumers use the same declarations without application lowering.
 
-`runtime/ruby/action_dispatch/content_security_policy.rb` stores typed
-`frame-src` sources. Setters replace or remove the directive.
-Setters return the assigned or removed source list, as Rails does.
+`runtime/ruby/action_dispatch/content_security_policy.rb` stores typed source
+lists. `frame_src` replaces or removes its directive; the existing global
+`set_directive`, raw `directives` access, and `worker_src` APIs share that storage.
+`frame_src` returns the assigned or removed source list, as Rails does.
 Unknown symbols fail during assignment. Whitespace and semicolons fail
 when `build` runs. A callback copies arrays and strings, then assigns
 the policy to its request only after its block returns.
-Request constructors initialize the optional policy to `nil`.
+Request constructors initialize optional policy storage and a lazy-load flag.
+The first read duplicates the app default. An explicit setter marks the value
+ready, so clearing a policy does not reload that default.
 
 `ActionController::Base#complete_content_security_policy` runs after
 conditional GET sets the final response status and before header copying.
@@ -197,8 +200,10 @@ conditional-GET behavior. Production status checks use `Main.run_rack`.
 The existing recursive runtime walk packages both new subdirectory files.
 The root aggregators require the implementations; adjacent RBS files supply
 their types. This shared packaging does not establish native target support.
-Global policy configuration, nonces, report-only declarations, other
-directives, and directive-level Proc sources remain unsupported.
+Canonical literal global policies and cached-page mutation concerns retain the
+existing Ruby-family runtime path. Controller `frame_src` declarations remain
+Ruby-only. Nonces, report-only mode, Proc sources, and other unverified forms
+remain unsupported.
 
 ## Why hand-write the primitives?
 
@@ -214,6 +219,94 @@ The tradeoff: emitters and primitives stay in lockstep. If
 `view_helpers.rs` adds a function, the corresponding emitter (or, for
 helpers, the `runtime/ruby/action_view/` source) has to learn to call
 it. Snapshot tests + toolchain tests catch drift.
+
+## Read bind capability
+
+`ROUNDHOUSE_PARAM_BINDS` is sampled once when assembling each target, then
+passed explicitly through lowering. The exhaustive `ParamBindCapability` policy
+separates driver support from the measured default:
+
+| Capability | Targets | Unset / other value | `=0` / `=1` |
+| --- | --- | --- | --- |
+| Default-on | Spinel | Binds | Inline / binds |
+| Opt-in | Ruby (CRuby), JRuby | Inline | Inline / binds |
+| Unsupported | All remaining targets | Inline | Inline / inline |
+
+Unsupported targets are Blog, Roda, Futamura, Crystal, Elixir, Go, Kotlin, Python, Rust,
+Swift, C#, TypeScript and TypeScript Worker. This includes every TypeScript
+profile: `node-sync`, libsql `node-async`, and `worker`. Empty or unrecognized
+values use the target default. An override never enables an unsupported shim.
+
+Spinel is default-on under the rollout policy. Lobsters statement counts favor
+binds with IN caching; a latency improvement over main is not established. CRuby binds improve
+nested reads, but repeated-query workloads lose SQL-only result replay and
+remain slower. JRuby has correctness coverage but lacks matched performance
+evidence. Both are opt-in until their workload measurements support a default
+change. Direct Ruby emitter APIs use the Ruby default; the Spinel-specific
+entry points use the Spinel default. Neither reads the environment; callers
+assembling a target resolve the override once.
+
+The override affects transpilation, not an already emitted server. It supports
+paired `=0`/`=1` measurements without changing the target capability. Compile-time
+literals, variable-arity IN lists, and writes keep their existing inline form.
+Ruby-family nullable equality selects its SQL shape at runtime: a present value
+uses `= ?` and reserves a bind slot; nil uses `IS NULL` without a slot. Inline
+mode uses `= value` / `IS NULL`. This preserves partial-index eligibility and
+LEFT JOIN reduction. At most seven nullable predicates may share cached bound
+shapes (128 combinations); larger combinations prepare transient statements.
+Variable-arity IN reads stay inline and cached by their complete SQL text, as
+on main. They do not opt into the nullable-shape overflow policy. Non-nullable columns
+keep `= ?`; nil passed to a typed integer bind remains SQL NULL, never zero.
+Enabling another target requires its selected driver/profile to implement
+`bind_int`, `bind_text`, `bind_bool`, and their `_opt` variants, with execution
+after binding and value serialization matching the inline writer.
+
+## Spinel statement-cache diagnostic
+
+Set `RH_STMT_STATS=1` before starting an emitted Spinel app to write cumulative
+per-connection summaries to stderr. A different nonempty value names a file to
+append to; unset, empty and `0` disable it. The destination and enabled flag are
+read once at boot. Changing the environment afterwards does not enable or disable
+the diagnostic. Disabled hooks are constant checks: no SQL tracking, counter
+updates, output, per-row work or diagnostic locking. Run diagnostics separately
+from timings.
+
+`Db.close` dumps after finalizing the pool. For an on-demand snapshot, stop request
+workers first and call `Db.dump_stmt_stats("phase")`; labels should contain no
+whitespace. Connection IDs are `shard:index`, local to the configured pool. A
+process that exits without closing its pool must explicitly request a snapshot.
+
+Each `RH_STMT_STATS` line reports:
+
+- `hits`, `misses` (successful native prepares), and `prepare_failures`.
+  Statement-cache hit rate is `hits / (hits + misses)`; replay hits do not reach
+  that cache. `misses` includes transient prepares and `transient_prepares` counts
+  that subset, including busy-hit readers and partial-replay promotions.
+- `entries`, `peak_entries`, and `distinct_sql` (distinct successfully
+  prepared SQL strings retained for that connection, including transient reads).
+  The connection keeps at most `STAT_SQL_CAP` (4096) of those strings.
+  `distinct_sql` is that retained count. `distinct_sql_capped=1` means further
+  distinct SQL was prepared and not stored, so the count is the cap rather than
+  the true total. Disabled diagnostics store nothing. SQL text and bind values
+  are not printed.
+- `trims` (boundaries exceeding CAP), `evictions` (cached statements dropped), and
+  `finalizations` (real SQLite finalizations, including transient release, failed
+  cleanup and pool close). Logical `Db.finalize` resets a cached statement and
+  does not count as a real finalization.
+- `qc_hits`, `qc_misses`, and `qc_bypasses` count request-replay decisions.
+  Bypasses include disabled request replay and SQL containing `?`. Bound reads
+  always execute against SQLite; SQL-only replay cannot distinguish bind values.
+- `executions`: SQLite `SQLITE_STMTSTATUS_RUN`, summed over live and finalized
+  cached and transient statements. It counts first native steps, including replay
+  promotions, rather than rows, prepares, replayed results or `Db.exec` writes.
+  The native counter is read only at snapshots or real finalization, including
+  before failed cleanup destroys a statement.
+
+Counters are cumulative; subtract snapshots to measure a phase. The native cache's
+128-entry cap is soft within a request, with least-recently-used trimming at lease
+boundaries after every outstanding cursor is released. Summing per-connection
+`distinct_sql` is not a count of globally unique SQL strings. A capped connection reports 4096, not the prepares it stopped storing. The diagnostic is
+implemented for compiled Spinel; CRuby and JRuby do not emit these summaries.
 
 ## Emitter ↔ runtime contract
 
@@ -3650,7 +3743,7 @@ table it prints, and the gaps in it:
 | global_ids, sgids.generate | 4/4, 5/5 | |
 | sgids.verify | 19/24 | |
 | app_verifiers.blob_id / envelope / data | 8/8, 3/3, 7/7 | fixed with this entry: the blob verifier signed with signed-id's envelope |
-| encrypted_cookies | 0/28 | not implemented |
+| encrypted_cookies.verify / generate | 20/20, 8/8 | `cookies.encrypted`; see "`cookies.encrypted` is Rails' encrypted cookie jar" below |
 | csrf | 0/208 | not implemented |
 | passwords | 0/45 | not held |
 
@@ -4094,6 +4187,49 @@ comparison, so there is one script.
    the first and split between them in the second — RSS alone would
    invent a penalty the clustered lane does not pay, PSS alone would
    break comparison with the single-process rows already measured.
+
+### `cookies.encrypted` is Rails' encrypted cookie jar - CLOSED (ours, 2026-10-15)
+
+**Was:** `ActionController::CookieJar` had `signed` and `permanent`
+views and no `encrypted`, so `cookies.encrypted[...]` was a
+NoMethodError, and the runtime had no AES-GCM.
+
+**Now (measured against Rails 8.1.4, `load_defaults 8.1`):**
+`cookies.encrypted` writes and reads
+`b64(ciphertext)--b64(iv)--b64(tag)`, AES-256-GCM with a 12-byte IV and
+no associated data, the key PBKDF2-HMAC-SHA256(secret_key_base,
+"authenticated encrypted cookie", 1000, 32), the plaintext the `_rails`
+envelope (purpose `cookie.<name>`) around the value as JSON, so a
+read answers the value with its type (a Hash with String keys, an
+Integer). `ActionController::MessageEncryptor` holds the format, over
+`MessageDigest.aes_256_gcm_encrypt` / `aes_256_gcm_decrypt` (OpenSSL on
+CRuby, spinel's `packages/openssl` on spinel).
+`tests/rails_compat_vectors.rb` holds the jar to campfire's 28 vectors
+(tampered parts, wrong name, rotated secret, Marshal value, the
+pre-5.2 cookie without metadata), CRuby and the spinel binary alike.
+
+**Left as they are, each stated where it lives:**
+
+- **Not read:** key rotation (`config.action_dispatch.cookies_rotations`),
+  the AES-256-CBC jar (`use_authenticated_cookie_encryption = false`),
+  overridden `authenticated_encrypted_cookie_salt` / `encrypted_cookie_cipher`
+  / `cookies_serializer` (`:marshal`, `:hybrid`), and the
+  `{"_rails":{"data":…}}` envelope no cookie jar writes. An app that
+  sets them gets the defaults here.
+- **`expires:` on a write is dropped:** `cookies.encrypted[:t] = {
+  value: x, expires: 1.hour }` sends no `Expires` and puts no `exp` in
+  the envelope, so the cookie reads for as long as the browser keeps
+  it. Rails records the expiry inside the encrypted envelope, so a
+  copied short-lived cookie stops reading server-side. Only
+  `.permanent` sets one. The signed jar has the same gap.
+- **The session cookie** is still the signed one (see "Not
+  implemented" in the vectors entry above): `cookies.encrypted[<session
+  key>]` reads nil in an emitted app until the session store writes
+  through this jar.
+- **Link cost (spinel):** AES-GCM comes from spinel's `packages/openssl`,
+  which `runtime/spinel/message_digest.rb` requires, so every spinel web
+  app now links libssl/libcrypto and a build host needs the OpenSSL
+  headers.
 
 ### Signed cookies interoperate with Rails — CLOSED (ours)
 
@@ -4960,3 +5096,14 @@ Found 2026-10-07 probing `request.format` on a from-scratch Rails API
 app under `--target spinel`; reproduces identically under `--target
 ruby`, since both lanes consume the same `controller_to_library`
 universal IR.
+
+### CSP no longer uses a no-header divergence
+
+Supported controller `frame_src` declarations now run as dispatcher callbacks
+on the Ruby target and produce response headers. Unsupported declarations keep
+located errors and survey gaps. Whole-route replacement does not hide those gaps.
+
+Canonical literal global policies and request-policy mutation concerns keep
+the Ruby-family runtime path used by cached Campfire pages.
+Header completion occurs after the final response status is known, including
+when an around callback returns a cached response without yielding.

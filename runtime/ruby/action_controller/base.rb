@@ -916,6 +916,11 @@ module ActionController
     # Location on another origin.
     def redirect_to(path, notice: nil, alert: nil, status: :found)
       loc = ActionController.sanitize_location(path)
+      # Rails' `_compute_redirect_to_location`: a path becomes the
+      # request's absolute URL. `head location:` does not come through
+      # here, so a 201 Location stays as the action wrote it. With no
+      # host in scope `url_from_path` returns the path unchanged.
+      loc = absolute_redirect_location(loc)
       loc = same_host_location(loc)
       @location = loc
       @status   = resolve_status(status)
@@ -953,6 +958,10 @@ module ActionController
     # outgoing response.
     def response
       self
+    end
+
+    def redirect?
+      @status == 301 || @status == 302 || @status == 303 || @status == 307 || @status == 308
     end
 
     # Rails' `self.response_body =` (campfire's MessagesController and
@@ -1047,6 +1056,13 @@ module ActionController
       @headers
     end
 
+    # `importmap.to_json(resolver: helpers)`. The map's paths are
+    # already resolved at ingest, so the resolver is accepted and
+    # unused. `self` is enough for the call to evaluate.
+    def helpers
+      self
+    end
+
     # `send_data data, type:, disposition:` — a binary response body
     # (lobsters streams avatar PNGs). Same buffering contract as
     # render. `disposition` is retained as a Content-Disposition
@@ -1108,6 +1124,14 @@ module ActionController
 
     def request_for_csrf
       nil
+    end
+
+    # A single-slash path (`/login`, not protocol-relative `//host`)
+    # joined to the request's protocol and host. Anything else — an
+    # absolute URL, `//host`, a path with no host to join — is unchanged.
+    def absolute_redirect_location(loc)
+      return loc unless loc.start_with?("/") && !loc.start_with?("//")
+      url_from_path(loc)
     end
 
     # Relative locations (`/path`, not `//host`) pass. An absolute URL

@@ -380,6 +380,17 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         }
     }
 
+    if let Ok(entries) = vfs.read_dir(&dir.join("config/environments")) {
+        let mut envs: Vec<String> = entries
+            .iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "rb"))
+            .filter(|p| vfs.read_to_string(p).is_ok_and(|text| sets_assume_ssl(&text)))
+            .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .collect();
+        envs.sort();
+        app.assume_ssl_envs = envs;
+    }
+
     let schema_path = dir.join("db/schema.rb");
     let structure_path = dir.join("db/structure.sql");
     if vfs.exists(&schema_path) {
@@ -567,7 +578,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             let outer = model.name.clone();
                             app.models.push(model);
                             if let Some(classes) =
-                                unwrap_or_record(ingest_nested_library_classes(&source, &path_str))?
+                                unwrap_or_record(ingest_nested_library_classes(&source, &path_str, outer.0.as_str()))?
                             {
                                 let nested = nested_under(&outer, classes);
                                 let (concern_items, concern_enum_decls, concern_guarded) =
@@ -684,13 +695,20 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     };
     let nested_app_roots: Vec<PathBuf> = roots.iter().skip(1).map(|root| dir.join(root)).collect();
     let mut support_seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let boot_required = boot_required_files(vfs, dir);
+    let mut support_batches: Vec<(String, PathBuf, Vec<PathBuf>)> = Vec::new();
     for sub in support_roots(vfs, dir, &roots, &path_gems, &lib_ignores) {
-        let sub = sub.as_str();
-        let support_dir = dir.join(sub);
+        let support_dir = dir.join(&sub);
         if !vfs.is_dir(&support_dir) {
             continue;
         }
         let Ok(entries) = read_rb_files(vfs, &support_dir) else { continue };
+        support_batches.push((sub, support_dir, entries));
+    }
+    // Last, so a file a support root already reached is ingested once.
+    support_batches.push((String::new(), dir.to_path_buf(), boot_required.clone()));
+    for (sub, support_dir, entries) in support_batches {
+        let sub = sub.as_str();
         for entry in entries {
             if sub == "lib" && ignored_lib_file(&entry) {
                 continue;
@@ -733,7 +751,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         // an alias naming one (an enum predicate, say)
                         // would hard-fail here and drop every genuinely
                         // nested class in the file too.
-                        if let Ok(classes) = ingest_nested_library_classes(&source, &path_str) {
+                        if let Ok(classes) = ingest_nested_library_classes(&source, &path_str, outer.0.as_str()) {
                             let nested = nested_under(&outer, classes);
                             let (concern_items, concern_enum_decls, concern_guarded) =
                                 ingest_concern_model_items_with_constants(
@@ -815,6 +833,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                     .is_some_and(|stem| stem.ends_with("_helper"));
                 match ingest_library_classes(&source, &path_str) {
                     Ok(classes) => {
+                        if is_helper_module {
+                            app.helper_modules.extend(classes.iter().map(|lc| lc.name.clone()));
+                        }
                         for lc in classes.iter().filter(|_| is_helper_module) {
                             // Rails resolves a helper's `include`d
                             // modules into the same view surface —
@@ -875,6 +896,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // not abort ingest.
     // Rails' ParamsWrapper default (see `App::wrap_parameters_by_default`).
     app.wrap_parameters_by_default = read_wrap_parameters_by_default(vfs, dir);
+    // The ActiveJob queue adapter (see `App::queue_adapter`).
+    app.queue_adapter = read_queue_adapter(vfs, dir);
+    // Where Sidekiq pushes (see `App::sidekiq_redis`).
+    app.sidekiq_redis = read_sidekiq_redis(vfs, dir);
     let app_config_path = dir.join("config/application.rb");
     if let Ok(source) = vfs.read(&app_config_path) {
         app.loaded_frameworks =
@@ -948,6 +973,23 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 )) {
                     methods.append(&mut synth);
                 }
+            }
+        }
+        // The canonical literal CSP initializer defines the per-request policy
+        // factory. Admission and the initializer ledger use the same AST reader.
+        if let Ok(init) = vfs.read(&dir.join("config/initializers/content_security_policy.rb")) {
+            if let Some(method) = content_security_policy_method(&String::from_utf8_lossy(&init)) {
+                let (parsed, diagnostics) = super::prism::scope(|| crate::runtime_src::parse_methods(&method));
+                if diagnostics.iter().any(|diagnostic| diagnostic.severity == crate::diagnostic::Severity::Error) {
+                    return Err(IngestError::Unsupported {
+                        file: "config/initializers/content_security_policy.rb".to_string(),
+                        message: "the generated content_security_policy factory does not parse".to_string(),
+                    });
+                }
+                methods.append(&mut parsed.map_err(|message| IngestError::Unsupported {
+                    file: "config/initializers/content_security_policy.rb".to_string(),
+                    message,
+                })?);
             }
         }
         // The forgery check's verification strategy (Rails main's
@@ -1559,6 +1601,13 @@ end
                 // it keeps the redirect out of every emitter's route kind.
                 if !routes.redirects.is_empty() {
                     app.controllers.push(synthesize_redirect_controller(&routes.redirects));
+                    // The inherited runtime calls this helper, outside app call-site inference.
+                    let signatures = crate::rbs::parse_app_signatures(
+                        "class RoundhouseRedirectsController\n  def same_host_location: (String location) -> String\n  def absolute_redirect_location: (String location) -> String\nend\n",
+                    ).expect("routing redirect policy signature parses");
+                    for (owner, methods) in signatures {
+                        app.rbs_signatures.entry(owner).or_default().extend(methods);
+                    }
                 }
                 app.routes = routes;
                 synthesize_rails_health_controller(&mut app);
@@ -1789,6 +1838,13 @@ end
                 &importmap_path.display().to_string(),
             ))? {
                 if !importmap.pins.is_empty() {
+                    if let Some(method) = importmap_json_method(&importmap.pins) {
+                        if let Some(rails_app) = app.rails_application.as_mut() {
+                            if let Ok(mut synth) = crate::runtime_src::parse_methods(&method) {
+                                rails_app.methods.append(&mut synth);
+                            }
+                        }
+                    }
                     app.importmap = Some(importmap);
                 }
             }
@@ -2028,6 +2084,8 @@ end
 
     enum_constants.validate_consumed_sources(&app, &sources, &enum_input_files)?;
     keep_initializer_defined(&mut app, dir, &sources, initializer_defined);
+    // `self.queue_adapter =` on ApplicationJob (see `App::queue_adapter`).
+    apply_application_job_queue_adapter(&mut app);
     // The ledger of boot statements no recognizer above read. A warning
     // per statement, in the ingest diagnostic channel; no `App` field.
     super::initializer_ledger::record(
@@ -2122,6 +2180,19 @@ end
     })?;
     // After it: a contract result's `to_monad` is a Result.
     super::dry_monads::lower_dry_monads(&mut app, &sources)?;
+    // Oj reads its mode from the initializers (`Oj.mimic_JSON`).
+    {
+        let init_dir = dir.join("config/initializers");
+        let mut initializers = Vec::new();
+        if vfs.is_dir(&init_dir) {
+            for entry in read_rb_files(vfs, &init_dir)? {
+                if let Ok(text) = vfs.read_to_string(&entry) {
+                    initializers.push(text);
+                }
+            }
+        }
+        super::oj::lower_oj(&mut app, &sources, &initializers)?;
+    }
     super::dry_initializer::drop_type_constants(&mut app, &sources);
     // graphql-ruby object types: analyzer-only field methods, so
     // inference carries each type's record class down the schema.
@@ -2145,6 +2216,9 @@ end
     // After the splice: `include Discard::Model` can arrive through a concern.
     super::discard::expand_discard_models(&mut app)?;
     super::model_macros::expand_model_macros(&mut app, &sources)?;
+    // After the concern-macro expansion: a concern's macros are that one's to expand or refuse.
+    super::class_macros::expand_class_macros(&mut app, &sources);
+    super::column_accessors::rewrite_super(&mut app);
     // After the splice, so a class method a concern contributed gets
     // the same treatment as one written in the model.
     qualify_model_class_method_ar_calls(&mut app);
@@ -2246,11 +2320,22 @@ end
     collect_binary_assets(vfs, dir, &mut app);
     let mut require_roots: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
     require_roots.extend(support_roots(vfs, dir, &roots, &path_gems, &lib_ignores));
+    require_roots.extend(
+        boot_required
+            .iter()
+            .filter_map(|file| file.strip_prefix(dir).ok())
+            .map(|file| file.display().to_string()),
+    );
     app.app_requires = collect_app_requires(vfs, dir, &require_roots);
     // Generated re-ingest labels never register real sources. No later
     // pass may append source-backed FileIds beyond the indexed snapshot.
     let late_sources = super::sources::drain();
     super::sources::assert_snapshot_matches(&[], &late_sources);
+    // Before analysis too, so `check` types the recount the emit writes (`Origin.reset_counters(id, :stories)`), rather than reporting a method the lowering answers.
+    crate::lower::reset_counters::apply_reset_counters_lowering(&mut app);
+    super::app_extension_calls::mark(&mut app);
+    super::unreachable_views::mark(&mut app);
+    super::uncalled_helper_copies::mark(&mut app);
     Ok(app)
 }
 
@@ -3634,6 +3719,7 @@ fn expr_calls_respond_with(expr: &crate::expr::Expr) -> bool {
     });
     found
 }
+
 
 /// A receiverless, blockless call left in a controller's class body
 /// after every consumer has run is a macro roundhouse does not
@@ -6956,6 +7042,80 @@ fn support_roots<V: Vfs + ?Sized>(
     out
 }
 
+/// Files `config/application.rb` and `config/environment.rb` load with a
+/// literal top-level `require_relative`, in file order.
+///
+/// Rails runs both files top to bottom before any initializer, so a
+/// constant defined in a file they load is defined for the whole process.
+/// An app that keeps boot-time settings in `config/site_settings.rb` and
+/// writes `require_relative "site_settings"` beside `require "rails/all"`
+/// has nothing in an autoload path, and no support root reached the file:
+/// every reference to its constants reported `constant not supported`
+/// (#1013).
+///
+/// `boot`, `application` and `environment` are the boot chain itself, not
+/// support code. A target must be an existing `.rb` file inside the app,
+/// reached without a symbolic link. A computed path, or one outside the
+/// app, is not followed; survey mode records it as a gap.
+fn boot_required_files<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Vec<PathBuf> {
+    let config_dir = dir.join("config");
+    let boot_chain = ["boot.rb", "application.rb", "environment.rb"].map(|name| config_dir.join(name));
+    let mut out = Vec::new();
+    for name in ["application.rb", "environment.rb"] {
+        let file = config_dir.join(name);
+        let Ok(source) = vfs.read(&file) else { continue };
+        let parsed = ruby_prism::parse(&source);
+        let Some(program) = parsed.node().as_program_node() else { continue };
+        for statement in program.statements().body().iter() {
+            let Some(call) = statement.as_call_node() else { continue };
+            if call.receiver().is_some()
+                || call.block().is_some()
+                || super::util::constant_id_str(&call.name()) != "require_relative"
+            {
+                continue;
+            }
+            let arguments: Vec<_> =
+                call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            let target = (arguments.len() == 1)
+                .then(|| super::util::string_value(&arguments[0]))
+                .flatten()
+                .and_then(|request| normalize_engine_library_require(dir, &config_dir, &request))
+                .map(|mut target| {
+                    if target.extension().is_none() {
+                        target.set_extension("rb");
+                    }
+                    target
+                });
+            match target {
+                Some(target) if boot_chain.contains(&target) => {}
+                Some(target)
+                    if target.extension().is_some_and(|e| e == "rb")
+                        && vfs.exists(&target)
+                        && !vfs.is_dir(&target)
+                        && !path_has_symlink_component(vfs, dir, &target) =>
+                {
+                    if !out.contains(&target) {
+                        out.push(target);
+                    }
+                }
+                _ => {
+                    if survey::is_active() {
+                        let location = statement.location();
+                        let text = String::from_utf8_lossy(location.as_slice());
+                        survey::record(&super::IngestError::Unsupported {
+                            file: file.display().to_string(),
+                            message: format!(
+                                "require_relative not followed (not a literal path to a Ruby file inside the app): `{text}`"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// App-layer roots for one Rails app: `app` first, then one
 /// `<pkg>/app` per Packwerk package that has an `app/` directory and
 /// one `<engine>/app` per in-repo Rails engine — sorted (after `app`)
@@ -8088,7 +8248,7 @@ fn synthesize_redirect_controller(
     use crate::expr::{Expr, ExprNode, Literal};
     use crate::span::Span;
 
-    let body = redirects
+    let mut body: Vec<_> = redirects
         .iter()
         .map(|redirect| {
             // Built from Ruby source so the action body is ingested the
@@ -8184,6 +8344,16 @@ fn synthesize_redirect_controller(
             }
         })
         .collect();
+
+    // Routing redirects do not use ActionController's open-redirect policy.
+    // Keep the exception on this controller instead of weakening redirect_to.
+    let policy = super::controller::ingest_controller(
+        b"class RoundhouseRedirectsController < ActionController::Base\nprivate\ndef same_host_location(location)\n  location\nend\ndef absolute_redirect_location(location)\n  location\nend\nend\n",
+        "<routing-redirect>",
+    )
+    .expect("routing redirect policy parses")
+    .expect("routing redirect policy is a controller");
+    body.extend(policy.body);
 
     crate::dialect::Controller {
         name: crate::ident::ClassId(Symbol::from(super::routes::REDIRECT_CONTROLLER)),
@@ -9070,6 +9240,53 @@ fn extract_app_namespace(source: &[u8]) -> Option<String> {
     None
 }
 
+/// The complete literal policy subset accepted by canonical initializer admission.
+pub(super) fn content_security_policy_method(source: &str) -> Option<String> {
+    super::content_security_policy_config::global_policy_method(source)
+}
+
+/// Pretty `{"imports":{…}}` for `Rails.application.importmap_json`.
+///
+/// The bytes are the script body `javascript_importmap_tags` embeds
+/// (`action_view/view_helpers.rb`: 2-space indent, one pin per line,
+/// `": "` between name and path). Campfire hashes that body into
+/// `script-src`. A compact encoding is a different hash, and the
+/// browser then blocks the page's own import map. Pin paths are
+/// already `/assets/…` from importmap ingest, in the same order
+/// `Importmap.pins` emits.
+pub(super) fn importmap_json_method(pins: &[crate::app::ImportmapPin]) -> Option<String> {
+    if pins.is_empty() {
+        return None;
+    }
+    let mut json = String::from("{\n  \"imports\": {\n");
+    for (i, pin) in pins.iter().enumerate() {
+        if i > 0 {
+            json.push_str(",\n");
+        }
+        json.push_str("    \"");
+        json.push_str(&json_escape(&pin.name));
+        json.push_str("\": \"");
+        json.push_str(&json_escape(&pin.path));
+        json.push('"');
+    }
+    json.push_str("\n  }\n}");
+    Some(format!("def importmap_json\n  {json:?}\nend\n"))
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 pub(super) fn extract_session_cookie_key(source: &[u8]) -> Option<String> {
     let source = String::from_utf8_lossy(source);
     let mut seen_session_store = false;
@@ -9764,6 +9981,283 @@ fn read_wrap_parameters_by_default<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool
         }
     }
     default
+}
+
+/// The adapter a trimmed, non-comment config line sets
+/// `config.active_job.queue_adapter` to, as a name: `= :sidekiq` and
+/// `= "sidekiq"` both give `"sidekiq"`. `Some(None)` when the line sets
+/// it to something that isn't a literal (`ENV.fetch(...)`), `None` when
+/// the line doesn't set it. One definition for the lift and the
+/// initializer ledger.
+pub(super) fn queue_adapter_line(line: &str) -> Option<Option<String>> {
+    let rest = line
+        .strip_prefix("Rails.application.config.active_job.queue_adapter")
+        .or_else(|| line.strip_prefix("config.active_job.queue_adapter"))?;
+    // An assignment, not the `==` or `=~` operators or a rightward
+    // assignment (`=> name`), which reads the setting.
+    let value = rest.trim_start().strip_prefix('=')?;
+    if value.starts_with(['=', '~', '>']) {
+        return None;
+    }
+    let value = value.trim();
+    // Drop a trailing comment, with or without a space before its `#`,
+    // but not a `#` inside a quoted value.
+    let value = match value.chars().next() {
+        Some(q @ ('"' | '\'')) => match value[1..].find(q) {
+            Some(at) => {
+                let (quoted, after) = value.split_at(at + 2);
+                let after = after.trim_start();
+                if !after.is_empty() && !after.starts_with('#') {
+                    return Some(None);
+                }
+                quoted
+            }
+            None => value,
+        },
+        _ => match value.find('#') {
+            Some(at) => value[..at].trim(),
+            None => value,
+        },
+    };
+    let name = if let Some(sym) = value.strip_prefix(':') {
+        sym
+    } else if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        return Some(None);
+    };
+    let literal = !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    Some(literal.then(|| name.to_string()))
+}
+
+/// `App::queue_adapter`: `config/application.rb`, then
+/// `config/environments/production.rb`, then `config/initializers`, by
+/// line scan as `read_forgery_verification_strategy` reads them. The
+/// last setting wins, and a last setting that isn't a literal leaves the
+/// adapter unknown (`None`) rather than falling back to an earlier one.
+fn read_queue_adapter<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Option<String> {
+    let mut adapter: Option<String> = None;
+    for sub in ["config/application.rb", "config/environments/production.rb", "config/initializers"] {
+        let path = dir.join(sub);
+        let paths = if vfs.is_dir(&path) {
+            read_rb_files(vfs, &path).unwrap_or_default()
+        } else {
+            vec![path]
+        };
+        for p in paths {
+            let Ok(source) = vfs.read(&p) else { continue };
+            for line in String::from_utf8_lossy(&source).lines() {
+                let line = line.trim();
+                if line.starts_with('#') {
+                    continue;
+                }
+                if let Some(set) = queue_adapter_line(line) {
+                    adapter = set;
+                }
+            }
+        }
+    }
+    adapter
+}
+
+/// `self.queue_adapter = :name` in `ApplicationJob`'s class body. Rails
+/// keeps the adapter per job class, and ApplicationJob's covers every
+/// job that inherits it, so it overrides the config files' setting, the
+/// last assignment winning, and a value that isn't a literal leaves the
+/// adapter unknown, as in `read_queue_adapter`. Another job class's own
+/// setting is not honored yet: its jobs follow the app's adapter, with a
+/// warning.
+fn apply_application_job_queue_adapter(app: &mut App) {
+    let mut set: Option<Option<String>> = None;
+    for lc in &app.library_classes {
+        let name = lc.name.0.as_str();
+        for call in &lc.unknown_calls {
+            let Some(value) = job_queue_adapter(call) else { continue };
+            if name == "ApplicationJob" {
+                set = Some(value);
+            } else {
+                warn_sidekiq(format!(
+                    "`self.queue_adapter =` in {name} is not honored yet (only ApplicationJob's is read); its jobs use the app's adapter"
+                ));
+            }
+        }
+    }
+    if let Some(value) = set {
+        app.queue_adapter = value;
+    }
+}
+
+/// The adapter a job class-body `self.queue_adapter = …` names: the
+/// literal's name, `Some(None)` for a value that isn't a Symbol or
+/// String literal, `None` for any other call.
+fn job_queue_adapter(call: &crate::expr::Expr) -> Option<Option<String>> {
+    use crate::expr::{ExprNode, Literal};
+    let ExprNode::Send { method, args, .. } = &*call.node else { return None };
+    if method.as_str() != "queue_adapter=" || args.len() != 1 {
+        return None;
+    }
+    Some(match &*args[0].node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        _ => None,
+    })
+}
+
+/// `App::sidekiq_redis`: the `Sidekiq.configure_client` Redis settings
+/// in `config/initializers`, the last block that sets them winning, as it
+/// does when Rails runs the initializers in order.
+fn read_sidekiq_redis<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::app::SidekiqRedisConfig {
+    let mut config = crate::app::SidekiqRedisConfig::default();
+    let init = dir.join("config/initializers");
+    if !vfs.is_dir(&init) {
+        return config;
+    }
+    for path in read_rb_files(vfs, &init).unwrap_or_default() {
+        let Ok(source) = vfs.read(&path) else { continue };
+        if let Some(found) = sidekiq_client_redis(&source, &path.display().to_string()) {
+            config = found;
+        }
+    }
+    config
+}
+
+/// The `url:` and `password:` a file's `Sidekiq.configure_client do
+/// |config| config.redis = { … } end` gives, `None` when the file has no
+/// such assignment. Only those two keys are read, each as a String
+/// literal, `ENV["NAME"]` or `ENV.fetch("NAME"[, "default"])`. Any other
+/// key, a value in another form, or a `config.redis =` that isn't a Hash
+/// literal is a warning: the push then takes that setting from the
+/// environment fallbacks, or not at all.
+pub(super) fn sidekiq_client_redis(source: &[u8], file: &str) -> Option<crate::app::SidekiqRedisConfig> {
+    let src = String::from_utf8_lossy(source);
+    // Cheap skip before parsing, as `kaminari_default_per_page` does.
+    if !src.contains("configure_client") {
+        return None;
+    }
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let program = root.as_program_node()?;
+    let text = |node: &Node<'_>| {
+        let loc = node.location();
+        src[loc.start_offset()..loc.end_offset()].to_string()
+    };
+    let mut found = None;
+    for stmt in initializer_statements(&program) {
+        let Some(call) = stmt.as_call_node() else { continue };
+        if super::util::constant_id_str(&call.name()) != "configure_client" {
+            continue;
+        }
+        let Some(recv) = call.receiver() else { continue };
+        if !matches!(constant_text(&recv, &src).as_deref(), Some("Sidekiq" | "::Sidekiq")) {
+            continue;
+        }
+        let Some(block) = call.block().and_then(|b| b.as_block_node()) else { continue };
+        let Some(param) = block
+            .parameters()
+            .and_then(|p| p.as_block_parameters_node())
+            .and_then(|p| p.parameters())
+            .and_then(|p| p.requireds().iter().next())
+            .and_then(|p| p.as_required_parameter_node())
+        else {
+            continue;
+        };
+        let param = super::util::constant_id_str(&param.name());
+        let Some(body) = block.body().and_then(|b| b.as_statements_node()) else { continue };
+        for inner in body.body().iter() {
+            let Some(assign) = inner.as_call_node() else { continue };
+            if super::util::constant_id_str(&assign.name()) != "redis=" {
+                continue;
+            }
+            let on_param = assign
+                .receiver()
+                .and_then(|r| r.as_local_variable_read_node())
+                .is_some_and(|r| super::util::constant_id_str(&r.name()) == param);
+            if !on_param {
+                continue;
+            }
+            let Some(args) = assign.arguments() else { continue };
+            let args: Vec<_> = args.arguments().iter().collect();
+            let [value] = args.as_slice() else { continue };
+            let mut config = crate::app::SidekiqRedisConfig::default();
+            let Some(hash) = value.as_hash_node() else {
+                warn_sidekiq(format!(
+                    "`{param}.redis = {}` in {file} is not a Hash literal, so it is not read; jobs are pushed to REDIS_PROVIDER, REDIS_URL or localhost",
+                    text(value)
+                ));
+                found = Some(config);
+                continue;
+            };
+            for element in hash.elements().iter() {
+                let Some(pair) = element.as_assoc_node() else {
+                    warn_sidekiq(format!("`{}` in {file}'s Sidekiq Redis settings is not read", text(&element)));
+                    continue;
+                };
+                let Some(key) = super::util::symbol_value(&pair.key()) else {
+                    warn_sidekiq(format!("`{}` in {file}'s Sidekiq Redis settings is not read", text(&element)));
+                    continue;
+                };
+                if key != "url" && key != "password" {
+                    warn_sidekiq(format!(
+                        "Sidekiq Redis setting `{key}:` in {file} is not supported yet (only url: and password: are read); it is ignored"
+                    ));
+                    continue;
+                }
+                let value = pair.value();
+                let Some(setting) = redis_setting(&value, &src) else {
+                    warn_sidekiq(format!(
+                        "Sidekiq Redis `{key}: {}` in {file} is not a String literal, ENV[\"NAME\"] or ENV.fetch(\"NAME\"); it is ignored",
+                        text(&value)
+                    ));
+                    continue;
+                };
+                if key == "url" {
+                    config.url = Some(setting);
+                } else {
+                    config.password = Some(setting);
+                }
+            }
+            found = Some(config);
+        }
+    }
+    found
+}
+
+/// A Redis setting's value as `RedisSetting` reads it.
+fn redis_setting(node: &Node<'_>, src: &str) -> Option<crate::app::RedisSetting> {
+    use crate::app::RedisSetting;
+    if let Some(literal) = string_literal_value(node) {
+        return Some(RedisSetting::Literal(literal));
+    }
+    let call = node.as_call_node()?;
+    let recv = call.receiver()?;
+    if !matches!(constant_text(&recv, src).as_deref(), Some("ENV" | "::ENV")) {
+        return None;
+    }
+    if call.block().is_some() {
+        return None;
+    }
+    let args: Vec<_> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let strings: Option<Vec<String>> = args.iter().map(string_literal_value).collect();
+    let strings = strings?;
+    match (super::util::constant_id_str(&call.name()), strings.as_slice()) {
+        ("[]", [name]) => Some(RedisSetting::Env(name.clone())),
+        ("fetch", [name]) => Some(RedisSetting::EnvFetch { name: name.clone(), default: None }),
+        ("fetch", [name, default]) => {
+            Some(RedisSetting::EnvFetch { name: name.clone(), default: Some(default.clone()) })
+        }
+        _ => None,
+    }
+}
+
+/// A warning about what ingest reads from the app's Sidekiq settings.
+fn warn_sidekiq(detail: String) {
+    let mut d = crate::diagnostic::Diagnostic::unsupported(crate::span::Span::synthetic(), None, "Sidekiq", detail);
+    d.severity = crate::diagnostic::Severity::Warning;
+    super::prism::push(d);
 }
 
 /// What a trimmed, non-comment config line sets the app-wide
@@ -10558,6 +11052,19 @@ fn locale_literal(value: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// `config.assume_ssl = true` on an uncommented line of an environment
+/// file. A trailing `#` comment after the value is Ruby, so it is cut
+/// before the comparison; a line that is itself a comment is not.
+pub(crate) fn sets_assume_ssl(text: &str) -> bool {
+    text.lines().any(|line| {
+        let t = line.trim();
+        t.strip_prefix("config.assume_ssl")
+            .map(|rest| rest.trim_start())
+            .and_then(|rest| rest.strip_prefix('='))
+            .is_some_and(|rest| rest.split('#').next().unwrap_or("").trim() == "true")
+    })
+}
+
 #[cfg(test)]
 mod locale_tests {
     use super::locale_literal;
@@ -10569,5 +11076,28 @@ mod locale_tests {
         assert_eq!(locale_literal("\"fr#CA\" # comment").as_deref(), Some("fr#CA"));
         assert_eq!(locale_literal("'ja'").as_deref(), Some("ja"));
         assert_eq!(locale_literal("ENV[\"LOCALE\"]"), None);
+    }
+}
+
+#[cfg(test)]
+mod importmap_json_tests {
+    use super::importmap_json_method;
+    use crate::app::ImportmapPin;
+
+    #[test]
+    fn importmap_json_is_the_pretty_script_body() {
+        let pins = vec![
+            ImportmapPin { name: "application".into(), path: "/assets/application.js".into() },
+            ImportmapPin {
+                name: "@hotwired/turbo-rails".into(),
+                path: "/assets/turbo.js".into(),
+            },
+        ];
+        let method = importmap_json_method(&pins).expect("pins");
+        let json = "{\n  \"imports\": {\n    \"application\": \"/assets/application.js\",\n    \"@hotwired/turbo-rails\": \"/assets/turbo.js\"\n  }\n}";
+        assert!(
+            method.contains(&format!("{json:?}")),
+            "CSP hashes this string; it has to be the importmap script body:\n{method}"
+        );
     }
 }

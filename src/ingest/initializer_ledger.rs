@@ -353,6 +353,24 @@ const RECOGNIZERS: &[Recognizer] = &[
         levels: ANY,
         reads: |p| code_lines(p.text).any(|l| raise_on_missing_line(l).is_some()),
     },
+    Recognizer {
+        name: "oj (Oj.mimic_JSON / Oj.optimize_rails: ingest/oj reads the mode)",
+        origins: INIT,
+        levels: ANY,
+        reads: |p| {
+            code_lines(p.text).any(|l| {
+                let l = l.trim_start_matches("::");
+                l == "Oj.mimic_JSON" || l.starts_with("Oj.mimic_JSON(") || l == "Oj.optimize_rails"
+            })
+        },
+    },
+    Recognizer {
+        name: "content_security_policy (config.content_security_policy do |policy|)",
+        origins: INIT,
+        levels: ANY,
+        reads: |p| p.file_name == "content_security_policy.rb"
+            && super::app::content_security_policy_method(p.src).is_some(),
+    },
 ];
 
 /// Names of every recognizer the ledger consults, for the docs and tests.

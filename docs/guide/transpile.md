@@ -74,10 +74,16 @@ remove the directive. A `false` declaration clears the policy after its block ru
 
 Either manual CSP response header prevents automatic policy building.
 A final `304` response gets no automatic CSP header.
-Global policies, nonce settings, report-only declarations, directive-level
-Proc sources, and concern or custom macro declarations remain unsupported.
-Unsupported declarations report errors without survey mode.
-Other targets refuse these declarations; shared runtime files do not prove support.
+Nonce settings, report-only declarations, directive-level Proc sources, and
+custom macro declarations remain unsupported. Other targets refuse the
+controller `frame_src` declaration profile.
+
+The existing Ruby-family global-policy path remains available for complete
+literal policies in `config/initializers/content_security_policy.rb`.
+It supports source-list directives and the `DISABLE_CONTENT_SECURITY_POLICY`
+environment guard. Cached-page concerns can edit `policy.directives` and
+`worker_src`; those callbacks use the same request ownership and final writer.
+Other global forms and concern declarations report located errors.
 See [the implementation record](../content-security-policy-plan.md).
 
 ### Date-only values

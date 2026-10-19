@@ -462,9 +462,12 @@ pub(in crate::analyze) fn register(
     }
     app_ctrl.class_methods.insert(Symbol::from("logger"), Ty::Untyped);
     // `cookies` is the cookie jar: string values in and out,
-    // `signed`/`permanent`/`encrypted` are the same jar with a codec
-    // (so `cookies.signed.permanent[:session_id] = …` chains), and
-    // `delete` answers the removed value.
+    // `signed`/`permanent` are the same jar with a codec (so
+    // `cookies.signed.permanent[:session_id] = …` chains), and `delete`
+    // answers the removed value. `encrypted` is the exception: its
+    // values are JSON (`cookies_serializer :json`), so a read answers
+    // whatever the cookie holds, the session's Hash included
+    // (runtime/ruby/action_controller/cookies.rb, `EncryptedCookieJar`).
     {
         let jar_id = ClassId(Symbol::from("ActionDispatch::Cookies::CookieJar"));
         let jar_ty = Ty::Class { id: jar_id.clone(), args: vec![].into() };
@@ -476,9 +479,18 @@ pub(in crate::analyze) fn register(
         // `[]=` takes a String or an options Hash; answers what it was
         // given, which callers never read.
         jar.instance_methods.insert(Symbol::from("[]="), Ty::Nil);
-        for m in ["signed", "permanent", "encrypted", "signed_or_encrypted"] {
+        for m in ["signed", "permanent", "signed_or_encrypted"] {
             jar.instance_methods.insert(Symbol::from(m), jar_ty.clone());
         }
+        let encrypted_id = ClassId(Symbol::from("ActionDispatch::Cookies::EncryptedCookieJar"));
+        let encrypted_ty = Ty::Class { id: encrypted_id.clone(), args: vec![].into() };
+        jar.instance_methods.insert(Symbol::from("encrypted"), encrypted_ty.clone());
+        let mut encrypted = ClassInfo::default();
+        encrypted.instance_methods.insert(Symbol::from("[]"), Ty::Untyped);
+        encrypted.instance_methods.insert(Symbol::from("[]="), Ty::Nil);
+        encrypted.instance_methods.insert(Symbol::from("delete"), str_or_nil());
+        encrypted.instance_methods.insert(Symbol::from("permanent"), encrypted_ty);
+        classes.insert(encrypted_id, encrypted);
         for m in ["key?", "has_key?", "include?"] {
             jar.instance_methods.insert(Symbol::from(m), Ty::Bool);
         }
@@ -677,7 +689,7 @@ fn register_content_security_policy(
     classes: &mut HashMap<ClassId, ClassInfo>,
     app_ctrl: &mut ClassInfo,
 ) {
-    // The typed policy value. `policy.frame_src(...)` / `.copy` / `.build`
+    // The typed policy value. `policy.frame_src(...)` / `.dup` / `.build`
     // dispatch on the policy INSTANCE, so its signatures land instance-side.
     {
         const RBS: &str =

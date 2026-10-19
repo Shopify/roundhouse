@@ -6,9 +6,11 @@
 # Rails' `ActiveSupport::Testing::ConstantStubbing#stub_const`, as Rails
 # writes it: the constant is REPLACED for the block and put back after,
 # so code that reads it at call time (`Message::Pagination::PAGE_SIZE`,
-# `Opengraph::Fetch::TIMEOUT`) sees the stub. A compiled tree resolves
-# constants at build time and has no `const_set`; there the helper is
-# absent and the call fails as the gap it is.
+# `Opengraph::Fetch::TIMEOUT`) sees the stub. Most sites never reach
+# this: `lower::stub_const` rewrites them to a value stack every target
+# shares. What is left is a stub that changes the constant's type, or
+# one read reflectively (`const_get`) — here the real helper answers
+# them; the spinel harness's fails the test saying why.
 class TestBase
   def stub_const(mod, constant, new_value)
     old_value = mod.const_get(constant, false)
@@ -28,6 +30,8 @@ end
 # Nokogiri; the shared harness's `Dom` is a scanner that matches a
 # selector's LAST compound and keeps no per-element attributes, so a
 # descendant selector read from it would answer for the whole page.
+# A spinel tree that carries spinel-nokogiri gets the same helper
+# (`project::SPINEL_CSS_SELECT`).
 require "nokogiri"
 
 # rails-dom-testing parses with HTML5 where Nokogiri has the parser and
@@ -53,8 +57,9 @@ module ActionCable
         else
           Broadcasts.log.select { |entry| entry[:stream] == stream }
         end
-      # The CRuby tree logs the Hash it publishes, the spinel tree the
-      # JSON text; both compare after the same round trip.
+      # The CRuby tree logs the Hash it publishes; the shared harness's
+      # version, which this replaces, reads the spinel tree's JSON text.
+      # Both compare after the same round trip.
       wire = ->(value) { ::JSON.parse(value.is_a?(String) ? value : ::JSON.generate(value)) }
       want = wire.(data)
       payloads = entries.map { |entry| entry[:payload] }.compact

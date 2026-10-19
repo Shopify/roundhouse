@@ -1,8 +1,6 @@
 # frozen_string_literal: true
-# Controller policy support for frame-src at Rails commit
-# 3a4961048ad251b50991ae83135d760a8a9e8ae3. Other directives, global policies,
-# nonces, report-only mode, and Proc sources remain unsupported.
-# Validate strings during build, not assignment.
+# Shared policy storage for global literal policies, cached script hashes, and
+# controller frame-src callbacks. Validate strings only when building a header.
 module ActionDispatch
   class ContentSecurityPolicy
     # Rails validates source strings only when it builds the header.
@@ -36,16 +34,34 @@ module ActionDispatch
 
     # Replace sources, or remove the directive when the first source is falsy.
     def frame_src(*sources)
-      result = if sources.first
-        @directives["frame-src"] = apply_mappings(sources)
-      else
-        @directives.delete("frame-src")
-      end
-      result
+      set_sources("frame-src", sources)
+    end
+
+    def directives
+      self
+    end
+
+    def [](name)
+      @directives[name]
+    end
+
+    def []=(name, sources)
+      @directives[name] = sources
+      nil
+    end
+
+    def set_directive(name, sources)
+      set_sources(name, sources)
+      nil
+    end
+
+    def worker_src(source)
+      set_sources("worker-src", [source])
+      nil
     end
 
     # Each callback gets its own mutable source arrays and strings.
-    def copy
+    def dup
       other = ActionDispatch::ContentSecurityPolicy.new
       other.replace_directives(@directives)
       other
@@ -60,7 +76,7 @@ module ActionDispatch
       parts.join("; ")
     end
 
-    # Used by copy on the new policy instance.
+    # Used by dup on the new policy instance.
     def replace_directives(source_directives)
       source_directives.each do |directive, sources|
         @directives[directive] = sources.map { |source| source.dup }
@@ -69,6 +85,15 @@ module ActionDispatch
     end
 
     private
+      def set_sources(name, sources)
+        result = if sources.first
+          @directives[name] = apply_mappings(sources)
+        else
+          @directives.delete(name)
+        end
+        result
+      end
+
       def apply_mappings(sources)
         sources.map do |source|
           if source.is_a?(Symbol)

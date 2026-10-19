@@ -39,6 +39,7 @@ module ActionDispatch
     @session_options: Hash[Symbol, bool]
     @params: Hash[String, untyped]
     @content_security_policy: ActionDispatch::ContentSecurityPolicy?
+    @csp_ready: bool
 
     def remote_ip: () -> String
     def remote_ip=: (String) -> String
@@ -54,6 +55,10 @@ module ActionDispatch
     def referer=: (String) -> String
     def host: () -> String
     def host=: (String) -> String
+    def raw_host_with_port: () -> String
+    def forwarded_authority: () -> String
+    def trusted_forwarded_peer?: () -> bool
+    def host_authority?: (String value) -> bool
     def format: () -> String
     def format=: (untyped value) -> untyped
     def body: () -> RequestBody
@@ -81,7 +86,9 @@ module ActionDispatch
     def ssl?: () -> bool
     def protocol: () -> String
     def optional_port: () -> Integer?
+    def port: () -> Integer
     def base_url: () -> String
+    def host_with_port: () -> String
     def original_url: () -> String
     def url: () -> String
     def referrer: () -> String

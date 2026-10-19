@@ -29,8 +29,8 @@ pub use visitor::{ArelVisitor, SqliteVisitor};
 use std::collections::HashMap;
 
 use crate::analyze::ClassInfo;
-use crate::expr::{Expr, ExprNode, InterpPart};
-use crate::ident::{ClassId, Symbol};
+use crate::expr::{Expr, ExprNode, InterpPart, LValue};
+use crate::ident::{ClassId, Symbol, VarId};
 use crate::schema::Schema;
 use crate::ty::Ty;
 
@@ -65,7 +65,7 @@ pub fn rewrite_arel_in_expr_with_assocs(
     assocs: &[crate::lower::model_associations::AssociationEdge],
 ) -> bool {
     let no_scopes = std::collections::HashSet::new();
-    rewrite_arel_in_expr_with_ruby_values(expr, schema, registry, assocs, false, &no_scopes)
+    rewrite_arel_in_expr_with_ruby_values(expr, schema, registry, assocs, false, &no_scopes, SqliteVisitor::default())
 }
 
 /// Ruby-family values preserve SQL NULL without changing strict-target emit.
@@ -80,6 +80,7 @@ pub(crate) fn rewrite_arel_in_expr_with_ruby_values(
     assocs: &[crate::lower::model_associations::AssociationEdge],
     ruby_read_values: bool,
     scopes: &std::collections::HashSet<crate::ident::Symbol>,
+    visitor: SqliteVisitor,
 ) -> bool {
     // Names (ivars/locals) the body later refines with relation-chain
     // methods (`@moderations.where(...)` after `@moderations =
@@ -88,7 +89,8 @@ pub(crate) fn rewrite_arel_in_expr_with_ruby_values(
     // runtime Relation path.
     let mut refined = RefinedNames::default();
     collect_relation_refined_names(expr, scopes, &mut refined);
-    let mut changed = rewrite_arel_inner(expr, schema, registry, assocs, &refined, ruby_read_values, scopes);
+    HOIST_TEMPORARIES.with(|c| c.set(0));
+    let mut changed = rewrite_arel_inner(expr, schema, registry, assocs, &refined, ruby_read_values, scopes, visitor);
     // Both call sites hand us a METHOD BODY, and a body that is a
     // single statement is not a `Seq` — so the hoist post-pass inside
     // `rewrite_arel_inner`, which walks a Seq's statement list, had no
@@ -121,11 +123,12 @@ pub(crate) fn rewrite_arel_in_expr_with_ruby_values(
     changed
 }
 
-const RELATION_REFINERS: &[&str] = &[
-    "where", "not", "joins", "left_outer_joins", "left_joins", "order", "group", "having",
-    "limit", "offset", "merge", "includes", "preload", "eager_load", "references", "distinct",
-    "select", "where!", "order!", "reorder", "rewhere",
-];
+/// A catalog Builder (any receiver) or a [`crate::catalog::BUILDER_ALIASES`]
+/// spelling. Hydrating the receiver of one of these to an Array strands
+/// the call. Same set as [`crate::lower::scope_chain::is_relation_chain_method`].
+pub(crate) fn is_relation_refiner(method: &str) -> bool {
+    crate::catalog::is_relation_builder_name(method)
+}
 
 /// A finder terminates a relation but still needs that relation as its
 /// receiver. If the whole call cannot lift, hydrating only its receiver
@@ -134,7 +137,7 @@ const RELATION_REFINERS: &[&str] = &[
 /// Rails' per-column dynamic finders (`find_by_id`, `find_by_email!`, …)
 /// are the same shape as `find_by` and need the same treatment (#558).
 fn requires_relation_receiver(method: &str) -> bool {
-    RELATION_REFINERS.contains(&method)
+    is_relation_refiner(method)
         || matches!(method, "find_by" | "find_by!" | "sole" | "find_sole_by")
         // Not a lifted SELECT: Array answers none of the bulk writes, so the hydrated rows would raise NoMethodError.
         || matches!(method, "delete_all" | "update_all" | "destroy_all" | "touch_all")
@@ -406,6 +409,7 @@ fn rewrite_arel_inner(
     refined: &RefinedNames,
     ruby_read_values: bool,
     scopes: &std::collections::HashSet<crate::ident::Symbol>,
+    visitor: SqliteVisitor,
 ) -> bool {
     if let ExprNode::Assign { target, value } = expr.node.as_ref() {
         let name = match target {
@@ -424,7 +428,7 @@ fn rewrite_arel_inner(
             if ruby_read_values {
                 ruby_values::normalize(&mut op, schema);
             }
-            let mut replacement = SqliteVisitor.visit(&op, schema, &owner);
+            let mut replacement = visitor.visit(&op, schema, &owner);
             // The expansion replaces the recognized chain wholesale;
             // its provenance is the chain call site. Subtrees the
             // builder lifted out of the chain (predicate values, …)
@@ -460,15 +464,15 @@ fn rewrite_arel_inner(
         let ExprNode::Send { recv: Some(recv), args, .. } = &mut *expr.node else {
             unreachable!("matched Send with recv above");
         };
-        changed |= rewrite_arel_spine_args(recv, schema, registry, assocs, refined, ruby_read_values, scopes);
+        changed |= rewrite_arel_spine_args(recv, schema, registry, assocs, refined, ruby_read_values, scopes, visitor);
         for a in args {
-            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, scopes);
+            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, scopes, visitor);
         }
         return changed;
     }
     let mut changed = false;
     walk_subexprs_mut(expr, &mut |e| {
-        changed |= rewrite_arel_inner(e, schema, registry, assocs, refined, ruby_read_values, scopes)
+        changed |= rewrite_arel_inner(e, schema, registry, assocs, refined, ruby_read_values, scopes, visitor)
     });
     // Post-pass: when an Arel rewrite landed a multi-stmt hydrate Seq
     // in a *value* position — directly as an Assign value
@@ -502,17 +506,18 @@ fn rewrite_arel_spine_args(
     refined: &RefinedNames,
     ruby_read_values: bool,
     scopes: &std::collections::HashSet<crate::ident::Symbol>,
+    visitor: SqliteVisitor,
 ) -> bool {
     let mut changed = false;
     if let ExprNode::Send { recv, args, block, .. } = &mut *expr.node {
         if let Some(r) = recv {
-            changed |= rewrite_arel_spine_args(r, schema, registry, assocs, refined, ruby_read_values, scopes);
+            changed |= rewrite_arel_spine_args(r, schema, registry, assocs, refined, ruby_read_values, scopes, visitor);
         }
         for a in args {
-            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, scopes);
+            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, scopes, visitor);
         }
         if let Some(b) = block {
-            changed |= rewrite_arel_inner(b, schema, registry, assocs, refined, ruby_read_values, scopes);
+            changed |= rewrite_arel_inner(b, schema, registry, assocs, refined, ruby_read_values, scopes, visitor);
         }
     }
     changed
@@ -550,58 +555,75 @@ fn hoist_value_seqs_in_stmts(stmts: &mut Vec<Expr>) -> bool {
 /// context children (block bodies, if/while branches, nested stmt Seqs)
 /// are NOT descended — their own enclosing Seq's post-pass handles them.
 ///
+/// Left to right, as Ruby evaluates them: a value evaluated before a
+/// hoisted Seq is bound to a temporary ahead of the Seq's statements, so
+/// `[a.save, <hydrate Seq>]` still saves before it queries. Not the
+/// right of `&&` / `||`, which runs only when the left lets it.
+///
 /// Note: two hydrate Seqs hoisted from one statement would both bind the
 /// visitor's fixed `stmt`/`results` locals and collide; that multi-query-
 /// per-statement case is a pre-existing visitor-naming limitation, not
 /// introduced here (every recognized site uses the same var names).
 fn hoist_value_seqs(e: &mut Expr, hoisted: &mut Vec<Expr>) -> bool {
-    let mut changed = false;
-    match &mut *e.node {
-        ExprNode::Send { recv, args, .. } => {
-            if let Some(r) = recv {
-                changed |= hoist_value_child(r, hoisted);
-            }
-            for a in args {
-                changed |= hoist_value_child(a, hoisted);
-            }
-        }
-        ExprNode::Apply { fun, args, .. } => {
-            changed |= hoist_value_child(fun, hoisted);
-            for a in args {
-                changed |= hoist_value_child(a, hoisted);
-            }
-        }
-        ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } => {
-            changed |= hoist_value_child(value, hoisted);
-        }
-        ExprNode::BoolOp { left, right, .. } => {
-            changed |= hoist_value_child(left, hoisted);
-            changed |= hoist_value_child(right, hoisted);
-        }
-        ExprNode::Array { elements, .. } => {
-            for el in elements {
-                changed |= hoist_value_child(el, hoisted);
-            }
-        }
-        ExprNode::Hash { entries, .. } => {
-            for (_, v) in entries {
-                changed |= hoist_value_child(v, hoisted);
-            }
-        }
+    let slots: Vec<&mut Expr> = match &mut *e.node {
+        ExprNode::Send { recv, args, .. } => recv.iter_mut().chain(args.iter_mut()).collect(),
+        ExprNode::Apply { fun, args, .. } => std::iter::once(fun).chain(args.iter_mut()).collect(),
+        ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } => vec![value],
+        ExprNode::BoolOp { left, .. } => vec![left],
+        ExprNode::Array { elements, .. } => elements.iter_mut().collect(),
+        ExprNode::Hash { entries, .. } => entries.iter_mut().flat_map(|(k, v)| [k, v]).collect(),
         ExprNode::Return { value }
         | ExprNode::Raise { value }
         | ExprNode::Splat { value }
-        | ExprNode::KeywordSplat { value } => {
-            changed |= hoist_value_child(value, hoisted);
+        | ExprNode::KeywordSplat { value } => vec![value],
+        ExprNode::Yield { args } => args.iter_mut().collect(),
+        _ => Vec::new(),
+    };
+    let mut changed = false;
+    let mut per_slot: Vec<Vec<Expr>> = Vec::with_capacity(slots.len());
+    let mut slots = slots;
+    for slot in slots.iter_mut() {
+        let mut own = Vec::new();
+        changed |= hoist_value_child(slot, &mut own);
+        per_slot.push(own);
+    }
+    let last_hoisting = per_slot.iter().rposition(|h| !h.is_empty());
+    for (j, (slot, own)) in slots.into_iter().zip(per_slot).enumerate() {
+        hoisted.extend(own);
+        if last_hoisting.is_some_and(|k| j < k) && !is_inert(slot) {
+            hoisted.push(bind_to_temporary(slot));
+            changed = true;
         }
-        ExprNode::Yield { args } => {
-            for a in args {
-                changed |= hoist_value_child(a, hoisted);
-            }
-        }
-        _ => {}
     }
     changed
+}
+
+/// A value whose reading cannot be changed by statements that run after
+/// it: nothing to bind before a later hoist.
+fn is_inert(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Lit { .. } | ExprNode::Const { .. } | ExprNode::SelfRef | ExprNode::Lambda { .. })
+}
+
+thread_local! {
+    static HOIST_TEMPORARIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `__hoisted_N = <slot>`, leaving a read of `__hoisted_N` in its place.
+fn bind_to_temporary(slot: &mut Expr) -> Expr {
+    let n = HOIST_TEMPORARIES.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        n
+    });
+    let span = slot.span;
+    let name = Symbol::from(format!("__hoisted_{}_{n}", span.start));
+    let ty = slot.ty.clone();
+    let mut read = Expr::new(span, ExprNode::Var { id: VarId(0), name: name.clone() });
+    read.ty = ty.clone();
+    let value = std::mem::replace(slot, read);
+    let mut assign = Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name }, value });
+    assign.ty = ty;
+    assign
 }
 
 /// Process one value-position child: recurse into its own value

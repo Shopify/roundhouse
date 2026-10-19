@@ -77,6 +77,9 @@ end
   include Pagination
   has_many :comments
   scope :recent, -> { order(score: :desc).limit(10) }
+  scope :banged, -> { where!(score: 1).order!(:score) }
+  scope :bare_reload, -> { reload }
+  scope :reloaded, -> { where(score: 1).reload }
   scope :top, -> { recent.where("score > 0") }
   scope :titles_only, -> { pluck(:title) }
   scope :filtered, ->(uid) { uid ? where(user_id: uid) : all }
@@ -96,6 +99,9 @@ end
             r#"class StoriesController < ApplicationController
   def index
     @relation = Story.recent
+    @banged = Story.banged
+    @bare_reload = Story.bare_reload
+    @reloaded = Story.reloaded
     @chained = Story.recent.where(user_id: 1)
     @delegated = Story.recent.for_user(1)
     @first = Story.recent.first
@@ -176,6 +182,28 @@ fn relation_of_story() -> Ty {
 fn scope_call_types_as_relation() {
     let app = analyzed_app();
     assert_eq!(ivar_ty(&app, "relation"), relation_of_story());
+}
+
+#[test]
+fn bang_builder_alias_scope_types_as_relation() {
+    // `where!` / `order!` are catalog aliases of builders. The scope
+    // seed has to read the same names the chain lowerer does, or a
+    // body that lowers onto `__rel` is still declared `Array[Story]`.
+    let app = analyzed_app();
+    assert_eq!(ivar_ty(&app, "banged"), relation_of_story());
+}
+
+#[test]
+fn relation_reload_continues_a_builder_chain() {
+    // `reload` is a Relation builder and an Instance read. A bare
+    // `reload` is the instance method. `where(…).reload` is the
+    // relation hop and keeps the relation type.
+    let app = analyzed_app();
+    let stories = Ty::Array {
+        elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }),
+    };
+    assert_eq!(ivar_ty(&app, "bare_reload"), stories);
+    assert_eq!(ivar_ty(&app, "reloaded"), relation_of_story());
 }
 
 #[test]

@@ -151,11 +151,33 @@ fn content_security_policy_runtime_apis_cannot_bypass_target_admission() {
         let mut app = ingest_app_from_tree(files).expect("ingest policy API");
         roundhouse::session::analyze_and_lower(&mut app);
         let (result, diagnostics) = roundhouse::emit::diagnostics::scope(||
-            roundhouse::project::target_files(&app, Path::new("."), BuildTarget::Spinel));
+            roundhouse::project::target_files(&app, Path::new("."), BuildTarget::Rust));
         assert!(result.is_err(), "unverified policy API target accepted {body}");
         assert!(diagnostics.iter().any(|diagnostic|
             diagnostic.severity == Severity::Error
                 && diagnostic.message.contains("content_security_policy")
                 && diagnostic.span.start > 0), "missing located API refusal: {diagnostics:?}");
+    }
+}
+
+#[test]
+fn content_security_policy_canonical_initializer_rejects_partial_policies() {
+    for body in [
+        "policy.script_src :self, dynamic_source",
+        "policy.script_src :self, :unknown_source",
+        "policy.not_a_directive :self",
+        "policy.script_src -> { 'https://dynamic.example' }",
+    ] {
+        let initializer = format!("Rails.application.config.content_security_policy do |policy|\n  {body}\nend\n");
+        let files = tree("", &[
+            ("config/application.rb", "module Blog\n  class Application < Rails::Application\n  end\nend\n"),
+            ("config/initializers/content_security_policy.rb", &initializer),
+        ]);
+        let error = ingest_app_from_tree(files.clone()).expect_err("partial global policy must fail");
+        assert!(error.to_string().contains("config/initializers/content_security_policy.rb"), "{error}");
+        survey::activate();
+        let _ = prism::scope(|| ingest_app_from_tree(files));
+        let gaps = survey::drain();
+        assert!(gaps.iter().any(|gap| gap.to_string().contains("content_security_policy")), "{gaps:?}");
     }
 }

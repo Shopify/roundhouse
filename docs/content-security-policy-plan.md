@@ -61,11 +61,11 @@ Accept another directive only when its typed runtime implementation and behavior
 
 The following forms remain unsupported:
 
-- Global initializer policies.
+- Global policies outside the validated literal canonical initializer profile.
 - Nonce generators and nonce directive configuration.
 - Report-only configuration and declarations.
 - Directive-level `Proc` sources.
-- Concern-defined declarations and declarations produced by custom class macros.
+- Concern declarations outside the existing directive-mutation profile, and custom class macros.
 - Block forms, conditions, enabled arguments, or options whose semantics the compiler cannot preserve.
 - Targets without verified policy storage and response completion.
 
@@ -351,7 +351,8 @@ Executed checks:
 - The CLI refused a global policy reached through `settings ||= Rails.application.config`,
   with its initializer path and line. The earlier binary emitted that input with warnings only.
 
-No CSP support is claimed for JRuby, Spinel, Roda, or another native target.
+Controller `frame_src` declarations remain Ruby-only. The existing global-policy and
+directive-mutation profiles retain their Ruby-family runtime path.
 Historical release snapshots remain unchanged.
 
 ### Writebook survey
@@ -381,3 +382,32 @@ Remaining error groups:
 
 The initializer warnings include Active Storage authentication hooks.
 The survey does not establish complete Writebook execution or deployment safety.
+
+## Main integration — 2026-10-19
+
+The merge retains the global policy and cached script-hash behavior from main.
+One typed policy stores both global directives and controller frame sources.
+`dup` is the shared deep-copy operation; no separate copy alias remains.
+Request setters mark lazy policy state ready, including explicit `nil` assignments.
+
+The canonical literal initializer uses a complete AST reader for admission,
+factory generation, and initializer consumption. Unsupported expressions,
+unknown directives, and unknown source symbols cannot produce partial policies.
+The existing environment disable guard remains request-visible.
+
+Directive-mutation concerns use the same guarded, dispatcher-only lowering.
+The response applies default headers before CSP completion.
+No dispatcher builds the CSP header before conditional GET establishes the final status.
+The former no-header divergence and its gap exception are removed.
+
+New emitted checks cover global defaults with controller callbacks,
+explicit policy clearing, cached around responses without a yield,
+script hashes, environment disabling, manual headers, and final `304` responses.
+A separate emitted CLI smoke run confirmed the combined cached `200` header,
+conditional `304` suppression, and manual report-only precedence.
+No new native controller-policy execution coverage is claimed.
+
+Merge verification: `bin/rh verify --all` passed with 6,392 tests and 392 skips.
+The documentation-test command completed with zero cases. Source analysis reads the bundled
+OpenTelemetry span contract, and the CSRF guard regression exercises emitted
+request behavior instead of matching generated source text.

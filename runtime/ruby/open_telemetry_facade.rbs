@@ -6,11 +6,11 @@ module OpenTelemetry
   module Trace
     class Span
       def recording?: () -> bool
-      def set_attribute: (untyped _key, untyped _value) -> Span
+      def set_attribute: (untyped _key, untyped _value) -> OpenTelemetry::Trace::Span
     end
 
-    NON_RECORDING_SPAN: Span
+    NON_RECORDING_SPAN: OpenTelemetry::Trace::Span
 
-    def self.current_span: () -> Span
+    def self.current_span: () -> OpenTelemetry::Trace::Span
   end
 end

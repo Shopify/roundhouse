@@ -393,6 +393,16 @@ pub(super) fn synthesize_process_action(
     // of gap (map_expr walks If / Seq / Lambda / BeginRescue). The
     // transform is idempotent on already-rewritten action-arm Sends.
     body = rewrites::rewrite_request_format(&body);
+    // `params` the same way, and for the same reason. Rails runs a block
+    // or lambda filter, an `if:`/`unless:` lambda and a `rescue_from`
+    // block with `instance_exec` on the controller, so `params` there is
+    // the Parameters the action reads. Left raw, `params[:id]` was a
+    // Symbol-keyed read on the String-keyed `@params` Hash and answered
+    // nil: `Widget.find(nil)` became a 404, and `head :forbidden if
+    // params[:deny] == "1"` never fired (rubys/roundhouse#998). The
+    // action arms are already rewritten and carry `@params`, which the
+    // pass leaves alone.
+    body = rewrites::rewrite_params(&body);
 
     let param_sym = Symbol::from(param);
     MethodDef {
@@ -758,7 +768,6 @@ fn case_dispatch(
 // Synthetic-Expr helpers — every node a synthesized span and default
 // effects/ty so the rest of the pipeline doesn't choke on them.
 // ---------------------------------------------------------------------------
-
 fn syn(node: ExprNode) -> Expr {
     Expr::new(Span::synthetic(), node)
 }

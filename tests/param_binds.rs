@@ -1,4 +1,4 @@
-//! Correctness gate for roundhouse#12. Both emit modes run in separate
+//! Correctness gate for roundhouse#12. The default and both override modes run in separate
 //! processes: changing ROUNDHOUSE_PARAM_BINDS in the parallel test runner is
 //! racy. No fixture generation, server, network or Docker is needed.
 //!
@@ -7,10 +7,22 @@
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
+#[path = "support/test_subprocess.rs"]
+mod test_subprocess;
 
 use roundhouse::project::BuildTarget;
 use std::path::PathBuf;
 use std::process::Command;
+
+// These probes cover supported runtimes. Pin their default
+// independently of the production capability table, then inspect actual emit.
+fn expected_binds(target: BuildTarget) -> bool {
+    match std::env::var("ROUNDHOUSE_PARAM_BINDS").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => target == BuildTarget::Spinel,
+    }
+}
 
 fn overlay() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
@@ -181,14 +193,16 @@ fn check_success(command: &Command, output: &std::process::Output) {
 
 fn emitted(test: &str, target: BuildTarget) {
     if std::env::var_os("ROUNDHOUSE_BINDS_CHILD").is_none() {
-        for mode in ["0", "1"] {
-            println!("{test}: ROUNDHOUSE_PARAM_BINDS={mode}");
-            success(
-                Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", test, "--include-ignored", "--nocapture"])
-                    .env("ROUNDHOUSE_BINDS_CHILD", "1")
-                    .env("ROUNDHOUSE_PARAM_BINDS", mode),
-            );
+        for mode in [None, Some("0"), Some("1")] {
+            println!("{test}: ROUNDHOUSE_PARAM_BINDS={mode:?}");
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", test, "--include-ignored", "--nocapture"])
+                .env("ROUNDHOUSE_BINDS_CHILD", "1")
+                .env_remove("ROUNDHOUSE_PARAM_BINDS");
+            if let Some(mode) = mode {
+                child.env("ROUNDHOUSE_PARAM_BINDS", mode);
+            }
+            success(&mut child);
         }
         return;
     }
@@ -196,7 +210,7 @@ fn emitted(test: &str, target: BuildTarget) {
     assert!(errors.is_empty(), "{}", errors.join("\n"));
     let probe = std::fs::read_to_string(dir.join("app/models/parent.rb")).unwrap();
     // Prevent a green test that silently exercises only the inline fallback.
-    let binds_on = std::env::var("ROUNDHOUSE_PARAM_BINDS").unwrap() == "1";
+    let binds_on = expected_binds(target);
     for method in [
         "find_by_id(value)",
         "rows(value)",
@@ -280,8 +294,36 @@ Db.close
 "#,
         include_str!("param_binds_emit.rb")
     );
-    run_script(&dir, &script, target == BuildTarget::Spinel);
+    // JRuby's real JDBC execution is covered by its container contract and
+    // compare lane. This host-independent probe pins its compiler policy.
+    if target != BuildTarget::Jruby {
+        run_script(&dir, &script, target == BuildTarget::Spinel);
+    }
     std::fs::remove_dir_all(dir.parent().unwrap()).expect("remove successful overlay");
+}
+
+#[test]
+fn emitted_reads_jruby_policy() {
+    emitted(test_subprocess::name!("emitted_reads_jruby_policy"), BuildTarget::Jruby);
+}
+
+#[test]
+fn direct_ruby_and_spinel_emit_use_their_defaults() {
+    let mut app = roundhouse::ingest::ingest_app(std::path::Path::new("fixtures/tiny-blog"))
+        .expect("tiny-blog");
+    roundhouse::session::analyze_and_lower(&mut app);
+    for (label, files, binds) in [
+        ("Ruby", roundhouse::emit::ruby::emit_lowered_models(&app), false),
+        ("Spinel", roundhouse::emit::ruby::emit_spinel(&app), true),
+    ] {
+        let models: Vec<_> = files.iter()
+            .filter(|f| f.content.contains("  def self._adapter_find_by_id(id)\n"))
+            .collect();
+        assert!(!models.is_empty(), "{label}: no synthesized reads");
+        for model in models {
+            assert_bound(&model.content, "self._adapter_find_by_id(id)", "bind_int", binds);
+        }
+    }
 }
 
 fn method_body<'a>(source: &'a str, method: &str) -> &'a str {
@@ -477,7 +519,7 @@ puts "runtime: NUL inline writes and bound reads agree"
 
 #[test]
 fn varying_binds_ruby() {
-    emitted("varying_binds_ruby", BuildTarget::Ruby);
+    emitted(test_subprocess::name!("varying_binds_ruby"), BuildTarget::Ruby);
 }
 
 #[test]
@@ -488,7 +530,7 @@ fn bind_runtime_ruby() {
 #[test]
 #[ignore = "requires Spinel (SPINEL=/path/to/spinel)"]
 fn varying_binds_spinel() {
-    emitted("varying_binds_spinel", BuildTarget::Spinel);
+    emitted(test_subprocess::name!("varying_binds_spinel"), BuildTarget::Spinel);
 }
 
 #[test]
@@ -580,25 +622,27 @@ puts "PASS seeded String-only find/exists adapter boundary and nil guards"
 
 #[test]
 fn string_key_adapter_ruby() {
-    string_key_adapter("string_key_adapter_ruby", BuildTarget::Ruby);
+    string_key_adapter(test_subprocess::name!("string_key_adapter_ruby"), BuildTarget::Ruby);
 }
 
 #[test]
 #[ignore = "requires Spinel and its RBS extractor"]
 fn string_key_adapter_spinel() {
-    string_key_adapter("string_key_adapter_spinel", BuildTarget::Spinel);
+    string_key_adapter(test_subprocess::name!("string_key_adapter_spinel"), BuildTarget::Spinel);
 }
 
 fn nullable_associations(test: &str, target: BuildTarget) {
     if std::env::var_os("ROUNDHOUSE_BINDS_CHILD").is_none() {
-        for mode in ["0", "1"] {
-            println!("{test}: ROUNDHOUSE_PARAM_BINDS={mode}");
-            success(
-                Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", test, "--include-ignored", "--nocapture"])
-                    .env("ROUNDHOUSE_BINDS_CHILD", "1")
-                    .env("ROUNDHOUSE_PARAM_BINDS", mode),
-            );
+        for mode in [None, Some("0"), Some("1")] {
+            println!("{test}: ROUNDHOUSE_PARAM_BINDS={mode:?}");
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", test, "--include-ignored", "--nocapture"])
+                .env("ROUNDHOUSE_BINDS_CHILD", "1")
+                .env_remove("ROUNDHOUSE_PARAM_BINDS");
+            if let Some(mode) = mode {
+                child.env("ROUNDHOUSE_PARAM_BINDS", mode);
+            }
+            success(&mut child);
         }
         return;
     }
@@ -654,7 +698,7 @@ end
         );
     let (dir, errors) = app.emit(target);
     assert!(errors.is_empty(), "{}", errors.join("\n"));
-    let binds_on = std::env::var("ROUNDHOUSE_PARAM_BINDS").unwrap() == "1";
+    let binds_on = expected_binds(target);
     let link = std::fs::read_to_string(dir.join("app/models/link.rb")).unwrap();
     assert_bound(&link, "account", "bind_int", binds_on);
     assert_bound(&link, "article", "bind_text", binds_on);
@@ -700,13 +744,13 @@ Db.close
 
 #[test]
 fn nullable_associations_ruby() {
-    nullable_associations("nullable_associations_ruby", BuildTarget::Ruby);
+    nullable_associations(test_subprocess::name!("nullable_associations_ruby"), BuildTarget::Ruby);
 }
 
 #[test]
 #[ignore = "requires Spinel (SPINEL=/path/to/spinel)"]
 fn nullable_associations_spinel() {
-    nullable_associations("nullable_associations_spinel", BuildTarget::Spinel);
+    nullable_associations(test_subprocess::name!("nullable_associations_spinel"), BuildTarget::Spinel);
 }
 
 fn cache_probe(native: bool) -> &'static str {
@@ -785,4 +829,25 @@ fn raw_where_substitution_ruby() {
 #[ignore = "requires Spinel (SPINEL=/path/to/spinel)"]
 fn raw_where_substitution_spinel() {
     raw_where_substitution(BuildTarget::Spinel);
+}
+
+#[test]
+fn typescript_profiles_keep_inline_reads() {
+    use roundhouse::profile::DeploymentProfile;
+    let mut app = roundhouse::ingest::ingest_app(std::path::Path::new("fixtures/tiny-blog"))
+        .expect("tiny-blog");
+    roundhouse::session::analyze_and_lower(&mut app);
+    for profile in [
+        DeploymentProfile::node_sync(),
+        DeploymentProfile::node_async(),
+        DeploymentProfile::worker(),
+    ] {
+        let files = roundhouse::emit::typescript::emit_with_profile(&app, &profile);
+        let models: Vec<_> = files.iter()
+            .filter(|f| f.content.contains("_adapter_find_by_id"))
+            .collect();
+        assert!(!models.is_empty(), "{} must exercise synthesized reads", profile.name);
+        assert!(models.iter().any(|f| f.content.contains("Db.escape_int(")), "{}", profile.name);
+        assert!(models.iter().all(|f| !f.content.contains("Db.bind_")), "{}", profile.name);
+    }
 }

@@ -37,10 +37,7 @@ module ActionDispatch
     # runtime/ruby/action_dispatch/request.rb.
     attr_accessor :request_parameters
     attr_reader :path_parameters
-    # The optional per-request Content Security Policy — see the twin in
-    # runtime/ruby/action_dispatch/request.rb. nil until a controller CSP
-    # callback stores one.
-    attr_accessor :content_security_policy
+    # Policy state distinguishes an unread global default from an explicit clear.
 
     def initialize(env, params = {})
       @env = env
@@ -49,6 +46,7 @@ module ActionDispatch
       @path_parameters = RequestPathParameters.new({})
       @session_options = {}
       @content_security_policy = nil
+      @csp_ready = false
     end
 
     # Rack's per-request session options — see the twin in
@@ -142,8 +140,48 @@ module ActionDispatch
     # So an app with no `domain` of its own raised NoMethodError on its
     # first absolute URL: campfire's message row, which links each
     # message by `room_at_message_url`.
+    # Rails' `raw_host_with_port`, and what `host` answers here: the Host
+    # header already included its port. The last `X-Forwarded-Host`
+    # wins only from a loopback or private peer, and only when it is a
+    # host authority. `config.hosts` is not applied yet.
     def host
+      raw_host_with_port
+    end
+
+    def raw_host_with_port
+      forwarded = forwarded_authority
+      return forwarded unless forwarded.empty?
       @env["HTTP_HOST"] || @env["SERVER_NAME"] || "localhost"
+    end
+
+    def forwarded_authority
+      return "" unless trusted_forwarded_peer?
+      forwarded = @env.fetch("HTTP_X_FORWARDED_HOST", "").to_s.split(",").last.to_s.strip
+      return "" unless host_authority?(forwarded)
+      forwarded
+    end
+
+    def trusted_forwarded_peer?
+      ip = remote_ip.to_s
+      # Empty is not loopback. A missing address must not count as the
+      # proxy in front of the app.
+      return false if ip.empty?
+      return true if ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
+      return true if ip.start_with?("10.") || ip.start_with?("192.168.") || ip.start_with?("169.254.")
+      return true if ip.start_with?("fc") || ip.start_with?("fd") || ip.start_with?("fe80:")
+      if ip.start_with?("172.")
+        second = ip.split(".")[1].to_s.to_i
+        return true if second >= 16 && second <= 31
+      end
+      if ip.start_with?("100.")
+        second = ip.split(".")[1].to_s.to_i
+        return true if second >= 64 && second <= 127
+      end
+      false
+    end
+
+    def host_authority?(value)
+      value.match?(/\A(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(:[0-9]{1,5})?\z/)
     end
 
     # See the shared twin: HTTPS=on, or a TLS-terminating proxy's
@@ -170,6 +208,22 @@ module ActionDispatch
       port
     end
 
+    def port
+      authority = forwarded_authority
+      if authority.empty?
+        authority = @env["HTTP_HOST"] || @env["SERVER_NAME"] || "localhost"
+        if !@env.key?("HTTP_HOST") && (@env.key?("SERVER_NAME") || !authority.include?(":"))
+          authority = "#{authority}:#{@env.fetch("SERVER_PORT", "").to_s}"
+        end
+      end
+      sep = authority.rindex(":")
+      unless sep.nil?
+        value = authority[(sep + 1)..].to_s
+        return value.to_i if value.match?(/\A[0-9]+\z/)
+      end
+      ssl? ? 443 : 80
+    end
+
     # Without the scheme's standard port, as the shared twin's: Rails'
     # `host_with_port` writes no `:443`/`:80`, and the CSRF check
     # compares this with an Origin a browser serializes the same way.
@@ -178,6 +232,31 @@ module ActionDispatch
       default = ssl? ? ":443" : ":80"
       h = h[0, h.length - default.length] if h.end_with?(default)
       "#{protocol}#{h}"
+    end
+
+    # Twin of the shared Request: scheme stripped, standard port already
+    # dropped by `base_url`.
+    def host_with_port
+      b = base_url
+      p = protocol
+      return "" if b.length < p.length
+      b[p.length..].to_s
+    end
+
+    # Same memo as the shared class. This overlay replaces that class on
+    # the CRuby lane, so the method has to live here too.
+    def content_security_policy
+      return @content_security_policy if @csp_ready
+      @csp_ready = true
+      src = Rails.application.content_security_policy
+      @content_security_policy = src.nil? ? nil : src.dup
+      @content_security_policy
+    end
+
+    def content_security_policy=(policy)
+      @csp_ready = true
+      @content_security_policy = policy
+      policy
     end
 
     def remote_ip

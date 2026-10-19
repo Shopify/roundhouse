@@ -16,6 +16,9 @@ use std::path::PathBuf;
 use roundhouse::emit::ruby;
 use roundhouse::ingest::ingest_app_from_tree;
 
+
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
 const AUTHENTICATION: &str = r#"module Authentication
   extend ActiveSupport::Concern
 
@@ -82,23 +85,45 @@ fn campfire_shape() -> Vec<(String, String)> {
 }
 
 #[test]
-fn the_concern_macro_runs_after_sign_in_under_its_guard_and_halts() {
-    let rooms = get(&campfire_shape(), "rooms_controller.rb");
-    let auth = rooms.find("require_authentication").expect("require_authentication");
-    let verify = rooms.find("verify_authenticity_token").expect("verify_authenticity_token");
-    assert!(auth < verify, "the check runs after sign-in:\n{rooms}");
-    // Once, at the declared position.
-    assert_eq!(rooms.matches("verify_authenticity_token").count(), 1, "{rooms}");
-    let tail = &rooms[verify..];
-    // The guard is kept, and folded the way `deny_bots`' body is: the
-    // `StringInquirer` predicate is a comparison with its label. Left as
-    // `bot_key?` it is a NoMethodError on every request, which is what
-    // the CRuby lane served before the inquirer fact reached controllers.
-    assert!(
-        tail.contains(r#"verify_authenticity_token if !(authenticated_by == "bot_key")"#),
-        "the `unless:` guard is kept and folded:\n{rooms}"
-    );
-    assert!(tail.contains("performed?"), "a refused request halts the chain:\n{rooms}");
+fn guarded_concern_forgery_check_observes_sign_in_and_blocks_the_action() {
+    emit_and_run::empty_app()
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\nend\n")
+        .write("app/controllers/concerns/authentication.rb", AUTHENTICATION)
+        .write("app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n  include Authentication\nend\n")
+        .write("config/routes.rb",
+            "Rails.application.routes.draw do\n  post '/rooms', to: 'rooms#create'\nend\n")
+        .write("app/controllers/rooms_controller.rb", r#"class RoomsController < ApplicationController
+  def create
+    response.headers["X-Action"] = "ran"
+    head :created
+  end
+  private
+  def authenticated_by
+    if @signed_in
+      params[:mode].to_s.inquiry
+    else
+      "".inquiry
+    end
+  end
+end
+"#)
+        .run_ruby(r#"
+require_relative "app/controllers/rooms_controller"
+ActionController::Base.allow_forgery_protection = true
+bot = RoomsController.new
+bot.params = { "mode" => "bot_key" }
+bot.request_method = "POST"
+bot.process_action(:create)
+raise "bot guard ran before sign-in" unless bot.status == 201 && bot.headers["X-Action"] == "ran"
+browser = RoomsController.new
+browser.params = { "mode" => "session" }
+browser.request_method = "POST"
+browser.process_action(:create)
+raise "forgery check did not stop the action" unless browser.status == 422 && browser.headers["X-Action"].nil?
+ActionController::Base.allow_forgery_protection = false
+"#)
+        .assert_passes();
 }
 
 #[test]

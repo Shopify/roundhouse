@@ -20,7 +20,10 @@ module ActionController
     def request_host_for_redirect
       r = @request
       return "" if r.nil?
-      r.host.to_s
+      # Same authority as `request.host` / `request.url`
+      # (`Request#raw_host_with_port`): last `X-Forwarded-Host` from a
+      # loopback or private peer, otherwise the Host header.
+      r.raw_host_with_port.to_s
     end
 
     def request_protocol_for_url

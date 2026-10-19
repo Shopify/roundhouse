@@ -96,14 +96,31 @@ pub(super) fn synthesize(app: &mut App, source_files: &[crate::span::SourceFile]
             }
             // Build the replacement fully before touching `expr`, so a
             // refusal leaves the original declaration untouched.
-            if let Some(before_action) = lower(expr, &mut scopes)? {
+            if let Some(before_action) = lower(expr, &mut scopes, false)? {
                 spans.push(expr.span);
                 *expr = before_action;
             }
         }
     }
+    let mut claimed = Vec::new();
+    for filters in app.concern_filters.values_mut() {
+        for filter in filters {
+            let Some(expr) = &mut filter.block else { continue };
+            if macro_name(expr) != Some(MACRO) { continue; }
+            if captures.iter().any(|capture| capture.file == expr.span.file
+                && capture.start >= expr.span.start && capture.end <= expr.span.end)
+            {
+                refuse_unit(expr.span, "content_security_policy mutation uses unsupported local bindings")?;
+                continue;
+            }
+            if let Some(callback) = lower(expr, &mut scopes, true)? {
+                claimed.push(expr.span);
+                *expr = callback;
+            }
+        }
+    }
     app.content_security_policy_spans = spans;
-    reject_indirect(app)?;
+    reject_indirect(app, &claimed)?;
     Ok(())
 }
 
@@ -128,10 +145,30 @@ fn macro_name(expr: &Expr) -> Option<&str> {
     }
 }
 
+/// Main's concern profile edits raw directives or worker-src rather than
+/// declaring a new controller frame-src policy.
+pub(super) fn is_core_mutation(expr: &Expr) -> bool {
+    let ExprNode::Send { recv: None, method, block: Some(block), .. } = &*expr.node else { return false };
+    if method.as_str() != MACRO { return false; }
+    let ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } = &*block.node else { return false };
+    if params.len() != 1 || rest_param.is_some() || !extra_params.is_empty() || block_param.is_some() {
+        return false;
+    }
+    fn uses_core(expr: &Expr, policy: &Symbol) -> bool {
+        if matches!(&*expr.node, ExprNode::Send { recv: Some(recv), method, .. }
+            if is_policy(recv, policy) && matches!(method.as_str(), "directives" | "worker_src"))
+        { return true; }
+        let mut found = false;
+        expr.node.for_each_child(&mut |child| found |= uses_core(child, policy));
+        found
+    }
+    uses_core(body, &params[0]) && block_violation(body, Some(&params[0]), true).is_none()
+}
+
 /// `Some(before_action)` for an accepted declaration; `None` when the
 /// declaration was refused in survey mode (a gap was recorded). In
 /// strict mode a refusal returns `Err`.
-fn lower(expr: &Expr, scopes: &mut LocalScopes) -> IngestResult<Option<Expr>> {
+fn lower(expr: &Expr, scopes: &mut LocalScopes, mutation: bool) -> IngestResult<Option<Expr>> {
     let span = expr.span;
     let ExprNode::Send { args, block, .. } = &*expr.node else {
         return Ok(None);
@@ -234,7 +271,7 @@ fn lower(expr: &Expr, scopes: &mut LocalScopes) -> IngestResult<Option<Expr>> {
         }
     }
 
-    let Some(body) = filter_body(block, enabled, span, scopes)? else {
+    let Some(body) = filter_body(block, enabled, span, scopes, mutation)? else {
         return Ok(None);
     };
 
@@ -274,10 +311,11 @@ fn filter_body(
     enabled: bool,
     span: Span,
     scopes: &mut LocalScopes,
+    mutation: bool,
 ) -> IngestResult<Option<Expr>> {
     let mut stmts: Vec<Expr> = Vec::new();
     if let Some(block) = block {
-        let Some((policy, mut body)) = validate_block(block, span)? else {
+        let Some((policy, mut body)) = validate_block(block, span, mutation)? else {
             return Ok(None);
         };
         let suffix = scopes.suffix();
@@ -298,7 +336,7 @@ fn filter_body(
 
 /// `Some((policy_param, body))` for a well-formed single-parameter block;
 /// a refusal otherwise. Validates the body before cloning it.
-fn validate_block(block: &Expr, span: Span) -> IngestResult<Option<(Symbol, Expr)>> {
+fn validate_block(block: &Expr, span: Span, mutation: bool) -> IngestResult<Option<(Symbol, Expr)>> {
     let ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } = &*block.node
     else {
         return refuse(span, "content_security_policy block is malformed");
@@ -314,7 +352,7 @@ fn validate_block(block: &Expr, span: Span) -> IngestResult<Option<(Symbol, Expr
         );
     }
     let policy = params.first().cloned().unwrap_or_else(|| Symbol::from("policy"));
-    if let Some(reason) = block_violation(body, Some(&policy)) {
+    if let Some(reason) = block_violation(body, Some(&policy), mutation) {
         return refuse(span, reason);
     }
     Ok(Some((policy, body.clone())))
@@ -322,13 +360,13 @@ fn validate_block(block: &Expr, span: Span) -> IngestResult<Option<(Symbol, Expr
 
 /// The reason a block body is unsupported, or `None` when it is a flat
 /// sequence of `policy.frame_src(...)` calls and isolable local work.
-fn block_violation(body: &Expr, policy: Option<&Symbol>) -> Option<String> {
+fn block_violation(body: &Expr, policy: Option<&Symbol>, mutation: bool) -> Option<String> {
     let mut reason: Option<String> = None;
-    check(body, policy, 0, &mut reason);
+    check(body, policy, 0, mutation, &mut reason);
     reason
 }
 
-fn check(e: &Expr, policy: Option<&Symbol>, depth: u32, reason: &mut Option<String>) {
+fn check(e: &Expr, policy: Option<&Symbol>, depth: u32, mutation: bool, reason: &mut Option<String>) {
     if reason.is_some() {
         return;
     }
@@ -337,7 +375,13 @@ fn check(e: &Expr, policy: Option<&Symbol>, depth: u32, reason: &mut Option<Stri
         ExprNode::Send { recv: Some(recv), method, args, block, .. }
             if policy.is_some_and(|policy| is_policy(recv, policy)) =>
         {
-            if method.as_str() != DIRECTIVE {
+            let allowed = if mutation {
+                (method.as_str() == "directives" && args.is_empty())
+                    || (method.as_str() == "worker_src" && args.len() == 1)
+            } else {
+                method.as_str() == DIRECTIVE
+            };
+            if !allowed {
                 *reason = Some(format!(
                     "content_security_policy supports only the `{DIRECTIVE}` directive, not `{}`",
                     method.as_str()
@@ -356,7 +400,7 @@ fn check(e: &Expr, policy: Option<&Symbol>, depth: u32, reason: &mut Option<Stri
                     ));
                     return;
                 }
-                check(arg, policy, depth, reason);
+                check(arg, policy, depth, mutation, reason);
                 if reason.is_some() {
                     return;
                 }
@@ -430,7 +474,7 @@ fn check(e: &Expr, policy: Option<&Symbol>, depth: u32, reason: &mut Option<Stri
         ExprNode::Lambda { .. } => depth + 1,
         _ => depth,
     };
-    e.node.for_each_child(&mut |child| check(child, policy, depth, reason));
+    e.node.for_each_child(&mut |child| check(child, policy, depth, mutation, reason));
 }
 
 fn is_policy(e: &Expr, policy: &Symbol) -> bool {
@@ -465,7 +509,7 @@ fn condition(value: &Expr, scopes: &mut LocalScopes) -> Option<Expr> {
                 && rest_param.is_none()
                 && extra_params.is_empty()
                 && block_param.is_none()
-                && block_violation(body, None).is_none() =>
+                && block_violation(body, None, false).is_none() =>
         {
             let mut body = body.clone();
             rename_locals(&mut body, &scopes.suffix());
@@ -542,23 +586,23 @@ fn action_in(list: &[String]) -> Expr {
 
 /// Refuse the macro inside a concern `included do` block or a custom macro
 /// method, where the single-dispatcher lowering cannot reach it.
-fn reject_indirect(app: &App) -> IngestResult<()> {
+fn reject_indirect(app: &App, claimed: &[Span]) -> IngestResult<()> {
     for class in &app.library_classes {
         for call in &class.unknown_calls {
-            reject_nested(call, &app.controllers)?;
+            reject_nested(call, &app.controllers, claimed)?;
         }
         for method in &class.methods {
-            reject_nested(&method.body, &app.controllers)?;
+            reject_nested(&method.body, &app.controllers, claimed)?;
         }
     }
     for controller in &app.controllers {
         for item in &controller.body {
             match item {
-                ControllerBodyItem::ClassMethod { method, .. } => reject_nested(&method.body, &app.controllers)?,
+                ControllerBodyItem::ClassMethod { method, .. } => reject_nested(&method.body, &app.controllers, claimed)?,
                 ControllerBodyItem::Unknown { expr, .. }
                     if !matches!(macro_name(expr), Some(MACRO | "content_security_policy_report_only")) =>
                 {
-                    reject_nested(expr, &app.controllers)?;
+                    reject_nested(expr, &app.controllers, claimed)?;
                 }
                 _ => {}
             }
@@ -567,10 +611,11 @@ fn reject_indirect(app: &App) -> IngestResult<()> {
     Ok(())
 }
 
-fn reject_nested(body: &Expr, controllers: &[crate::Controller]) -> IngestResult<()> {
+fn reject_nested(body: &Expr, controllers: &[crate::Controller], claimed: &[Span]) -> IngestResult<()> {
     let mut spans: Vec<Span> = Vec::new();
     collect_macro_calls(body, controllers, &mut spans);
     for span in spans {
+        if claimed.contains(&span) { continue; }
         refuse_unit(
             span,
             "content_security_policy requires a receiverless or self declaration; nested DSLs, concerns, custom macros, and explicit controller receivers are not supported",
