@@ -1320,7 +1320,7 @@ impl Analyzer {
                     || (self.source_indexed && self.includes_source_namespace(included.0.as_str(), class.name.0.as_str()));
                 if known { continue; }
                 let detail = format!("{} includes unresolved {}", class.name.0, included.0);
-                if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
+                if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic(),
                     Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: old, .. })
                     if construct.as_str() == "include" && old == &detail)) { continue; }
                 // The call's own span, carried alongside `includes` since
@@ -1329,9 +1329,9 @@ impl Analyzer {
                 let span = class.include_spans.get(i).copied().unwrap_or_default();
                 let mut refusal = crate::expr::Expr::new(span,
                     crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil });
-                refusal.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                refusal.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
                     target: None, construct: Symbol::from("include"), detail,
-                });
+                }));
                 class.unknown_calls.push(refusal);
             }
         }
@@ -1340,8 +1340,8 @@ impl Analyzer {
                 let ModelBodyItem::Unknown { expr, .. } = item else { continue };
                 let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
                 if method.as_str() != "include" { continue; }
-                if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "include") {
-                    expr.diagnostic = None;
+                if matches!(&expr.diagnostic(), Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "include") {
+                    crate::expr::ExprCold::set_diagnostic(&mut expr.cold, None);
                 }
                 let missing: Vec<_> = args.iter().filter_map(|arg| {
                     let ExprNode::Const { path } = &*arg.node else { return None };
@@ -1357,10 +1357,10 @@ impl Analyzer {
                     (!known).then_some(name)
                 }).collect();
                 if !missing.is_empty() {
-                    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                    expr.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None, construct: Symbol::from("include"),
                         detail: format!("{} includes unresolved {}", model.name.0, missing.join(", ")),
-                    });
+                    }));
                 }
             }
         }

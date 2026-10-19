@@ -226,7 +226,7 @@ fn unsupported_accessor_shapes_are_reported_only_for_includers() {
         let (items, enums) = roundhouse::ingest::library_class::ingest_concern_model_items(source.as_bytes(), "draft_state.rb");
         assert_eq!(items.len(), 1, "recognized declaration must be retained: {declaration}");
         let [ModelBodyItem::Unknown { expr, .. }] = items[0].1.as_slice() else { panic!("{items:?}") };
-        assert!(expr.diagnostic.is_some(), "unsupported declaration needs a contextual refusal: {declaration}");
+        assert!(expr.diagnostic().is_some(), "unsupported declaration needs a contextual refusal: {declaration}");
         assert!(enums.is_empty());
 
         let files = [
@@ -247,7 +247,7 @@ fn unsupported_accessor_shapes_are_reported_only_for_includers() {
         assert_eq!(gaps.len(), 2, "one refusal per includer: {declaration}: {gaps:?}");
         let declaration_span = app.concern_model_items.values().flatten().find_map(|item| {
             let ModelBodyItem::Unknown { expr, .. } = item else { return None };
-            expr.diagnostic.as_ref().map(|_| expr.span)
+            expr.diagnostic().as_ref().map(|_| expr.span)
         }).expect("original refused declaration retains its source span");
         for name in ["Message", "Note"] {
             assert!(gaps.iter().any(|gap| gap.to_string().contains(&format!("on {name}"))), "{gaps:?}");

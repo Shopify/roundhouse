@@ -1163,14 +1163,14 @@ end
             let mut expr = make(file);
             typer.analyze_expr(&mut expr, &Ctx::default());
             assert!(
-                expr.diagnostic.is_some(),
+                expr.diagnostic().is_some(),
                 "source FileId({file}) cannot use a generated fallback"
             );
         }
         let mut generated = make(99);
         generated.decisions |= crate::expr::GENERATED_CONST_REF;
         typer.analyze_expr(&mut generated, &Ctx::default());
-        assert!(generated.diagnostic.is_none());
+        assert!(generated.diagnostic().is_none());
         assert!(matches!(generated.ty, Some(crate::ty::Ty::Class { .. })));
     }
 

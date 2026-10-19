@@ -8973,7 +8973,7 @@ fn report_dropped_class_body_call(lc: &LibraryClass, call: &Expr) {
 
 fn is_preserved_external_include(call: &Expr) -> bool {
     matches!(
-        &call.diagnostic,
+        &call.diagnostic(),
         Some(crate::diagnostic::DiagnosticKind::Unsupported {
             construct,
             detail,
@@ -9001,7 +9001,7 @@ fn external_include_is_enabled(detail: &str) -> bool {
 fn include_is_unresolved(lc: &LibraryClass, inc: &ClassId) -> bool {
     let detail = format!("{} includes unresolved {}", lc.name.0, inc.0);
     lc.unknown_calls.iter().any(|call| {
-        matches!(&call.diagnostic,
+        matches!(&call.diagnostic(),
             Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: d, .. })
             if construct.as_str() == "include" && *d == detail)
     })
