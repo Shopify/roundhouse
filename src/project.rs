@@ -1803,6 +1803,40 @@ pub fn futamura_target_files(
     Ok(ensure_readme(files, target))
 }
 
+/// `--target fractal`'s tree: the app (`emit::fractal::files`) with the
+/// query sites of the selected `classes` specialized, and nothing else
+/// changed. With no class selected it is the identity. No README is
+/// added: the tree is the app, compared file for file against it.
+pub fn fractal_target_files(
+    app: &App,
+    fixture: &Path,
+    classes: &[String],
+    untrusted: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let mut files = emit::fractal::files(fixture)?;
+    let report = emit::fractal::specialize(app, &mut files, classes, untrusted)?;
+    if classes.is_empty() {
+        eprintln!("roundhouse: fractal: no --class selected; the tree is the app unchanged");
+    }
+    for d in &report.definitions {
+        eprintln!("roundhouse: fractal: selected {d}");
+    }
+    if !classes.is_empty() {
+        eprintln!(
+            "roundhouse: fractal: specialized {} query site(s); {} left to Rails",
+            report.specialized.len(),
+            report.residue.len(),
+        );
+    }
+    for s in &report.specialized {
+        eprintln!("  specialized {s}");
+    }
+    for r in &report.residue {
+        eprintln!("  residue     {r}");
+    }
+    Ok(files)
+}
+
 /// The `ruby` target's half of `--target futamura`'s whole-route
 /// replacement, from the INGESTED app: lowered the way `--target ruby`
 /// lowers it, with every diagnostic that emit would report. Errors do
@@ -2441,8 +2475,8 @@ fn collect_asset_files(root: &Path, dir: &Path, out: &mut Vec<(String, String)>)
 }
 
 /// Give each emitted file the executable bits its source counterpart
-/// has. Only the Futamura target needs it: its tree IS the source app,
-/// whose `bin/rails` and friends must still run. Every other target
+/// has. Only the Futamura and Fractal targets need it: their tree IS the
+/// source app, whose `bin/rails` and friends must still run. Every other target
 /// documents its run step as `ruby main.rb`-shaped commands.
 pub fn copy_exec_bits(src: &Path, files: &[(String, String)], dest: &Path) -> Result<(), String> {
     #[cfg(unix)]

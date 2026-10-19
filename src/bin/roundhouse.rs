@@ -37,6 +37,7 @@ fn usage() -> &'static str {
     "\
 Usage: roundhouse --target LANG [INPUT] [-o OUT]
        roundhouse --site [INPUT] [-o OUT]
+       roundhouse --target fractal [--class NAME]... [INPUT] [-o OUT]
        roundhouse --archives LANG,LANG [INPUT] [-o OUT]
        roundhouse check [--continue] [--inventory PATH] [--hotspots] [APP]
        roundhouse lsp
@@ -60,6 +61,14 @@ Options:
                          swift, typescript, typescript-worker, ruby, jruby,
                          spinel
                        Default INPUT=.  Default OUT=./out/<lang>/
+                       `fractal` keeps the app on Rails and speeds up only
+                       the classes named with --class (see --class).
+      --class NAME     With --target fractal: a class to specialize, by its
+                       full name (`Current`, `Admin::Report`). Repeatable.
+                       Every definition of it is selected (Rubydex), its
+                       provably safe query chains are rewritten, and every
+                       other file stays the app's own. No --class emits
+                       the app unchanged.
       --site           Build all targets + landing-page assets.
                        Default INPUT=fixtures/real-blog  Default OUT=./_site/
       --archives LIST  Build only comma-separated targets' browse archives.
@@ -116,6 +125,13 @@ fn cli() -> ExitCode {
             println!("roundhouse {}", roundhouse::version::describe());
             ExitCode::SUCCESS
         }
+        Ok(Action::Fractal { classes, input, out, survey }) => match run_fractal(&classes, &input, &out, survey) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("roundhouse: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Ok(Action::Transpile { target, input, out, allow_unsupported, survey }) => {
             match run_transpile(target, &input, &out, allow_unsupported, survey) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -162,6 +178,12 @@ enum Action {
         input: PathBuf,
         out: PathBuf,
     },
+    Fractal {
+        classes: Vec<String>,
+        input: PathBuf,
+        out: PathBuf,
+        survey: bool,
+    },
     Archives {
         targets: Vec<BuildTarget>,
         input: PathBuf,
@@ -176,6 +198,8 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
     let mut out: Option<PathBuf> = None;
     let mut allow_unsupported = false;
     let mut survey = false;
+    let mut fractal = false;
+    let mut classes: Vec<String> = Vec::new();
     let mut positional: Vec<String> = Vec::new();
 
     let mut iter = args.into_iter();
@@ -199,7 +223,14 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
                 let v = iter
                     .next()
                     .ok_or_else(|| format!("{arg} requires a value"))?;
-                target = Some(parse_target(&v)?);
+                if v == "fractal" {
+                    fractal = true;
+                } else {
+                    target = Some(parse_target(&v)?);
+                }
+            }
+            "--class" => {
+                classes.push(iter.next().ok_or("--class requires a class name")?);
             }
             "-o" | "--output" => {
                 let v = iter
@@ -207,9 +238,11 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
                     .ok_or_else(|| format!("{arg} requires a value"))?;
                 out = Some(PathBuf::from(v));
             }
+            "--target=fractal" => fractal = true,
             s if s.starts_with("--target=") => {
                 target = Some(parse_target(&s["--target=".len()..])?);
             }
+            s if s.starts_with("--class=") => classes.push(s["--class=".len()..].to_string()),
             s if s.starts_with("--output=") => {
                 out = Some(PathBuf::from(&s["--output=".len()..]));
             }
@@ -228,6 +261,20 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
         ));
     }
 
+    if fractal {
+        if target.is_some() || site || archives.is_some() || allow_unsupported {
+            return Err("--target fractal cannot be combined with another --target, --site, --archives or --allow-unsupported".into());
+        }
+        return Ok(Action::Fractal {
+            classes,
+            input: positional.pop().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")),
+            out: out.unwrap_or_else(|| PathBuf::from("out/fractal")),
+            survey,
+        });
+    }
+    if !classes.is_empty() {
+        return Err("--class is only meaningful with --target fractal".into());
+    }
     if let Some(targets) = archives {
         if target.is_some() || site || allow_unsupported || survey {
             return Err("--archives cannot be combined with --target, --site, --survey or --allow-unsupported".into());
@@ -276,6 +323,68 @@ fn parse_target(s: &str) -> Result<BuildTarget, String> {
             Err(format!("unknown target '{s}'. Valid: {valid}"))
         }
     }
+}
+
+/// `--target fractal`: ingest and analyze (no lowerings), then the app's
+/// own tree with the selected classes' query sites specialized. Nothing
+/// outside the selection is reported: it is Rails' to run, not a gap.
+fn run_fractal(classes: &[String], input: &std::path::Path, out: &std::path::Path, survey: bool) -> Result<(), String> {
+    if !input.exists() {
+        return Err(format!("input {} does not exist", input.display()));
+    }
+    if survey {
+        roundhouse::ingest::survey::activate();
+    }
+    let (app_result, parse_diags) = roundhouse::ingest::prism::scope(|| ingest_app(input));
+    let gaps = if survey { roundhouse::ingest::survey::drain() } else { Vec::new() };
+    let mut app = match app_result {
+        Ok(app) => app,
+        Err(e) => {
+            for d in &parse_diags {
+                eprintln!("roundhouse: {}", d.render(&[]));
+            }
+            if !gaps.is_empty() {
+                eprintln!();
+                eprint!("{}", roundhouse::ingest::survey::render_report(&gaps));
+            } else if !survey {
+                eprintln!("roundhouse: hint: re-run with --survey to record unsupported constructs and keep going");
+            }
+            return Err(format!("ingest {}: {e}", input.display()));
+        }
+    };
+    // A syntax error or a recorded gap leaves its file in the tree as the
+    // app wrote it (the identity copies text, not IR), but its IR holds
+    // placeholders, so no site in it is rewritten.
+    // Only errors: ingest also files warnings here (initializer statements
+    // no recognizer reads), which say nothing about a file's IR, and which
+    // Rails, running the initializers, makes moot.
+    let mut untrusted: Vec<String> = Vec::new();
+    for d in parse_diags.iter().filter(|d| d.severity == Severity::Error) {
+        eprintln!("roundhouse: {}", d.render(&app.sources));
+        if let Some(source) = (d.span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) {
+            untrusted.push(source.path.clone());
+        }
+    }
+    if !gaps.is_empty() {
+        eprintln!();
+        eprint!("{}", roundhouse::ingest::survey::render_report(&gaps));
+        eprintln!(
+            "roundhouse: {} ingest gap(s) recorded; their files are copied unchanged and none of their sites is rewritten",
+            gaps.len()
+        );
+        for gap in &gaps {
+            if let roundhouse::ingest::IngestError::Unsupported { file, .. } | roundhouse::ingest::IngestError::Parse { file, .. } = gap {
+                untrusted.push(file.clone());
+            }
+        }
+    }
+    roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
+    let files = project::fractal_target_files(&app, input, classes, &untrusted)?;
+    project::write_to_dir(&files, out)?;
+    let assets = project::write_binary_assets(&app.binary_assets, &files, out)?;
+    project::copy_exec_bits(input, &files, out)?;
+    eprintln!("roundhouse: emitted {} files to {} (fractal)", files.len() + assets, out.display());
+    Ok(())
 }
 
 fn run_transpile(
