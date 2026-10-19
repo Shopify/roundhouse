@@ -202,6 +202,9 @@ struct FileAnswers {
     constant_classes: IdentityHashMap<DeclarationId, ClassId>,
     namespace_definitions: HashSet<Box<str>>,
     class_definitions: HashSet<Box<str>>,
+    /// Each `class`/`module` definition as (full name, start, end): the
+    /// byte range of the whole definition, keyword through `end`.
+    class_bodies: Vec<(Box<str>, u32, u32)>,
     alias_definitions: HashSet<Box<str>>,
     runtime_namespace_aliases: HashMap<Box<str>, Box<str>>,
     /// Source-only factory admission facts; they do not alter name resolution.
@@ -462,6 +465,21 @@ impl ConstResolver {
     fn file(&self, file: FileId) -> Option<&FileAnswers> {
         let index = file.0.checked_sub(1)?;
         self.files.get(index as usize)?.as_ref()
+    }
+
+    /// Every `class`/`module` definition in the app, as (fully qualified
+    /// name, span of the whole definition), reopenings included, in file
+    /// order. A definition's span contains the definitions nested in it.
+    pub(crate) fn class_bodies(&self) -> Vec<(Box<str>, Span)> {
+        let mut out = Vec::new();
+        for (index, file) in self.files.iter().enumerate() {
+            let Some(file) = file else { continue };
+            for (name, start, end) in &file.class_bodies {
+                out.push((name.clone(), Span { file: FileId(index as u32 + 1), start: *start, end: *end }));
+            }
+        }
+        out.sort_by_key(|(_, span)| (span.file.0, span.start));
+        out
     }
 
     /// Every constant (fully qualified) `file` declares: its classes and
@@ -922,8 +940,10 @@ fn answer_file(
                 let owner = parent.and_then(|id| graph.name_id_to_declaration_id(*id))
                     .and_then(|id| graph.declarations().get(id));
                 let full = owner.map_or_else(|| written.to_string(), |owner| format!("{}::{}", hoisted_name(owner.name()), written.as_str()));
-                if matches!(definition, Some(Definition::Class(_) | Definition::Module(_))) {
+                if let Some(class @ (Definition::Class(_) | Definition::Module(_))) = definition {
                     answers.class_definitions.insert(full.clone().into());
+                    let offset = class.offset();
+                    answers.class_bodies.push((full.clone().into(), offset.start(), offset.end()));
                 }
                 if let Some(Definition::ConstantAlias(alias)) = definition {
                     answers.alias_definitions.insert(full.clone().into());
