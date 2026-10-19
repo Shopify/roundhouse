@@ -580,19 +580,21 @@ fn deferred_concern_dependencies_stay_dormant_and_use_lexical_names() {
         ("app/models/support.rb", "module Scope; module DraftState; def helper; 'local'; end; end; class Support; include DraftState; end; end"),
     ]);
     ingest_app_from_tree(files.clone()).expect("a Concern dependency is deferred, and the local namesake has no accessors");
+    // Inside `module Scope`, the model's `include DraftState` is the local
+    // namesake, as Ruby binds it. Ingest stores that name, so the Concern's
+    // accessors are never spliced into the model; the local module, which
+    // this file does not model, is refused by analysis instead.
     let mut shadowed = files.clone();
     shadowed.insert("app/models/support.rb".into(), b"module Scope; module DraftState; def helper; 'local'; end; end; class Message < ApplicationRecord; self.table_name = 'messages'; include DraftState; end; end".to_vec());
-    let error = ingest_app_from_tree(shadowed.clone()).unwrap_err().to_string();
-    assert!(error.contains("on Scope::Message") && error.contains("source-resolved"), "{error}");
-    roundhouse::ingest::survey::activate();
-    let result = ingest_app_from_tree(shadowed);
-    let gaps = roundhouse::ingest::survey::drain();
-    let app = result.unwrap();
-    assert_eq!(gaps.len(), 1, "{gaps:?}");
-    assert_eq!(gaps[0].to_string(), error);
+    let mut app = ingest_app_from_tree(shadowed).expect("the local namesake supplies no accessors");
     let model = app.models.iter().find(|m| m.name.0.as_str() == "Scope::Message").unwrap();
     let lowered = roundhouse::lower::lower_model_to_library_class(model, &app.schema);
     assert!(!lowered.methods.iter().any(|m| ["scratch", "scratch="].contains(&m.name.as_str())));
+    roundhouse::session::analyze_and_lower(&mut app);
+    let errors: Vec<String> = roundhouse::analyze::diagnose(&app).into_iter()
+        .filter(|d| d.severity == roundhouse::diagnostic::Severity::Error)
+        .map(|d| d.to_string()).collect();
+    assert!(errors.iter().any(|e| e.contains("Scope::Message includes unresolved Scope::DraftState")), "{errors:?}");
     let mut files = files;
     files.insert("app/models/support.rb".into(), b"module Scope; class Support; include ::DraftState; end; end".to_vec());
     let error = ingest_app_from_tree(files).unwrap_err().to_string();

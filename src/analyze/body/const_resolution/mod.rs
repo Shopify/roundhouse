@@ -809,15 +809,19 @@ fn answer_file(
     } else {
         HashSet::new()
     };
+    // Positions a whole-path reference filled, which an exact one replaces.
+    let mut path_keys = HashSet::new();
     for reference_id in document.constant_references() {
         let Some(reference) = graph.constant_references().get(reference_id) else {
             continue;
         };
         let offset = reference.offset();
         // A superclass or mixin reference spans its whole `A::B` path,
-        // so it starts at the same offset as the `A` reference. Only a
-        // reference whose span is exactly its written name belongs to
-        // that offset.
+        // so it starts at the same offset as the `A` reference. Its
+        // answer belongs to where its final name starts, which is where
+        // `reference` looks for an IR span covering the whole path; a
+        // reference whose span is exactly its written name keeps its
+        // own start.
         let written = source
             .text
             .get(offset.start() as usize..offset.end() as usize);
@@ -825,10 +829,23 @@ fn answer_file(
             .names()
             .get(reference.name_id())
             .and_then(|name| graph.strings().get(name.str()));
-        if !name.is_some_and(|name| written == Some(name.as_str())) {
+        let Some((key, exact)) = name.and_then(|name| {
+            let (name, written) = (name.as_str(), written?);
+            if written == name {
+                Some((offset.start(), true))
+            } else {
+                let prefix = written.strip_suffix(name)?;
+                prefix.ends_with("::").then(|| (offset.end() - name.len() as u32, false))
+            }
+        }) else {
+            continue;
+        };
+        // A path reference only fills its final name's position; the
+        // reference that Rubydex recorded there itself, if any, wins.
+        if !exact && answers.references.contains_key(&key) {
             continue;
         }
-        if parenthesized_receivers.contains(&offset.start())
+        if exact && parenthesized_receivers.contains(&offset.start())
             && let Some(target) = resolved_namespace(graph, *reference.name_id())
                 .filter(|target| is_runtime_declaration(graph, target))
         {
@@ -839,7 +856,7 @@ fn answer_file(
             .and_then(|id| graph.declarations().get(id).map(|decl| (*id, decl)))
             .map(|(id, declaration)| {
                 if declaration.kind() == "Class" {
-                    answers.class_references.insert(offset.start());
+                    answers.class_references.insert(key);
                 }
                 if declaration.as_namespace().is_some() && !is_assigned_value(graph, declaration) {
                     let (class, runtime) = class_cache.entry(id).or_insert_with(|| {
@@ -884,12 +901,15 @@ fn answer_file(
                     ResolvedConstant::Value { declaration: id, name: Arc::new(ClassId(Symbol::from(hoisted_name(name).as_ref()))), runtime, runtime_decl }
                 }
             });
-        match answers.references.entry(offset.start()) {
+        match answers.references.entry(key) {
             Entry::Vacant(slot) => {
+                if !exact {
+                    path_keys.insert(key);
+                }
                 slot.insert(target);
             }
             Entry::Occupied(mut slot) => {
-                if slot.get().is_none() && target.is_some() {
+                if (exact && path_keys.remove(&key)) || (slot.get().is_none() && target.is_some()) {
                     slot.insert(target);
                 }
             }
@@ -1209,5 +1229,25 @@ end
             }
             _ => panic!("ActiveRecord::SignedId::SALT must resolve to the runtime value"),
         }
+    }
+
+    /// A superclass or mixin path is one Rubydex reference spanning the
+    /// whole `A::B`. Its answer is where an IR span covering that path
+    /// looks, the final name, while the `A` reference keeps its own.
+    #[test]
+    fn superclass_and_mixin_paths_answer_at_their_final_name() {
+        let text = "module A\n  class B; end\n  module H; end\nend\nclass X < A::B\n  include A::H\nend\nclass Y < ::A::B; end\n";
+        let sources = vec![SourceFile { path: "x.rb".into(), text: text.into() }];
+        let resolver = ConstResolver::from_app_sources(&sources);
+        let path = |written: &str| -> Vec<Symbol> { written.split("::").filter(|s| !s.is_empty()).map(Symbol::from).collect() };
+        let at = |needle: &str, written: &str| {
+            let start = text.find(needle).unwrap() + needle.len() - written.len();
+            let span = Span { file: FileId(1), start: start as u32, end: (start + written.len()) as u32 };
+            resolver.namespace(span, &path(written)).map(|class| class.0.to_string())
+        };
+        assert_eq!(at("X < A::B", "A::B").as_deref(), Some("A::B"));
+        assert_eq!(at("include A::H", "A::H").as_deref(), Some("A::H"));
+        assert_eq!(at("Y < ::A::B", "::A::B").as_deref(), Some("A::B"));
+        assert_eq!(at("X < A", "A").as_deref(), Some("A"));
     }
 }
