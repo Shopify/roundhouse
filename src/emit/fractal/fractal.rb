@@ -39,6 +39,93 @@ module Fractal
     singleton_method_added: ["ActiveRecord::Scoping::Named::ClassMethods"],
   }.freeze
 
+  # What variants of the json-writer pass compare against, and the guard
+  # they install under. Such a variant writes the JSON `Hash#to_json`
+  # produces for a fixed-key hash of scalars, so it needs that `to_json`
+  # to be Active Support's, unmodified, and the core methods its checks
+  # and its writer call to be Ruby's own. Any value the checks do not
+  # accept takes the original expression.
+  module JsonWriter
+    # What the json gem escapes in a string (control characters, quote,
+    # backslash), and what Active Support then escapes (<, >, &). U+2028
+    # and U+2029, which Active Support also escapes, are the two
+    # separators.
+    ESCAPE = /[\x00-\x1f"\\<>&]/
+    LINE_SEPARATOR = "\u2028"
+    PARAGRAPH_SEPARATOR = "\u2029"
+    UTF_8 = ::Encoding::UTF_8
+
+    # Each must be implemented in C, on a core owner: nothing defined,
+    # prepended or included over it.
+    CORE = [
+      [::String, :instance_of?], [::String, :ascii_only?], [::String, :encoding],
+      [::String, :valid_encoding?], [::String, :include?], [::Regexp, :match?],
+      [::Integer, :to_s], [::TrueClass, :to_s], [::FalseClass, :to_s],
+      [::NilClass, :equal?], [::TrueClass, :equal?], [::FalseClass, :equal?],
+      [::Encoding, :equal?], [::String.singleton_class, :===], [::Integer.singleton_class, :===],
+    ].freeze
+    CORE_OWNERS = [
+      ::String, ::Regexp, ::Integer, ::TrueClass, ::FalseClass, ::NilClass, ::Encoding,
+      ::Module, ::Kernel, ::BasicObject, ::Comparable, ::Object,
+    ].freeze
+
+    ENCODING_FILE = "/active_support/json/encoding.rb"
+    TO_JSON_FILE = "/active_support/core_ext/object/json.rb"
+    JSON_FILE = "/json/common.rb"
+
+    class << self
+      def refusal
+        to_json = ::Hash.instance_method(:to_json)
+        unless to_json.owner == ::ActiveSupport::ToJsonWithActiveSupportEncoder && from?(to_json, TO_JSON_FILE)
+          return "Hash#to_json is defined by #{to_json.owner}, not Active Support"
+        end
+
+        encoding = ::ActiveSupport::JSON::Encoding
+        encoder = encoding.json_encoder
+        if encoding.const_defined?(:JSONGemCoderEncoder, false) && encoder == encoding::JSONGemCoderEncoder
+          # Measured: with the Coder the original writes natively, and
+          # the writer was slower than it for a six-value hash.
+          return "Active Support encodes with the json gem's native Coder, which the writer is not faster than for every shape"
+        end
+        unless encoding.const_defined?(:JSONGemEncoder, false) && encoder == encoding::JSONGemEncoder
+          return "ActiveSupport.json_encoder is #{encoder}, not Active Support's JSONGemEncoder"
+        end
+
+        default = encoding.instance_variable_get(:@encoder_without_options)
+        unless default.instance_of?(encoder) && default.singleton_methods.empty? && default.options == {}
+          return "Active Support's default JSON encoder has been replaced or given options"
+        end
+
+        methods = [
+          ::ActiveSupport::JSON.method(:encode), encoding.method(:encode_without_options),
+          encoder.instance_method(:encode), encoder.instance_method(:jsonify), encoder.instance_method(:stringify),
+        ]
+        redefined = methods.find { |method| !from?(method, ENCODING_FILE) }
+        return "#{redefined.owner}##{redefined.name} is not Active Support's own" if redefined
+
+        generate = ::JSON.method(:generate)
+        return "JSON.generate is not the json gem's own" unless from?(generate, JSON_FILE)
+        unless ::JSON.generator.name == "JSON::Ext::Generator"
+          return "the json gem generates with #{::JSON.generator}, not its native generator"
+        end
+
+        CORE.each do |mod, name|
+          method = mod.instance_method(name)
+          unless method.source_location.nil? && CORE_OWNERS.include?(method.owner)
+            return "#{mod}##{name} is redefined by #{method.owner}"
+          end
+        end
+        nil
+      end
+
+      private
+
+      def from?(method, suffix)
+        method.source_location&.first&.end_with?(suffix) || false
+      end
+    end
+  end
+
   class Declined < StandardError; end
   class Mismatch < StandardError; end
 
@@ -231,6 +318,8 @@ module Fractal
 
         target = guard[:singleton] ? constant.singleton_class : constant
         definition_refusal(target, guard[:method].to_sym, path(guard[:file]), guard[:line])
+      when :active_support_json
+        JsonWriter.refusal
       else
         "unknown guard #{guard[:kind].inspect}"
       end

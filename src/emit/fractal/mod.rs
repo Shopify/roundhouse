@@ -16,8 +16,9 @@
 //! - [`region`]: each `def` written directly in a selected body, with the
 //!   analyzer's facts about it and whether a variant can be attached.
 //! - [`pass`]: the transformations. Each proposes edits to a region and
-//!   the assumptions they rest on. None is registered yet; this module
-//!   is the baseline they attach to.
+//!   the assumptions they rest on. One is registered:
+//!   [`json_writer`], which writes a fixed-shape hash's JSON directly
+//!   where a method builds the hash only to encode it.
 //! - [`variant`]: the edited method, wrapped so that it keeps its
 //!   nesting, file and line, and the generated initializer that installs
 //!   it.
@@ -36,6 +37,7 @@
 //! without the original's paths in it, and no call pays a guard. See
 //! `docs/pipeline/fractal.md`.
 
+pub mod json_writer;
 pub mod pass;
 pub mod region;
 pub mod select;

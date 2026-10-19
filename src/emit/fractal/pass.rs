@@ -77,10 +77,18 @@ pub enum Guard {
     /// the app root. What a variant that relies on another app method's
     /// body (by inlining it, say) has to know at install time.
     DefinedAt { constant: String, method: String, singleton: bool, file: String, line: u32 },
+    /// `Hash#to_json` is Active Support's JSON encoding, with its stock
+    /// `JSONGemEncoder` (not the json gem's `Coder`, where the writer was
+    /// not measured faster for every shape) and nothing redefined along
+    /// the way, and the core methods the
+    /// [`json-writer`](super::json_writer) checks call are Ruby's own.
+    /// What a variant that writes `to_json`'s output itself has to know
+    /// at install time. Waits for
+    /// `ActiveSupport::ToJsonWithActiveSupportEncoder` to load.
+    ActiveSupportJson,
 }
 
-/// The passes a build runs, in order. None yet: this is the baseline the
-/// first ones attach to.
+/// The passes a build runs, in order.
 pub fn registered() -> Vec<Box<dyn Pass>> {
-    Vec::new()
+    vec![Box::new(super::json_writer::JsonWriter)]
 }

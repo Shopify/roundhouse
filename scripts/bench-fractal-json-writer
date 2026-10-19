@@ -1,0 +1,236 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Measure the json-writer Fractal pass: the app's own methods with the
+# JIT against the same methods with their variants installed, on the
+# same Ruby, JIT, workload and warmup, each in its own process.
+#
+#   scripts/bench-fractal-json-writer [--roundhouse PATH] [--calls N] [--rounds N] [--processes N] [--encoder NAME] [-- RUBY_FLAGS...]
+#
+#   scripts/bench-fractal-json-writer -- --yjit
+#   scripts/bench-fractal-json-writer -- --zjit      # Ruby 4.0 and later
+#
+# --encoder JSONGemEncoder sets ActiveSupport.json_encoder in both modes,
+# for a json new enough that Active Support would pick its Coder, where
+# the variants decline.
+#
+# The app is synthetic and written to a temporary directory: one class
+# whose methods build a fixed-key hash and return its Active Support
+# `to_json`. Roundhouse builds the fractal overlay for it, and the
+# overlay is placed on a copy of the app, as a deploy would.
+#
+# The two modes run in alternating processes (--processes pairs), so a
+# busy machine slows both alike. Reports, per method: CPU time per call
+# (median over every round of every process, with the range),
+# objects and slot bytes allocated per call, GC runs and GC time, and,
+# per process, live heap slots and RSS after the run and the JIT's code
+# size, so a CPU gain is shown next to what it costs.
+#
+# Needs `ruby` with activesupport installed. No Rails app is booted:
+# the harness stands in for the autoloader, as the fractal tests do.
+
+require "fileutils"
+require "json"
+require "open3"
+require "rbconfig"
+require "tmpdir"
+
+APP_SOURCE = <<~'RUBY'
+  # frozen_string_literal: true
+
+  class Payloads
+    # Two values, written inline.
+    def pair(label, count)
+      l = label #: String
+      c = count #: Integer
+      { label: l, count: c }.to_json
+    end
+
+    # Six values through a local, over several lines.
+    def card(title, body, author, id, position, archived)
+      t = title #: String
+      b = body #: String
+      a = author #: String
+      i = id #: Integer
+      p = position #: Integer
+      f = archived #: bool
+      payload = { id: i, title: t, body: b,
+                  author: a, position: p,
+                  archived: f, kind: "card" }
+      payload.to_json
+    end
+
+    # Values that may be nil, as nullable columns are.
+    def nilable(title, count)
+      t = title #: String?
+      c = count #: Integer?
+      { title: t, count: c }.to_json
+    end
+  end
+RUBY
+
+# [label, method, arguments]. The last row's string needs escaping, so
+# every call takes the original expression after the checks: the cost of
+# a miss.
+WORKLOAD = [
+  ["pair", :pair, ["Quarterly report", 42]],
+  ["card (6 values)", :card, ["Quarterly report", "Numbers are up for the third quarter.", "Zoë Example", 123_456, 7, false]],
+  ["nilable", :nilable, ["Draft", nil]],
+  ["pair, needs escaping", :pair, ["Fish & chips", 42]],
+].freeze
+
+def measure(app, mode, calls, rounds, flags, encoder)
+  script = <<~'RUBY'
+    require "active_support"
+    require "active_support/json"
+    require "pathname"
+    require "json"
+    app, mode, calls, rounds, workload = ARGV[0], ARGV[1], Integer(ARGV[2]), Integer(ARGV[3]), Marshal.load([ARGV[4]].pack("H*"))
+    ActiveSupport.json_encoder = ActiveSupport::JSON::Encoding.const_get(ARGV[5]) unless ARGV[5].empty?
+    module Rails
+      Loader = Struct.new(:callbacks) { def on_load(cpath, &block) = (callbacks[cpath] ||= []) << block }
+      Config = Struct.new(:prepares) { def to_prepare(&block) = prepares << block }
+      def self.application = (@application ||= Struct.new(:root, :config).new(Pathname.new(ARGV[0]), Config.new([])))
+      def self.autoloaders = (@autoloaders ||= Struct.new(:main).new(Loader.new({})))
+    end
+    load File.join(app, "config/initializers/fractal.rb") if mode == "fractal"
+    load File.join(app, "app/models/payloads.rb")
+    Rails.autoloaders.main.callbacks.fetch("Payloads", []).each { |cb| cb.call(Payloads, nil) }
+    if mode == "fractal"
+      bad = Fractal.status.reject { |_, (state, _)| state == :installed }
+      unless bad.empty? && Fractal.status.size == 3
+        warn "variants not installed: #{bad}"
+        exit 3
+      end
+    end
+    object = Payloads.new
+    slot_bytes = -> { GC.stat_heap.sum { |_, h| h[:total_allocated_objects] * h[:slot_size] } }
+    results = workload.each_with_index.map do |(label, method, args), index|
+      # A direct call with the same argument objects every time, so the
+      # loop itself allocates nothing.
+      names = args.each_index.map { |k| "a#{k}" }
+      Object.class_eval(<<~LOOP, __FILE__, __LINE__ + 1)
+        def run_#{index}(object, calls, args)
+          #{names.join(", ")}, = args
+          i = 0
+          while i < calls
+            object.#{method}(#{names.join(", ")})
+            i += 1
+          end
+        end
+      LOOP
+      runner = method(:"run_#{index}")
+      expected = object.public_send(method, *args)
+      runner.call(object, calls / 5, args) # warmup
+      cpu = []
+      objects = bytes = gc_count = gc_ms = 0
+      rounds.times do
+        GC.start
+        o0, b0, c0, t0 = GC.stat(:total_allocated_objects), slot_bytes.call, GC.count, GC.stat(:time)
+        start = Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID)
+        runner.call(object, calls, args)
+        cpu << (Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID) - start) / calls * 1e9
+        objects += GC.stat(:total_allocated_objects) - o0
+        bytes += slot_bytes.call - b0
+        gc_count += GC.count - c0
+        gc_ms += GC.stat(:time) - t0
+      end
+      {
+        label: label, output: expected, ns_all: cpu,
+        objects: objects.to_f / (calls * rounds), bytes: bytes.to_f / (calls * rounds),
+        gc_runs: gc_count, gc_ms: gc_ms,
+      }
+    end
+    GC.start
+    rss = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i
+    jit = if defined?(RubyVM::ZJIT) && RubyVM::ZJIT.enabled?
+      stats = RubyVM::ZJIT.stats rescue {}
+      ["zjit", stats[:code_region_bytes] || stats[:zjit_alloc_bytes]]
+    elsif defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled?
+      ["yjit", RubyVM::YJIT.runtime_stats[:code_region_size]]
+    else
+      ["interpreter", nil]
+    end
+    puts Marshal.dump({ results: results, live_slots: GC.stat(:heap_live_slots), rss_kb: rss, jit: jit,
+                        ruby: RUBY_DESCRIPTION, json: JSON::VERSION, encoder: ActiveSupport.json_encoder.name }).unpack1("H*")
+  RUBY
+  payload = Marshal.dump(WORKLOAD).unpack1("H*")
+  out, err, status = Open3.capture3(RbConfig.ruby, *flags, "-e", script, app, mode, calls.to_s, rounds.to_s, payload, encoder.to_s)
+  abort "the variants did not install, so there is nothing to compare:\n#{err}" if status.exitstatus == 3
+  abort "#{mode} run failed:\n#{err}" unless status.success?
+  Marshal.load([out.strip].pack("H*"))
+end
+
+# One report from several processes: medians of the per-round times,
+# means of the counts, and the last process's heap, RSS and code size.
+def combine(list)
+  merged = list.last.dup
+  merged[:results] = list.map { |run| run[:results] }.transpose.map do |rows|
+    times = rows.flat_map { |r| r[:ns_all] }.sort
+    rows.first.merge(
+      ns: times[times.size / 2], ns_min: times.first, ns_max: times.last,
+      objects: rows.sum { |r| r[:objects] } / rows.size, bytes: rows.sum { |r| r[:bytes] } / rows.size,
+      gc_runs: rows.sum { |r| r[:gc_runs] }, gc_ms: rows.sum { |r| r[:gc_ms] },
+    )
+  end
+  merged
+end
+
+def main
+  roundhouse = File.expand_path("../target/release/roundhouse", __dir__)
+  roundhouse = File.expand_path("../target/debug/roundhouse", __dir__) unless File.executable?(roundhouse)
+  calls, rounds, processes, encoder = 1_000_000, 5, 3, nil
+  args = ARGV.dup
+  flags = (i = args.index("--")) ? args.slice!(i..)[1..] : []
+  until args.empty?
+    case args.shift
+    when "--roundhouse" then roundhouse = args.shift
+    when "--calls" then calls = Integer(args.shift)
+    when "--rounds" then rounds = Integer(args.shift)
+    when "--processes" then processes = Integer(args.shift)
+    when "--encoder" then encoder = args.shift
+    else abort File.read(__FILE__)[/^#   scripts.*?\n#\n/m]
+    end
+  end
+
+  Dir.mktmpdir("fractal-json-bench") do |dir|
+    app = File.join(dir, "app")
+    FileUtils.mkdir_p(File.join(app, "app/models"))
+    File.write(File.join(app, "app/models/payloads.rb"), APP_SOURCE)
+    overlay = File.join(dir, "overlay")
+    _, err, status = Open3.capture3(roundhouse, "--target", "fractal", "--class", "Payloads", app, "-o", overlay)
+    abort "roundhouse failed:\n#{err}" unless status.success?
+    built = File.join(dir, "built")
+    FileUtils.cp_r(app, built)
+    FileUtils.cp_r(File.join(overlay, "."), built)
+    initializer = File.read(File.join(built, "config/initializers/fractal.rb"))
+    variants = initializer[/^Fractal\.variant.*\z/m]
+
+    runs = { "original" => [], "fractal" => [] }
+    processes.times do
+      runs["original"] << measure(app, "original", calls, rounds, flags, encoder)
+      runs["fractal"] << measure(built, "fractal", calls, rounds, flags, encoder)
+    end
+    original, fractal = runs.values_at("original", "fractal").map { |list| combine(list) }
+    original[:results].zip(fractal[:results]).each do |o, f|
+      abort "#{o[:label]}: outputs differ" unless o[:output] == f[:output]
+    end
+
+    puts "#{original[:ruby]}  flags=#{flags.join(" ").then { |s| s.empty? ? "(none)" : s }}"
+    puts "json #{original[:json]}, #{original[:encoder]}; #{processes} process(es) per mode, each #{rounds} rounds of #{calls} calls after #{calls / 5} warmup"
+    puts
+    puts "| method | ns/call original | ns/call fractal | speedup | objects/call | slot bytes/call | GC runs | GC ms |"
+    puts "|---|---:|---:|---:|---:|---:|---:|---:|"
+    original[:results].zip(fractal[:results]).each do |o, f|
+      puts format("| %s | %.0f (%.0f-%.0f) | %.0f (%.0f-%.0f) | %.2fx | %.1f -> %.1f | %.0f -> %.0f | %d -> %d | %d -> %d |",
+        o[:label], o[:ns], o[:ns_min], o[:ns_max], f[:ns], f[:ns_min], f[:ns_max], o[:ns] / f[:ns],
+        o[:objects], f[:objects], o[:bytes], f[:bytes], o[:gc_runs], f[:gc_runs], o[:gc_ms], f[:gc_ms])
+    end
+    puts
+    puts format("after the run: live slots %d -> %d, RSS %d KB -> %d KB, %s code %s -> %s bytes; variant source %d bytes",
+      original[:live_slots], fractal[:live_slots], original[:rss_kb], fractal[:rss_kb], original[:jit][0],
+      original[:jit][1] || "n/a", fractal[:jit][1] || "n/a", variants.bytesize)
+  end
+end
+
+main

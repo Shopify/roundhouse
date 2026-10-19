@@ -486,7 +486,7 @@ fn the_cli_builds_reports_and_rejects_fractal_flags_elsewhere() {
     let stderr = String::from_utf8_lossy(&ok.stderr);
     assert!(ok.status.success(), "{stderr}");
     assert!(stderr.contains("fractal: 6 method(s) in the selection, 6 admitted"), "{stderr}");
-    assert!(stderr.contains("0 pass(es): none registered"), "{stderr}");
+    assert!(stderr.contains("1 pass(es): json-writer"), "{stderr}");
     let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
     assert_eq!(json["classes"][0], "Current");
     assert_eq!(json["regions"].as_array().unwrap().len(), 6);
