@@ -33,7 +33,8 @@ mod class_new;
 pub(crate) use body::{indexed_pluck, string_answers};
 #[cfg(test)]
 pub(crate) use body::counted_first_last;
-pub(crate) use body::{ConstResolver, ConstResolverTask};
+pub(crate) use body::{ConstResolver, ConstResolverTask, definition_index};
+pub use body::DefinitionIndex;
 pub use body::PreparedConstResolver;
 pub mod async_color;
 pub mod attribution;

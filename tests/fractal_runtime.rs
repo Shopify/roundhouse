@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use roundhouse::analyze::Analyzer;
-use roundhouse::emit::fractal::{self, Cx, Edit, Guard, Pass, Proposal, Region};
+use roundhouse::emit::fractal::{self, Cx, Edit, Guard, Pass, Proposal, Region, Scope};
 use roundhouse::ingest::ingest_app;
 use roundhouse::span::Span;
 
@@ -71,6 +71,10 @@ struct Swap;
 impl Pass for Swap {
     fn name(&self) -> &'static str {
         "test-swap"
+    }
+
+    fn scope(&self) -> Scope {
+        Scope::Classes(Vec::new())
     }
 
     fn run(&self, cx: &Cx<'_>, region: &Region<'_>) -> Proposal {

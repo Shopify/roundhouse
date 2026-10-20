@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use roundhouse::analyze::Analyzer;
-use roundhouse::emit::fractal::{self, Cx, Edit, Guard, INITIALIZER, Pass, Plan, Proposal, Region};
+use roundhouse::emit::fractal::{self, Cx, Edit, Guard, INITIALIZER, Pass, Plan, Proposal, Region, Scope};
 use roundhouse::ingest::ingest_app;
 use roundhouse::span::Span;
 
@@ -227,6 +227,10 @@ impl Pass for Swap {
         "test-swap"
     }
 
+    fn scope(&self) -> Scope {
+        Scope::Classes(Vec::new())
+    }
+
     fn run(&self, cx: &Cx<'_>, region: &Region<'_>) -> Proposal {
         let text = &cx.app.sources[region.file.0 as usize - 1].text;
         let (start, end) = (region.def_span.start as usize, region.def_span.end as usize);
@@ -247,6 +251,10 @@ struct Fixed(Box<dyn Fn(&Region<'_>) -> Vec<Edit>>);
 impl Pass for Fixed {
     fn name(&self) -> &'static str {
         "test-fixed"
+    }
+
+    fn scope(&self) -> Scope {
+        Scope::Classes(Vec::new())
     }
 
     fn run(&self, _cx: &Cx<'_>, region: &Region<'_>) -> Proposal {
@@ -495,5 +503,190 @@ fn the_cli_builds_reports_and_rejects_fractal_flags_elsewhere() {
 
     let misplaced = run(&["--target", "ruby", "--class", "Current", dir.to_str().unwrap()]);
     assert!(!misplaced.status.success());
+    assert!(String::from_utf8_lossy(&misplaced.stderr).contains("only meaningful with --target fractal"));
+}
+
+// Scope: what a build ingests.
+
+/// A pass that only declares a scope, for the driver's decision.
+struct Scoped(fn() -> Scope);
+
+impl Pass for Scoped {
+    fn name(&self) -> &'static str {
+        "test-scoped"
+    }
+
+    fn scope(&self) -> Scope {
+        (self.0)()
+    }
+
+    fn run(&self, _cx: &Cx<'_>, _region: &Region<'_>) -> Proposal {
+        Proposal::default()
+    }
+}
+
+/// A file full ingest stops at: a migration verb the schema fold does
+/// not take.
+const UNREAD: &str = r#"class Unread < ActiveRecord::Migration[7.0]
+  def change
+    change_table :accounts do |t|
+      t.string :slug
+    end
+  end
+end
+"#;
+
+fn scoped_files() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("app/models/base_widget.rb", "class BaseWidget\n  def kind\n    \"base\"\n  end\nend\n"),
+        ("app/models/concerns/labelled.rb", "module Labelled\n  def tag\n    \"tag\"\n  end\nend\n"),
+        ("app/models/widget.rb", "class Widget < BaseWidget\n  include Labelled\n\n  def label\n    \"original\"\n  end\nend\n"),
+        ("app/models/widget/reopened.rb", "class Widget\n  def other\n    \"original\"\n  end\nend\n"),
+        ("app/models/unrelated.rb", "class Unrelated\n  def label\n    \"original\"\n  end\nend\n"),
+        ("db/migrate/20240101000000_unread.rb", UNREAD),
+        ("config/application.rb", "module App\n  class Application < Rails::Application\n  end\nend\n"),
+    ]
+}
+
+fn decide(dir: &Path, classes: &[&str], passes: &[&dyn Pass], whole_app: bool) -> Result<fractal::Ingest, String> {
+    let classes: Vec<String> = classes.iter().map(|c| c.to_string()).collect();
+    fractal::scope::decide(&dir.canonicalize().unwrap(), &classes, passes, whole_app)
+}
+
+/// The scope's files, relative to the app root.
+fn scope_files(ingest: &fractal::Ingest, dir: &Path) -> Vec<String> {
+    let fractal::Ingest::Files { files, .. } = ingest else { panic!("expected a scoped ingest") };
+    let root = dir.canonicalize().unwrap();
+    files.iter().map(|f| f.strip_prefix(&root).unwrap().to_string_lossy().into_owned()).collect()
+}
+
+#[test]
+fn a_build_ingests_only_the_selected_classes_and_the_apps_shape_by_default() {
+    let dir = app_dir("scope-default", &scoped_files());
+    let classes_only = Scoped(|| Scope::Classes(Vec::new()));
+    let ingest = decide(&dir, &["Widget"], &[&classes_only], false).unwrap();
+    assert_eq!(scope_files(&ingest, &dir), ["app/models/widget/reopened.rb", "app/models/widget.rb", "config/application.rb"]);
+    let fractal::Ingest::Files { indexed, .. } = ingest else { unreachable!() };
+    assert_eq!(indexed, 6, "Rubydex reads the app's Ruby, not db/");
+    // No pass registered is the same: classes are the unit.
+    assert_eq!(scope_files(&decide(&dir, &["Widget"], &[], false).unwrap(), &dir).len(), 3);
+}
+
+#[test]
+fn ancestors_bring_in_the_files_defining_superclasses_and_mixins() {
+    let dir = app_dir("scope-ancestors", &scoped_files());
+    let pass = Scoped(|| Scope::Classes(vec![fractal::Reach::Ancestors]));
+    let files = scope_files(&decide(&dir, &["Widget"], &[&pass], false).unwrap(), &dir);
+    assert!(files.contains(&"app/models/base_widget.rb".to_string()), "{files:?}");
+    assert!(files.contains(&"app/models/concerns/labelled.rb".to_string()), "{files:?}");
+    assert!(!files.iter().any(|f| f.contains("unrelated") || f.contains("migrate")), "{files:?}");
+}
+
+#[test]
+fn schema_signatures_and_custom_reaches_add_their_files() {
+    let mut files = scoped_files();
+    files.push(("db/schema.rb", SCHEMA));
+    files.push(("sig/widget.rbs", "class Widget\n  def label: () -> String\nend\n"));
+    let dir = app_dir("scope-reaches", &files);
+    let pass = Scoped(|| {
+        Scope::Classes(vec![
+            fractal::Reach::Schema,
+            fractal::Reach::Signatures,
+            fractal::Reach::Custom(|cx, files| {
+                files.extend(cx.index.files["Unrelated"].iter().map(PathBuf::from));
+            }),
+        ])
+    });
+    let scope = scope_files(&decide(&dir, &["Widget"], &[&pass], false).unwrap(), &dir);
+    for expected in ["db/schema.rb", "sig/widget.rbs", "app/models/unrelated.rb"] {
+        assert!(scope.contains(&expected.to_string()), "{expected} missing from {scope:?}");
+    }
+}
+
+#[test]
+fn a_pass_that_needs_the_whole_app_or_whole_app_reads_everything() {
+    let dir = app_dir("scope-whole", &scoped_files());
+    let whole = Scoped(|| Scope::WholeApp);
+    let classes_only = Scoped(|| Scope::Classes(Vec::new()));
+    match decide(&dir, &["Widget"], &[&classes_only, &whole], false).unwrap() {
+        fractal::Ingest::WholeApp { reason } => assert_eq!(reason, "pass `test-scoped` needs the whole app"),
+        fractal::Ingest::Files { .. } => panic!("a whole-app pass must widen the build"),
+    }
+    match decide(&dir, &["Widget"], &[&classes_only], true).unwrap() {
+        fractal::Ingest::WholeApp { reason } => assert_eq!(reason, "--whole-app"),
+        fractal::Ingest::Files { .. } => panic!("--whole-app must read everything"),
+    }
+}
+
+#[test]
+fn a_class_no_source_defines_is_an_error_before_anything_is_ingested() {
+    let dir = app_dir("scope-missing", &scoped_files());
+    let err = decide(&dir, &["Missing"], &[], false).err().unwrap();
+    assert!(err.contains("--class Missing: no class or module of that name"), "{err}");
+}
+
+/// Ingest through the scope sees only its files, so a file whole-app
+/// ingest stops at is never read, and the selected class plans exactly
+/// as it does in a whole-app build.
+#[test]
+fn a_scoped_ingest_reads_only_its_files_and_plans_the_selection_the_same() {
+    let dir = app_dir("scope-ingest", &scoped_files());
+    assert!(ingest_app(&dir).is_err(), "the migration stops a whole-app ingest");
+    let root = dir.canonicalize().unwrap();
+    let fractal::Ingest::Files { files, .. } = decide(&dir, &["Widget"], &[], false).unwrap() else { unreachable!() };
+    let fs = roundhouse::vfs::FsVfs::new();
+    let vfs = roundhouse::vfs::ScopedVfs::new(&fs, files);
+    let mut app = roundhouse::ingest::app::ingest_app_with_vfs(&vfs, &root).unwrap();
+    let read: Vec<&str> = app.sources.iter().map(|s| s.path.as_str()).filter(|p| p.ends_with(".rb")).collect();
+    assert!(read.iter().all(|p| !p.contains("unrelated") && !p.contains("migrate") && !p.contains("base_widget")), "{read:?}");
+    Analyzer::new(&app).analyze(&mut app);
+    let swap = Swap::new("original", "variant");
+    let plan = fractal::plan(&app, &root, &["Widget".to_string()], &[], &[&swap]).unwrap();
+    assert_eq!(keys(&plan), ["Widget#label", "Widget#other"]);
+    assert_eq!(plan.report.variants.len(), 2);
+}
+
+/// A component: an in-repository gem with its own `app/`, which ingest
+/// takes for an app root because its `lib/` declares a `Rails::Engine`.
+#[test]
+fn a_component_class_brings_its_engine_declaration_into_scope() {
+    let mut files = scoped_files();
+    files.retain(|(p, _)| !p.starts_with("db/"));
+    files.push(("Gemfile.lock", "PATH\n  remote: components/billing\n  specs:\n    billing (0.1.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\nDEPENDENCIES\n  billing!\n"));
+    files.push(("components/billing/billing.gemspec", "Gem::Specification.new { |s| s.name = \"billing\" }\n"));
+    files.push(("components/billing/lib/billing/engine.rb", "module Billing\n  class Engine < Rails::Engine\n  end\nend\n"));
+    files.push(("components/billing/app/models/billing/invoice.rb", "module Billing\n  class Invoice\n    def label\n      \"original\"\n    end\n  end\nend\n"));
+    let dir = app_dir("scope-component", &files);
+    let ingest = decide(&dir, &["Billing::Invoice"], &[], false).unwrap();
+    let scope = scope_files(&ingest, &dir);
+    assert!(scope.contains(&"components/billing/lib/billing/engine.rb".to_string()), "{scope:?}");
+    let fractal::Ingest::Files { files, .. } = ingest else { unreachable!() };
+    let root = dir.canonicalize().unwrap();
+    let fs = roundhouse::vfs::FsVfs::new();
+    let mut app = roundhouse::ingest::app::ingest_app_with_vfs(&roundhouse::vfs::ScopedVfs::new(&fs, files), &root).unwrap();
+    Analyzer::new(&app).analyze(&mut app);
+    let plan = fractal::plan(&app, &root, &["Billing::Invoice".to_string()], &[], &[]).unwrap();
+    assert_eq!(keys(&plan), ["Billing::Invoice#label"]);
+}
+
+#[test]
+fn the_cli_scopes_by_default_and_reads_everything_with_whole_app() {
+    let mut files = base_files();
+    files.push(("app/models/unrelated.rb", "class Unrelated\n  def label\n    \"original\"\n  end\nend\n"));
+    let dir = app_dir("scope-cli", &files);
+    let out = scratch("scope-cli-out").join("out");
+    let run = |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_roundhouse")).args(args).output().unwrap();
+
+    let scoped = run(&["--target", "fractal", "--class", "Shapes", dir.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&scoped.stderr);
+    assert!(scoped.status.success(), "{stderr}");
+    assert!(stderr.contains("fractal: ingesting 1 file(s) the selection and passes need"), "{stderr}");
+
+    let whole = run(&["--target", "fractal", "--whole-app", "--class", "Shapes", dir.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&whole.stderr);
+    assert!(whole.status.success(), "{stderr}");
+    assert!(stderr.contains("fractal: ingesting the whole app (--whole-app)"), "{stderr}");
+
+    let misplaced = run(&["--target", "ruby", "--whole-app", dir.to_str().unwrap()]);
     assert!(String::from_utf8_lossy(&misplaced.stderr).contains("only meaningful with --target fractal"));
 }

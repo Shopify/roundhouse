@@ -54,7 +54,8 @@ fn forwarded_block_may_be_nil(ty: &Ty) -> bool {
 mod diagnostic;
 mod const_resolution;
 mod lambda_local;
-pub(crate) use const_resolution::{ConstResolver, ConstResolverTask};
+pub(crate) use const_resolution::{ConstResolver, ConstResolverTask, definition_index};
+pub use const_resolution::DefinitionIndex;
 pub use const_resolution::PreparedConstResolver;
 use const_resolution::ResolvedConstant;
 mod narrowing;

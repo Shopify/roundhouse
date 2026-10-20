@@ -2,8 +2,10 @@
 //! one class at a time.
 //!
 //! Rails keeps running the app. A person names the classes to work on
-//! (`--class Shop`); Roundhouse ingests and analyzes the whole app, so it
-//! knows what Rails cannot see from one call site (types, effects, which
+//! (`--class Shop`); Roundhouse ingests and analyzes those classes and
+//! what its passes say they need to know about them ([`scope`]), or the
+//! whole app when a pass needs it or `--whole-app` asks, so it knows what
+//! Rails cannot see from one call site (types, effects, which
 //! definitions exist), and uses that application knowledge to produce
 //! specialized *variants* of the selected classes' methods. Everything
 //! else, including every method no pass changes, is the app's own code.
@@ -11,6 +13,8 @@
 //!
 //! The pieces, in the order a build runs them:
 //!
+//! - [`scope`]: which files to ingest, decided from a Rubydex index of
+//!   the app's constants before anything is ingested.
 //! - [`select`]: Rubydex finds every body of each selected class,
 //!   reopenings included, minus the bodies of other classes nested in it.
 //! - [`region`]: each `def` written directly in a selected body, with the
@@ -38,6 +42,7 @@
 
 pub mod pass;
 pub mod region;
+pub mod scope;
 pub mod select;
 mod overlay;
 pub mod variant;
@@ -50,6 +55,7 @@ use crate::App;
 use crate::span::FileId;
 
 pub use pass::{Cx, Edit, Guard, Pass, Proposal};
+pub use scope::{Ingest, Reach, Scope, ScopeCx};
 pub use region::{Analyzed, Knowledge, Region};
 pub use select::Selection;
 pub use variant::{Decline, INITIALIZER, RUNTIME, Variant};

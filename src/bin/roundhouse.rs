@@ -37,7 +37,7 @@ fn usage() -> &'static str {
     "\
 Usage: roundhouse --target LANG [INPUT] [-o OUT]
        roundhouse --site [INPUT] [-o OUT]
-       roundhouse --target fractal [--class NAME]... [--report PATH] [INPUT] [-o OUT]
+       roundhouse --target fractal [--class NAME]... [--whole-app] [--report PATH] [INPUT] [-o OUT]
        roundhouse --archives LANG,LANG [INPUT] [-o OUT]
        roundhouse check [--continue] [--inventory PATH] [--hotspots] [APP]
        roundhouse lsp
@@ -70,6 +70,10 @@ Options:
                        specialize, by its full name (`Shop`,
                        `Admin::Report`). Repeatable. Every definition of it
                        is selected (Rubydex). No --class emits nothing.
+                       Only the files defining these classes, and what
+                       the registered passes say they need, are ingested.
+      --whole-app      With --target fractal: ingest and analyze the
+                       whole app instead, as a pass that needs it does.
       --report PATH    With --target fractal: write the build's decisions
                        (selection, methods, variants, declines) as JSON.
       --site           Build all targets + landing-page assets.
@@ -128,8 +132,8 @@ fn cli() -> ExitCode {
             println!("roundhouse {}", roundhouse::version::describe());
             ExitCode::SUCCESS
         }
-        Ok(Action::Fractal { classes, input, out, survey, report }) => {
-            match run_fractal(&classes, &input, &out, survey, report.as_deref()) {
+        Ok(Action::Fractal { classes, input, out, survey, report, whole_app }) => {
+            match run_fractal(&classes, &input, &out, survey, report.as_deref(), whole_app) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("roundhouse: {e}");
@@ -189,6 +193,7 @@ enum Action {
         out: PathBuf,
         survey: bool,
         report: Option<PathBuf>,
+        whole_app: bool,
     },
     Archives {
         targets: Vec<BuildTarget>,
@@ -207,6 +212,7 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
     let mut fractal = false;
     let mut classes: Vec<String> = Vec::new();
     let mut report: Option<PathBuf> = None;
+    let mut whole_app = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut iter = args.into_iter();
@@ -237,6 +243,7 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
                 }
             }
             "--class" => classes.push(iter.next().ok_or("--class requires a class name")?),
+            "--whole-app" => whole_app = true,
             "--report" => report = Some(PathBuf::from(iter.next().ok_or("--report requires a path")?)),
             "-o" | "--output" => {
                 let v = iter
@@ -278,10 +285,11 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
             out: out.unwrap_or_else(|| PathBuf::from("out/fractal")),
             survey,
             report,
+            whole_app,
         });
     }
-    if !classes.is_empty() || report.is_some() {
-        return Err("--class and --report are only meaningful with --target fractal".into());
+    if !classes.is_empty() || report.is_some() || whole_app {
+        return Err("--class, --whole-app and --report are only meaningful with --target fractal".into());
     }
     if let Some(targets) = archives {
         if target.is_some() || site || allow_unsupported || survey {
@@ -333,24 +341,44 @@ fn parse_target(s: &str) -> Result<BuildTarget, String> {
     }
 }
 
-/// `--target fractal`: ingest and analyze (no lowerings: Rails keeps
-/// running the app), plan the build, and write the overlay of what the
-/// plan generates.
+/// `--target fractal`: decide what to ingest (the selected classes and
+/// what the passes need, or the whole app), ingest and analyze it (no
+/// lowerings: Rails keeps running the app), plan the build, and write
+/// the overlay of what the plan generates.
 fn run_fractal(
     classes: &[String],
     input: &std::path::Path,
     out: &std::path::Path,
     survey: bool,
     report_path: Option<&std::path::Path>,
+    whole_app: bool,
 ) -> Result<(), String> {
     use roundhouse::emit::fractal;
     if !input.exists() {
         return Err(format!("input {} does not exist", input.display()));
     }
+    let passes = fractal::pass::registered();
+    let passes: Vec<&dyn fractal::Pass> = passes.iter().map(|p| p.as_ref()).collect();
+    let root = input.canonicalize().map_err(|e| format!("input {}: {e}", input.display()))?;
+    let ingest = fractal::scope::decide(&root, classes, &passes, whole_app)?;
     if survey {
         roundhouse::ingest::survey::activate();
     }
-    let (app_result, parse_diags) = roundhouse::ingest::prism::scope(|| ingest_app(input));
+    let (app_result, parse_diags) = roundhouse::ingest::prism::scope(|| match &ingest {
+        fractal::Ingest::WholeApp { reason } => {
+            eprintln!("roundhouse: fractal: ingesting the whole app ({reason})");
+            ingest_app(input)
+        }
+        fractal::Ingest::Files { files, indexed } => {
+            eprintln!(
+                "roundhouse: fractal: ingesting {} file(s) the selection and passes need (Rubydex indexed {indexed}); --whole-app reads everything",
+                files.len()
+            );
+            let fs = roundhouse::vfs::FsVfs::new();
+            let vfs = roundhouse::vfs::ScopedVfs::new(&fs, files.iter().cloned());
+            roundhouse::ingest::app::ingest_app_with_vfs(&vfs, &root)
+        }
+    });
     let gaps = if survey { roundhouse::ingest::survey::drain() } else { Vec::new() };
     let mut app = match app_result {
         Ok(app) => app,
@@ -388,8 +416,6 @@ fn run_fractal(
         }
     }
     roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
-    let passes = fractal::pass::registered();
-    let passes: Vec<&dyn fractal::Pass> = passes.iter().map(|p| p.as_ref()).collect();
     let plan = fractal::plan(&app, input, classes, &untrusted, &passes)?;
     for line in plan.report.render().lines() {
         eprintln!("roundhouse: {line}");

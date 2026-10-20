@@ -10,8 +10,9 @@ load time; otherwise the app's own method runs. Deselecting a class
 and rebuilding gives the app back.
 
 The point is application knowledge. Roundhouse ingests and analyzes the
-whole app, so at build time it knows things a JIT cannot learn from
-inside one method: the types flowing through a body, its effects, which
+selected classes and what its passes need to know about them (or the
+whole app, when a pass needs it), so at build time it knows things a
+JIT cannot learn from inside one method: the types flowing through a body, its effects, which
 definitions exist and where, which shapes never vary. A Fractal pass
 uses that to remove work the JIT would have to keep, such as framework
 machinery that interprets a description fixed at build time, or an
@@ -27,16 +28,33 @@ would work with and emits nothing.
 
 All of it lives in [`src/emit/fractal/`](../../src/emit/fractal/).
 
-1. **Ingest and analyze**, without lowering. Files ingest can only
+1. **Scope** ([`scope.rs`](../../src/emit/fractal/scope.rs)). Before
+   anything is ingested, Rubydex indexes the app's Ruby for constants
+   alone (outside `test/`, `spec/`, `db/`, `vendor/` and the like) and
+   answers where each `--class` is defined. The build ingests those
+   files, plus what each registered pass declares with `Pass::scope`:
+   `Reach::Ancestors` (the files defining the selected classes'
+   superclasses and mixins), `Reach::Signatures` (`sig/**/*.rbs`),
+   `Reach::Schema` (`db/schema.rb`, else `db/structure.sql`), or a
+   `Reach::Custom` function over the index. It always keeps what tells
+   ingest the app's shape: `Gemfile.lock`, `roundhouse.yml`,
+   `config/application.rb`, the inflections initializer, and, for a
+   kept file, its Packwerk `package.yml` or its component's
+   `Rails::Engine` declaration. Everything else reads as absent, so what
+   it would have told the analyzer is unknown and a pass that needed it
+   declines: a narrower scope gives fewer variants, never different
+   ones. A pass that returns `Scope::WholeApp`, or `--whole-app`, makes
+   the build ingest everything instead.
+2. **Ingest and analyze**, without lowering. Files ingest can only
    partly read (a `--survey` gap, a syntax error) are still copied, but
    none of their methods gets a variant.
-2. **Select** ([`select.rs`](../../src/emit/fractal/select.rs)). Rubydex
+3. **Select** ([`select.rs`](../../src/emit/fractal/select.rs)). Rubydex
    finds every `class`/`module` body whose resolved name is a `--class`,
    reopenings included. Bodies of other classes nested inside are not
    selected; the innermost body around a definition decides, so `--class
    A --class A::B::C` covers what is written in `A` and in `C` but not in
    `B`. A name the app does not define is an error.
-3. **Regions** ([`region.rs`](../../src/emit/fractal/region.rs)). Each
+4. **Regions** ([`region.rs`](../../src/emit/fractal/region.rs)). Each
    `def` written directly in a selected body is a region, with the
    analyzer's IR for it (one copy per includer for a concern's methods)
    and a summary of what the analyzer knows: how much of the body is
@@ -46,15 +64,15 @@ All of it lives in [`src/emit/fractal/`](../../src/emit/fractal/).
    call that may wrap it (`memoize def ...`; the visibility calls are
    fine), on an object other than the class, or when its body calls
    `__dir__` or `require_relative`, or defines a method.
-4. **Passes** ([`pass.rs`](../../src/emit/fractal/pass.rs)). Each pass
+5. **Passes** ([`pass.rs`](../../src/emit/fractal/pass.rs)). Each pass
    sees every admitted region and may propose edits inside the method's
    definition, the guards they rely on, and whether replaying the method
    is unobservable. `pass::registered()` is empty.
-5. **Variants** ([`variant.rs`](../../src/emit/fractal/variant.rs)). The
+6. **Variants** ([`variant.rs`](../../src/emit/fractal/variant.rs)). The
    proposals for one region are combined, in pass order. A proposal
    with an edit outside the definition, or overlapping an earlier edit,
    is dropped and reported. A region nothing edited gets no variant.
-6. **Write** ([`overlay.rs`](../../src/emit/fractal/overlay.rs)). The
+7. **Write** ([`overlay.rs`](../../src/emit/fractal/overlay.rs)). The
    output directory gets `config/initializers/fractal.rb` when there is
    at least one variant, and nothing otherwise: a large app is never
    copied. A rebuild first removes what an earlier build wrote there, so
@@ -148,9 +166,12 @@ objects and bytes, GC time and retained memory.
 
 ## Writing a pass
 
-Implement [`Pass`](../../src/emit/fractal/pass.rs): a name and a `run`
-that takes a [`Region`](../../src/emit/fractal/region.rs) and returns a
-`Proposal`. Read the analyzed IR in `region.analyzed`; express
+Implement [`Pass`](../../src/emit/fractal/pass.rs): a name, a `scope`
+and a `run` that takes a [`Region`](../../src/emit/fractal/region.rs)
+and returns a `Proposal`. The scope says what the build has to ingest
+for the pass to know what it needs: start from `Scope::Classes` with
+the narrowest reaches that give it its facts, and say
+`Scope::WholeApp` only when they can come from anywhere in the app. Read the analyzed IR in `region.analyzed`; express
 replacements as `Edit`s on source spans inside `region.def_span`; add a
 `Guard` for every app definition outside the method the variant relies
 on; set `replayable` only when running the method twice is

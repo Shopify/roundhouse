@@ -26,11 +26,21 @@ use crate::App;
 use crate::span::Span;
 
 use super::region::Region;
+use super::scope::Scope;
 
 /// One compile-time transformation.
 pub trait Pass {
     /// Stable, short, kebab-case: it appears in reports and variant keys.
     fn name(&self) -> &'static str;
+
+    /// What the build must ingest for this pass to know what it needs.
+    /// A pass whose facts come from the selected classes (and, say, their
+    /// ancestors) names that, and the build reads only those files; one
+    /// that needs facts from anywhere in the app says
+    /// [`Scope::WholeApp`]. Anything outside the scope is unknown to the
+    /// analyzer, so a pass that under-declares gets fewer facts and
+    /// should decline where it lacks them.
+    fn scope(&self) -> Scope;
 
     /// Propose a variant of `region`, or decline with a reason. Called
     /// only for admitted regions.
