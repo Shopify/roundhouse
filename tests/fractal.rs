@@ -497,3 +497,89 @@ fn the_cli_builds_reports_and_rejects_fractal_flags_elsewhere() {
     assert!(!misplaced.status.success());
     assert!(String::from_utf8_lossy(&misplaced.stderr).contains("only meaningful with --target fractal"));
 }
+
+/// What `boot_snapshot.rb` writes, for a build that never runs Ruby.
+const SNAPSHOT: &str = r#"{
+  "env": "production", "active_record": "8.1.4", "ruby": "3.4.9",
+  "classes": {
+    "Account": {"file": "app/models/account.rb", "schema_loaded": true, "aliases": [["id_value", "id"]],
+                "flags": ["@attribute_methods_generated"],
+                "methods": [["name", "active_record", "name"], ["name=", "active_record", "name="],
+                            ["name_changed?", "active_model_proxy_attribute_changed?", "name_changed?"]]},
+    "Admin::Report": {"declined": "not an Active Record model"}
+  },
+  "bodies": {
+    "active_model_proxy_attribute_changed?": {"name_changed?": "def name_changed?(**options);self.attribute_changed?(\"name\", **options);end"},
+    "active_record": {"name": "def name;  _read_attribute('name') { |n| missing_attribute(n, caller) };end",
+                      "name=": "def name=(value);  _write_attribute('name', value);end"}
+  }
+}"#;
+
+#[test]
+fn boot_regions_render_shared_bodies_bind_tables_and_an_initializer() {
+    let snapshot: fractal::boot::Snapshot = serde_json::from_str(SNAPSHOT).unwrap();
+    let classes = vec!["Account".to_string(), "Admin::Report".to_string(), "Missing".to_string()];
+    let (report, files) = fractal::boot::render(&snapshot, &classes).unwrap();
+    assert_eq!(report.regions.len(), 1);
+    assert_eq!((report.regions[0].class.as_str(), report.regions[0].file.as_str(), report.regions[0].methods), ("Account", "app/models/account.rb", 3));
+    let declined: Vec<(&str, &str)> = report.declined.iter().map(|d| (d.class.as_str(), d.reason.as_str())).collect();
+    assert_eq!(declined, [("Admin::Report", "not an Active Record model"), ("Missing", "the boot recorded nothing for it")]);
+    let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["config/fractal/boot/attribute_methods.rb", "config/fractal/boot/classes/account.rb", "config/initializers/fractal_boot.rb"]
+    );
+    let file = |path: &str| files.iter().find(|(p, _)| p == path).unwrap().1.as_str();
+    let bodies = file("config/fractal/boot/attribute_methods.rb");
+    assert!(bodies.starts_with("# frozen_string_literal: true\n"), "{bodies}");
+    assert!(bodies.contains("      N0 = Module.new\n"), "{bodies}");
+    assert!(bodies.contains("        def name_changed?(**options);self.attribute_changed?(\"name\", **options);end\n"), "{bodies}");
+    let account = file("config/fractal/boot/classes/account.rb");
+    assert!(account.contains("owner = Account.send(:generated_attribute_methods)\n"), "{account}");
+    assert!(account.contains("Fractal::Boot.bind(owner, Fractal::Boot::Bodies::N0, [:name_changed?, :name_changed?])\n"), "{account}");
+    assert!(account.contains("Fractal::Boot.bind(owner, Fractal::Boot::Bodies::N1, [:name, :name, :name=, :name=])\n"), "{account}");
+    assert!(
+        account.contains("Account.load_schema\nAccount.alias_attribute('id_value', 'id')\nAccount.instance_variable_set(:@attribute_methods_generated, true)\n"),
+        "{account}"
+    );
+    assert!(!account.contains("@alias_attributes_mass_generated"), "only the flags the boot set");
+    let init = file("config/initializers/fractal_boot.rb");
+    assert!(init.starts_with(fractal::boot::RUNTIME), "the runtime comes first");
+    assert!(init.contains("env: 'production', active_record: '8.1.4',\n  regions: {\n    'Account' => 'account.rb',\n"), "{init}");
+    assert!(init.ends_with("Fractal::Boot.attach(Rails.application)\n"), "{init}");
+
+    // Nothing to bind, nothing to write.
+    let (_, none) = fractal::boot::render(&snapshot, &["Admin::Report".to_string()]).unwrap();
+    assert!(none.is_empty());
+}
+
+#[test]
+fn a_rebuild_removes_boot_regions_it_no_longer_generates() {
+    let snapshot: fractal::boot::Snapshot = serde_json::from_str(SNAPSHOT).unwrap();
+    let (report, files) = fractal::boot::render(&snapshot, &["Account".to_string()]).unwrap();
+    let dir = app_dir("boot-rebuild", &base_files());
+    let mut plan = build_plan(&dir, &["Account"], &[]).unwrap();
+    plan.generated = files;
+    plan.report.boot = Some(report);
+    let out = scratch("boot-rebuild-out").join("out");
+    fractal::write(&out, &plan).unwrap();
+    assert_eq!(files_in(&out).len(), 3);
+    fractal::write(&out, &build_plan(&dir, &[], &[]).unwrap()).unwrap();
+    assert!(files_in(&out).is_empty());
+    assert!(!out.join("config").exists());
+    assert!(fractal::owns("config/fractal/boot/classes/a.rb"));
+    assert!(!fractal::owns("config/fractal/boot/"));
+    assert!(!fractal::owns("config/fractal/other.rb"));
+}
+
+#[test]
+fn boot_is_a_fractal_flag() {
+    let dir = app_dir("boot-cli", &base_files());
+    let run = |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_roundhouse")).args(args).output().unwrap();
+    let misplaced = run(&["--target", "ruby", "--boot", "production", dir.to_str().unwrap()]);
+    assert!(!misplaced.status.success());
+    assert!(String::from_utf8_lossy(&misplaced.stderr).contains("only meaningful with --target fractal"));
+    let odd = run(&["--target", "fractal", "--class", "Current", "--boot", "prod;rm", dir.to_str().unwrap()]);
+    assert!(!odd.status.success());
+    assert!(String::from_utf8_lossy(&odd.stderr).contains("--boot takes an environment name"));
+}

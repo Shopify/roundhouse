@@ -5,11 +5,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::boot;
 use super::variant::INITIALIZER;
 
-/// Every path a fractal build can write, relative to the app root. A
-/// rebuild replaces these and nothing else.
-pub const OWNED: &[&str] = &[INITIALIZER];
+/// Every file a fractal build can write, relative to the app root, besides
+/// what it writes under [`boot::DIR`]. A rebuild replaces these and
+/// nothing else.
+pub const OWNED: &[&str] = &[INITIALIZER, boot::INITIALIZER];
+
+/// Is `rel` a path a fractal build owns?
+pub fn owns(rel: &str) -> bool {
+    OWNED.contains(&rel) || (rel.starts_with(boot::DIR) && !rel.contains("/../") && rel.len() > boot::DIR.len())
+}
 
 /// Write `generated` under `out`. `out` may be absent, empty, or hold
 /// only files an earlier build wrote, which are removed first: a rebuild
@@ -17,13 +24,13 @@ pub const OWNED: &[&str] = &[INITIALIZER];
 /// the old one behind. Anything else in `out` is refused, so `-o` can
 /// never point at the app itself.
 pub fn write(out: &Path, generated: &[(String, String)]) -> Result<usize, String> {
-    if let Some((path, _)) = generated.iter().find(|(path, _)| !OWNED.contains(&path.as_str())) {
+    if let Some((path, _)) = generated.iter().find(|(path, _)| !owns(path)) {
         return Err(format!("internal: {path} is not a path a fractal build owns"));
     }
     if out.exists() {
         let mut found = Vec::new();
         walk(out, out, &mut found)?;
-        let foreign: Vec<&String> = found.iter().filter(|rel| !OWNED.contains(&rel.as_str())).collect();
+        let foreign: Vec<&String> = found.iter().filter(|rel| !owns(rel)).collect();
         if let Some(first) = foreign.first() {
             return Err(format!(
                 "output {} holds {} file(s) a fractal build did not write ({first}, ...); use an empty directory or an earlier fractal output",

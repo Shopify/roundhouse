@@ -20,8 +20,10 @@ calls for their own sake, devirtualization and constant folding are the
 JIT's job, not Fractal's.
 
 **This baseline registers no pass.** It is the pipeline, the contract
-and the runtime that passes attach to. A build today reports what it
-would work with and emits nothing.
+and the runtime that passes attach to. Without `--boot`, a build today
+reports what it would work with and emits nothing. With `--boot ENV` it
+also writes [boot regions](#boot-regions): the attribute methods Rails
+generates for selected models while the app boots, as plain Ruby.
 
 ## Pipeline
 
@@ -56,8 +58,9 @@ All of it lives in [`src/emit/fractal/`](../../src/emit/fractal/).
    is dropped and reported. A region nothing edited gets no variant.
 6. **Write** ([`overlay.rs`](../../src/emit/fractal/overlay.rs)). The
    output directory gets `config/initializers/fractal.rb` when there is
-   at least one variant, and nothing otherwise: a large app is never
-   copied. A rebuild first removes what an earlier build wrote there, so
+   at least one variant, `config/initializers/fractal_boot.rb` and
+   `config/fractal/boot/` when there is at least one boot region, and
+   nothing otherwise: a large app is never copied. A rebuild first removes what an earlier build wrote there, so
    deselecting a class leaves no stale initializer; a directory holding
    anything else is refused, which keeps `-o` from pointing at the app.
    Placing the overlay on the app's root is the deploy step, and so is
@@ -65,7 +68,9 @@ All of it lives in [`src/emit/fractal/`](../../src/emit/fractal/).
 
 `--report PATH` writes the build's decisions as JSON: the selected
 bodies, every region with its admission and knowledge, the variants and
-their guards, and every declined site with the pass and reason.
+their guards, every declined site with the pass and reason, and with
+`--boot`, the boot regions and the models declined one
+([Boot regions](#boot-regions)).
 
 ## What a variant is
 
@@ -116,6 +121,96 @@ construction and the CLI. `tests/fractal_runtime.rs` builds an app with
 a test pass and checks every install, pending and decline rule against
 Ruby, with Active Record and Current attributes when they are
 installed.
+
+## Boot regions
+
+`--boot ENV` adds a second kind of region. A method region is a `def`
+the app wrote; a boot region is work Rails does for a selected class
+while the app boots in ENV, decided at build time and written out as
+plain Ruby, so that boot does less. Today a boot region is an Active
+Record model's attribute methods: on every boot that defines them,
+Active Support's CodeGenerator builds their source as strings (readers,
+writers, the dirty-tracking and query methods, `alias_attribute`
+methods) and compiles it.
+
+Which methods a model gets depends on its schema and on every gem and
+initializer that adds attribute method patterns, so the build does not
+predict them. It boots the app once, in ENV, under
+[`boot_snapshot.rb`](../../src/emit/fractal/boot_snapshot.rb) (`ruby`
+in the app root with `RAILS_ENV=ENV`; whatever the app needs to boot
+there has to be available to the build) and records, for each selected
+model, the methods CodeGenerator compiled into its generated attribute
+methods module with their source, the aliases Rails registered while
+defining them, and the flags it set. The overlay
+([`boot.rs`](../../src/emit/fractal/boot.rs)) then holds:
+
+- `config/fractal/boot/attribute_methods.rb`: each body once, one
+  module per Active Support method cache, as CodeGenerator keeps them,
+  compiled with the frozen string literals it compiles with;
+- `config/fractal/boot/classes/*.rb`: per model, the names it binds to
+  those bodies, then the schema load, the aliases and the flags that
+  Rails' own `define_attribute_methods` leaves behind;
+- `config/initializers/fractal_boot.rb`: the runtime
+  ([`boot.rb`](../../src/emit/fractal/boot.rb)), which binds a model's
+  region when Zeitwerk loads it (every load, so a reload gets it again)
+  and on each prepare for a model loaded earlier. A model whose attribute
+  methods are already generated keeps them.
+
+Binding is what CodeGenerator does after it has compiled:
+`define_method(name, body)` from a body that is a plain `def`, so the
+methods are the same kind of method entry Rails makes. Nothing is
+compiled from a string.
+
+A model is declined, with the reason in the report, when it is not an
+Active Record model, is abstract, is defined outside the app, did not
+have its attribute methods generated during the boot (Rails leaves
+them to first use unless the app eager loads with a schema cache dump
+and `check_schema_cache_dump_version = false`), or has a generated
+method the snapshot cannot account for (one not compiled by
+CodeGenerator, a body it did not see, a name that cannot be written as
+a `def`, or source compiled straight into the module). A declined model
+is left to Rails.
+
+**No guards.** A method variant is guarded at load because it replaces
+a method the app wrote, and a stale overlay must fall back to the
+app's code. A boot region has nothing to compare at load: it stands
+for what Rails would generate, and checking that would mean generating
+it. So a boot region is verified at build time instead, and the
+overlay belongs to the build of the app it was made from, the way
+compiled output does. The runtime makes one decision per boot, not
+per class: it binds only in the environment and Active Record version
+the regions were built for, and otherwise does nothing.
+`FRACTAL_BOOT=0` leaves every model to Rails; `FRACTAL_BOOT=1` binds in
+any environment, for running the app's suite against the overlay.
+`Fractal::Boot.bound` lists the models bound so far.
+
+**The gate** is the boot state. Boot the app and the app with the
+overlay on it in ENV and compare, for every model, the generated
+attribute methods (name, parameters, arity, original name, owner),
+the public and private method lists, attribute types, columns,
+aliases and the class's instance variables. They must be identical,
+and the app's suite must pass with the overlay. `tests/fractal_runtime.rs`
+does this against real Active Record for a small app that stands in
+for a Rails boot, including a reload, another environment and the off
+switch; `tests/fractal.rs` covers rendering, ownership of the overlay
+paths and the CLI.
+
+Measured (October 2026, a 32-core Linux box, Ruby 3.4.9, Rails 8.1.4,
+SQLite, warm Bootsnap, production, interleaved runs): real-blog with
+400 generated models of 30 columns each, so that this phase weighs
+what it does in a large app, 283,059 attribute methods:
+
+| | median boot, n=15 |
+|---|--:|
+| Rails | 3,314 ms |
+| with the `--boot production` overlay | 1,690 ms |
+
+The attribute method phase goes from about 1.8 s to about 0.4 s, of
+which about 0.2 s is the schema load that stays. Shape matters: a
+first prototype that wrote each model's methods out as their own
+copies of the source spent 650 ms deserializing 55 MB of instruction
+sequences, and saved half as much. Unmodified real-blog, with two
+models, boots in the same time either way.
 
 ## JIT shape
 

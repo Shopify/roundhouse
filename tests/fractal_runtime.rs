@@ -5,9 +5,16 @@
 //! installed, which declined and why, and that an installed one keeps
 //! the original's visibility, nesting, `super`, file and line.
 //!
+//! Boot regions (`--boot`) get the same treatment against real Active
+//! Record: the build boots a small app in production, and
+//! `tests/support/fractal_boot_test.rb` checks that the app with the
+//! overlay placed on it ends its boot in the state plain Rails leaves,
+//! with the attribute methods bound from the overlay.
+//!
 //! Needs `ruby` (with minitest, a bundled gem) on PATH. The Active
-//! Record and Current attributes cases run when `activerecord` is
-//! installed, as CI's unit job does, and skip otherwise.
+//! Record and Current attributes cases, and the boot regions, run when
+//! `activerecord` (and, for boot regions, `sqlite3`) is installed, as
+//! CI's unit job does, and skip otherwise.
 
 use std::fs;
 use std::path::PathBuf;
@@ -157,4 +164,141 @@ fn the_runtime_installs_variants_whose_guards_hold_and_keeps_the_app_otherwise()
         assert!(status.success());
         ruby(&copy, mode);
     }
+}
+
+/// A stand-in for a Rails boot: just enough for the boot snapshot and the
+/// boot regions' runtime. An environment from `RAILS_ENV`, Zeitwerk-shaped
+/// `on_load` and `to_prepare`, initializers loaded before the models, and,
+/// in production only, Rails' step of defining every model's attribute
+/// methods once the app has loaded (`Lazy` excepted, as a model Rails
+/// left to its first use).
+const BOOT_ENVIRONMENT: &str = r#"require "pathname"
+require "active_record"
+
+module Rails
+  Loader = Struct.new(:callbacks) do
+    def on_load(cpath, &block)
+      (callbacks[cpath] ||= []) << block
+    end
+  end
+  Config = Struct.new(:prepares) do
+    def to_prepare(&block)
+      prepares << block
+    end
+  end
+  Application = Struct.new(:root, :config)
+
+  def self.root = Pathname.new(File.expand_path("..", __dir__))
+  def self.env = ENV.fetch("RAILS_ENV", "development")
+  def self.application = (@application ||= Application.new(root, Config.new([])))
+  def self.autoloaders = (@autoloaders ||= Struct.new(:main).new(Loader.new({})))
+
+  # What an autoload does: load the file, then run the on_load callbacks.
+  def self.autoload_model(cpath)
+    load root.join("app/models/#{cpath.downcase}.rb").to_s
+    klass = Object.const_get(cpath)
+    autoloaders.main.callbacks.fetch(cpath, []).each { |callback| callback.call(klass, nil) }
+    klass
+  end
+end
+
+ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+ActiveRecord::Schema.verbose = false
+ActiveRecord::Schema.define do
+  create_table(:articles) { |t| t.string :title; t.text :body; t.integer :rating; t.boolean :published; t.timestamps }
+  create_table(:comments) { |t| t.integer :article_id; t.text :body; t.timestamps }
+  create_table(:widgets) { |t| t.string :name; t.decimal :price }
+  create_table(:lazies) { |t| t.string :name }
+end
+
+Dir[Rails.root.join("config/initializers/*.rb").to_s].sort.each { |file| load file }
+%w[Article Comment Widget Plain Lazy].each { |name| Rails.autoload_model(name) }
+Rails.application.config.prepares.each(&:call)
+(ActiveRecord::Base.descendants - [Lazy]).each(&:define_attribute_methods) if Rails.env == "production"
+"#;
+
+const BOOT_FILES: &[(&str, &str)] = &[
+    ("config/environment.rb", BOOT_ENVIRONMENT),
+    (
+        "app/models/article.rb",
+        "class Article < ActiveRecord::Base\n  alias_attribute :headline, :title\n  attribute :rating, :integer\nend\n",
+    ),
+    ("app/models/comment.rb", "class Comment < ActiveRecord::Base\n  def body\n    super&.upcase\n  end\nend\n"),
+    ("app/models/widget.rb", "class Widget < ActiveRecord::Base\nend\n"),
+    ("app/models/plain.rb", "class Plain\n  def label\n    \"plain\"\n  end\nend\n"),
+    ("app/models/lazy.rb", "class Lazy < ActiveRecord::Base\nend\n"),
+];
+
+fn ruby_has(libs: &[&str]) -> bool {
+    let script = libs.iter().map(|lib| format!("require {lib:?}")).collect::<Vec<_>>().join("; ");
+    Command::new("ruby").args(["-e", &script]).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[test]
+fn boot_regions_bind_the_attribute_methods_rails_generated_and_leave_its_boot_state() {
+    if !ruby_has(&["active_record", "sqlite3"]) {
+        eprintln!("skipping: activerecord and sqlite3 are not installed");
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("roundhouse-fractal-boot-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let app_dir = base.join("app");
+    for (path, content) in BOOT_FILES {
+        let path = app_dir.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let mut app = ingest_app(&app_dir).expect("ingest");
+    Analyzer::new(&app).analyze(&mut app);
+    let classes: Vec<String> = ["Article", "Comment", "Plain", "Lazy"].iter().map(|c| c.to_string()).collect();
+    let plan = fractal::plan_with_boot(&app, &app_dir, &classes, &[], &[], Some("production")).expect("plan");
+    let boot = plan.report.boot.as_ref().expect("a boot report");
+    assert_eq!(boot.env, "production");
+    let regions: Vec<(&str, &str)> = boot.regions.iter().map(|r| (r.class.as_str(), r.file.as_str())).collect();
+    assert_eq!(regions, [("Article", "app/models/article.rb"), ("Comment", "app/models/comment.rb")]);
+    assert!(boot.regions.iter().all(|r| r.methods > 50), "{:?}", boot.regions);
+    // In the order the selection found them: by file.
+    let declined: Vec<(&str, &str)> = boot.declined.iter().map(|d| (d.class.as_str(), d.reason.as_str())).collect();
+    assert_eq!(
+        declined,
+        [("Lazy", "Rails did not generate its attribute methods during the boot"), ("Plain", "not an Active Record model")]
+    );
+    let mut written: Vec<&str> = plan.generated.iter().map(|(path, _)| path.as_str()).collect();
+    written.sort();
+    assert_eq!(
+        written,
+        [
+            "config/fractal/boot/attribute_methods.rb",
+            "config/fractal/boot/classes/article.rb",
+            "config/fractal/boot/classes/comment.rb",
+            "config/initializers/fractal_boot.rb",
+        ]
+    );
+    // Bodies are kept once per method cache, not once per model.
+    let bodies = &plan.generated.iter().find(|(p, _)| p.ends_with("attribute_methods.rb")).unwrap().1;
+    assert_eq!(bodies.matches("def created_at_changed?(").count(), 1, "{bodies}");
+
+    let overlay = base.join("overlay");
+    fractal::write(&overlay, &plan).expect("write");
+    let out = base.join("out");
+    assert!(Command::new("cp").arg("-a").arg(&app_dir).arg(&out).status().unwrap().success());
+    assert!(Command::new("cp").arg("-a").arg(format!("{}/.", overlay.display())).arg(&out).status().unwrap().success());
+    for (path, content) in BOOT_FILES {
+        assert_eq!(&fs::read_to_string(out.join(path)).unwrap(), content, "{path} is the app's own");
+    }
+
+    let root = env!("CARGO_MANIFEST_DIR");
+    let output = Command::new("ruby")
+        .arg(format!("{root}/tests/support/fractal_boot_test.rb"))
+        .env("FRACTAL_SOURCE", &app_dir)
+        .env("FRACTAL_OUT", &out)
+        .env_remove("FRACTAL_BOOT")
+        .output()
+        .expect("ruby must be on PATH");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

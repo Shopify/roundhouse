@@ -25,10 +25,17 @@
 //!   loads, only after its guards hold, and leaves the app's own method
 //!   in place otherwise.
 //!
+//! - [`boot`], with `--boot ENV`: boot regions, the work Rails does for a
+//!   selected class while the app boots in ENV (today, an Active Record
+//!   model's attribute methods), recorded from one boot of the app at
+//!   build time and written out as plain Ruby that is bound when the
+//!   class loads.
+//!
 //! No app file is edited, so the output is an overlay holding only what
 //! a build generates (`config/initializers/fractal.rb`, when there is at
-//! least one variant) to be placed on the app's root. With no variant it
-//! is empty.
+//! least one variant, and `config/initializers/fractal_boot.rb` with
+//! `config/fractal/boot/`, when there is at least one boot region) to be
+//! placed on the app's root. With neither it is empty.
 //!
 //! Where YJIT and ZJIT would want different shapes, Fractal takes ZJIT's.
 //! The unit of specialization is a whole method, chosen once at load:
@@ -36,6 +43,7 @@
 //! without the original's paths in it, and no call pays a guard. See
 //! `docs/pipeline/fractal.md`.
 
+pub mod boot;
 pub mod pass;
 pub mod region;
 pub mod select;
@@ -49,6 +57,7 @@ use serde::Serialize;
 use crate::App;
 use crate::span::FileId;
 
+pub use boot::{BootDecline, BootRegion, BootReport};
 pub use pass::{Cx, Edit, Guard, Pass, Proposal};
 pub use region::{Analyzed, Knowledge, Region};
 pub use select::Selection;
@@ -64,6 +73,9 @@ pub struct Report {
     pub regions: Vec<RegionReport>,
     pub variants: Vec<Variant>,
     pub declined: Vec<Decline>,
+    /// With `--boot ENV`: the boot regions and the classes declined one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot: Option<BootReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +123,22 @@ impl Report {
         for d in &self.declined {
             out.push_str(&format!("  declined      {} [{}]: {}\n", d.at, d.pass, d.reason));
         }
+        if let Some(boot) = &self.boot {
+            out.push_str(&format!(
+                "fractal: {} boot region(s) for {} (Active Record {}), {} attribute method(s); {} class(es) declined\n",
+                boot.regions.len(),
+                boot.env,
+                if boot.active_record.is_empty() { "not loaded" } else { &boot.active_record },
+                boot.regions.iter().map(|r| r.methods).sum::<usize>(),
+                boot.declined.len()
+            ));
+            for r in &boot.regions {
+                out.push_str(&format!("  boot region   {} ({}): {} attribute method(s)\n", r.class, r.file, r.methods));
+            }
+            for d in &boot.declined {
+                out.push_str(&format!("  boot declined {}: {}\n", d.class, d.reason));
+            }
+        }
         out
     }
 }
@@ -126,6 +154,20 @@ pub struct Plan {
 /// read; `untrusted` names files ingest could only partly read (a
 /// `--survey` gap or a syntax error), which keep the app's code.
 pub fn plan(app: &App, input: &Path, classes: &[String], untrusted: &[String], passes: &[&dyn Pass]) -> Result<Plan, String> {
+    plan_with_boot(app, input, classes, untrusted, passes, None)
+}
+
+/// [`plan`], and with `boot` (an environment name) the selected classes'
+/// boot regions too: the build boots the app at `input` once in that
+/// environment ([`boot::snapshot`]) and writes what it recorded.
+pub fn plan_with_boot(
+    app: &App,
+    input: &Path,
+    classes: &[String],
+    untrusted: &[String],
+    passes: &[&dyn Pass],
+    boot: Option<&str>,
+) -> Result<Plan, String> {
     let mut report = Report {
         classes: classes.to_vec(),
         passes: passes.iter().map(|p| p.name().to_string()).collect(),
@@ -177,9 +219,12 @@ pub fn plan(app: &App, input: &Path, classes: &[String], untrusted: &[String], p
     }
 
     let mut generated = Vec::new();
-    if !variants.is_empty() {
+    let defines_fractal = || {
         let all = app.const_resolver.for_sources(&app.sources).class_bodies();
-        if all.iter().any(|(name, _)| name.as_ref() == "Fractal") {
+        all.iter().any(|(name, _)| name.as_ref() == "Fractal")
+    };
+    if !variants.is_empty() {
+        if defines_fractal() {
             return Err("the app defines `Fractal`, the constant the fractal runtime needs".into());
         }
         if input.join(INITIALIZER).exists() {
@@ -188,6 +233,27 @@ pub fn plan(app: &App, input: &Path, classes: &[String], untrusted: &[String], p
         generated.push((INITIALIZER.to_string(), variant::initializer(&variants)));
     }
     report.variants = variants;
+
+    if let Some(env) = boot {
+        let mut names: Vec<String> = Vec::new();
+        for (name, _) in &selection.bodies {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        let snapshot = boot::snapshot(input, env, &names)?;
+        let (boot_report, files) = boot::render(&snapshot, &names)?;
+        if !files.is_empty() {
+            if defines_fractal() {
+                return Err("the app defines `Fractal`, the constant the fractal runtime needs".into());
+            }
+            if input.join(boot::INITIALIZER).exists() || input.join(boot::DIR).exists() {
+                return Err(format!("{} or {} already exists in the app", boot::INITIALIZER, boot::DIR));
+            }
+        }
+        generated.extend(files);
+        report.boot = Some(boot_report);
+    }
     Ok(Plan { report, generated })
 }
 
@@ -198,7 +264,7 @@ pub fn write(out: &Path, plan: &Plan) -> Result<usize, String> {
     overlay::write(out, &plan.generated)
 }
 
-pub use overlay::OWNED;
+pub use overlay::{OWNED, owns};
 
 /// Is `rel` the tail of `path` at a path boundary?
 fn is_suffix_path(path: &str, rel: &str) -> bool {

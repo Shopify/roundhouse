@@ -37,7 +37,7 @@ fn usage() -> &'static str {
     "\
 Usage: roundhouse --target LANG [INPUT] [-o OUT]
        roundhouse --site [INPUT] [-o OUT]
-       roundhouse --target fractal [--class NAME]... [--report PATH] [INPUT] [-o OUT]
+       roundhouse --target fractal [--class NAME]... [--boot ENV] [--report PATH] [INPUT] [-o OUT]
        roundhouse --archives LANG,LANG [INPUT] [-o OUT]
        roundhouse check [--continue] [--inventory PATH] [--hotspots] [APP]
        roundhouse lsp
@@ -70,8 +70,16 @@ Options:
                        specialize, by its full name (`Shop`,
                        `Admin::Report`). Repeatable. Every definition of it
                        is selected (Rubydex). No --class emits nothing.
+      --boot ENV       With --target fractal: also write boot regions for
+                       the selected classes. The build boots the app once
+                       in ENV (`ruby` in INPUT, RAILS_ENV=ENV) and records
+                       the attribute methods Active Record generated for
+                       each selected model; the overlay binds them as
+                       plain defs when the model loads, so a boot in ENV
+                       compiles none of them.
       --report PATH    With --target fractal: write the build's decisions
-                       (selection, methods, variants, declines) as JSON.
+                       (selection, methods, variants, boot regions,
+                       declines) as JSON.
       --site           Build all targets + landing-page assets.
                        Default INPUT=fixtures/real-blog  Default OUT=./_site/
       --archives LIST  Build only comma-separated targets' browse archives.
@@ -128,8 +136,8 @@ fn cli() -> ExitCode {
             println!("roundhouse {}", roundhouse::version::describe());
             ExitCode::SUCCESS
         }
-        Ok(Action::Fractal { classes, input, out, survey, report }) => {
-            match run_fractal(&classes, &input, &out, survey, report.as_deref()) {
+        Ok(Action::Fractal { classes, input, out, survey, report, boot }) => {
+            match run_fractal(&classes, &input, &out, survey, report.as_deref(), boot.as_deref()) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("roundhouse: {e}");
@@ -189,6 +197,7 @@ enum Action {
         out: PathBuf,
         survey: bool,
         report: Option<PathBuf>,
+        boot: Option<String>,
     },
     Archives {
         targets: Vec<BuildTarget>,
@@ -207,6 +216,7 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
     let mut fractal = false;
     let mut classes: Vec<String> = Vec::new();
     let mut report: Option<PathBuf> = None;
+    let mut boot: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
     let mut iter = args.into_iter();
@@ -238,6 +248,7 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
             }
             "--class" => classes.push(iter.next().ok_or("--class requires a class name")?),
             "--report" => report = Some(PathBuf::from(iter.next().ok_or("--report requires a path")?)),
+            "--boot" => boot = Some(iter.next().ok_or("--boot requires an environment name")?),
             "-o" | "--output" => {
                 let v = iter
                     .next()
@@ -247,6 +258,7 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
             "--target=fractal" => fractal = true,
             s if s.starts_with("--class=") => classes.push(s["--class=".len()..].to_string()),
             s if s.starts_with("--report=") => report = Some(PathBuf::from(&s["--report=".len()..])),
+            s if s.starts_with("--boot=") => boot = Some(s["--boot=".len()..].to_string()),
             s if s.starts_with("--target=") => {
                 target = Some(parse_target(&s["--target=".len()..])?);
             }
@@ -278,10 +290,11 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
             out: out.unwrap_or_else(|| PathBuf::from("out/fractal")),
             survey,
             report,
+            boot,
         });
     }
-    if !classes.is_empty() || report.is_some() {
-        return Err("--class and --report are only meaningful with --target fractal".into());
+    if !classes.is_empty() || report.is_some() || boot.is_some() {
+        return Err("--class, --boot and --report are only meaningful with --target fractal".into());
     }
     if let Some(targets) = archives {
         if target.is_some() || site || allow_unsupported || survey {
@@ -342,8 +355,12 @@ fn run_fractal(
     out: &std::path::Path,
     survey: bool,
     report_path: Option<&std::path::Path>,
+    boot: Option<&str>,
 ) -> Result<(), String> {
     use roundhouse::emit::fractal;
+    if boot.is_some_and(|env| env.is_empty() || !env.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')) {
+        return Err("--boot takes an environment name (letters, digits, `_` and `-`)".into());
+    }
     if !input.exists() {
         return Err(format!("input {} does not exist", input.display()));
     }
@@ -390,7 +407,7 @@ fn run_fractal(
     roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
     let passes = fractal::pass::registered();
     let passes: Vec<&dyn fractal::Pass> = passes.iter().map(|p| p.as_ref()).collect();
-    let plan = fractal::plan(&app, input, classes, &untrusted, &passes)?;
+    let plan = fractal::plan_with_boot(&app, input, classes, &untrusted, &passes, boot)?;
     for line in plan.report.render().lines() {
         eprintln!("roundhouse: {line}");
     }
