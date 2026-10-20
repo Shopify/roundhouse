@@ -32,26 +32,24 @@
 //!   `to_json` methods are not touched: only this encoding consumer is.
 //! - **Keys that are not plain literals**, duplicate keys (an overwritten
 //!   value can still have effects), splats, `to_json` with options, and
-//!   values the analyzer cannot place among String, Integer, true, false
-//!   and nil (or one of those or nil).
+//!   values whose type is not String, Integer, true/false or nil (or one
+//!   of those or nil).
 //!
-//! The analyzer's types only choose which shape to try. They are not
-//! trusted: each call checks every value with Ruby's own core methods,
-//! never with a method of the value itself, and any value that is not
-//! exactly what the writer reproduces byte for byte (a String subclass,
-//! a non-UTF-8 string, one that needs escaping, a Float, ...) sends the
-//! call to the original expression, with the values already computed.
-//! So values are evaluated once, in source order, either way, and every
-//! case the writer does not cover is the app's own encoding.
+//! Types come from the analyzer, which reads the app's RBS (`sig/`
+//! sidecars and inline `#:` comments) and Sorbet signatures, and are
+//! taken as correct: an Integer, `true`, `false` or `nil` value is
+//! written as is. A String value is still checked on every call, since
+//! its JSON depends on its content: it must be exactly a String,
+//! ASCII-only or valid UTF-8, and contain nothing the json gem or Active
+//! Support would escape. A string that is not sends the call to the
+//! original expression, with the values already computed, so values are
+//! evaluated once, in source order, either way. A value that may be
+//! `nil` (`String?`) is written as `null` when it is.
 //!
-//! The variant relies on Active Support's encoding being the one in
-//! effect, unmodified, and on the core methods its checks call being
-//! Ruby's own. The [`Guard::ActiveSupportJson`] guard checks both when
-//! the owner loads; otherwise the app's method stays. It also declines
-//! when Active Support encodes with the json gem's `Coder` (json 2.15.2
-//! and later): the original is then native from end to end, and the
-//! writer measured slower than it for a six-value hash, so which shapes
-//! win there needs a cost model this pass does not have yet.
+//! The variant assumes `Hash#to_json` is Active Support's (or the json
+//! gem's: for the values the writer covers the two agree) and that
+//! nothing has redefined the core methods its string check calls.
+//! Nothing checks either at install yet.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -61,7 +59,7 @@ use crate::expr::Expr;
 use crate::span::Span;
 use crate::ty::Ty;
 
-use super::pass::{Cx, Edit, Guard, Pass, Proposal};
+use super::pass::{Cx, Edit, Pass, Proposal};
 use super::region::Region;
 
 pub struct JsonWriter;
@@ -480,7 +478,7 @@ impl Site {
         }
         body.push('}');
         let writer = if body.contains("#{") { format!("\"{body}\"") } else { format!("\"{body}\".dup") };
-        let checks: Vec<String> = self.checked().map(|(_, temp, kinds)| check(kinds, temp)).collect();
+        let checks: Vec<String> = self.checked().filter_map(|(_, temp, kinds)| check(kinds, temp)).collect();
         if checks.is_empty() {
             return writer;
         }
@@ -513,21 +511,16 @@ fn fragment(kinds: &BTreeSet<Kind>, t: &str) -> String {
     }
 }
 
-/// The test that `t` is a value whose JSON is exactly what
-/// [`fragment`] writes. It calls only core methods: on the classes, on
-/// the singletons, on the runtime's constants, and on `t` once it is
-/// known to be a String.
-fn check(kinds: &BTreeSet<Kind>, t: &str) -> String {
-    let one = |kind: Kind| match kind {
-        Kind::Nil => format!("nil.equal?({t})"),
-        Kind::Bool => format!("(true.equal?({t}) || false.equal?({t}))"),
-        Kind::Int => format!("::Integer === {t}"),
-        Kind::Str => format!(
-            "(::String === {t} && {t}.instance_of?(::String) && ({t}.ascii_only? || ({RT}::UTF_8.equal?({t}.encoding) && {t}.valid_encoding? && !{t}.include?({RT}::LINE_SEPARATOR) && !{t}.include?({RT}::PARAGRAPH_SEPARATOR))) && !{RT}::ESCAPE.match?({t}))"
-        ),
-    };
-    let parts: Vec<String> = kinds.iter().map(|k| one(*k)).collect();
-    if parts.len() == 1 { parts[0].clone() } else { format!("({})", parts.join(" || ")) }
+/// What a value of these kinds must pass for [`fragment`]'s text to be
+/// its JSON, or `None` when its type alone settles it. Only a String
+/// needs a check, on its content: see `Fractal::JsonWriter` in the
+/// runtime.
+fn check(kinds: &BTreeSet<Kind>, t: &str) -> Option<String> {
+    if !kinds.contains(&Kind::Str) {
+        return None;
+    }
+    let plain = format!("{RT}.exact_plain_string?({t})");
+    Some(if kinds.contains(&Kind::Nil) { format!("(nil.equal?({t}) || {plain})") } else { plain })
 }
 
 /// `json` inside a Ruby double-quoted literal. Baked JSON is printable
@@ -659,7 +652,6 @@ fn plan(region: &Region<'_>, text: &str, mut scan: Scan) -> Proposal {
         replayable &= plain;
     }
     if !proposal.edits.is_empty() {
-        proposal.guards.push(Guard::ActiveSupportJson);
         proposal.replayable = replayable;
     }
     proposal

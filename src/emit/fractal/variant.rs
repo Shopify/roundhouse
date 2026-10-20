@@ -143,16 +143,13 @@ pub fn initializer(variants: &[Variant]) -> String {
         let guards = v
             .guards
             .iter()
-            .map(|guard| match guard {
-                Guard::DefinedAt { constant, method, singleton, file, line } => format!(
+            .map(|Guard::DefinedAt { constant, method, singleton, file, line }| {
+                format!(
                     "{{ kind: :defined_at, constant: {}, method: {}, singleton: {singleton}, file: {}, line: {line} }}",
                     ruby_str(constant),
                     ruby_str(method),
                     ruby_str(file)
-                ),
-                Guard::ActiveSupportJson => {
-                    "{ kind: :active_support_json, constant: 'ActiveSupport::ToJsonWithActiveSupportEncoder' }".to_string()
-                }
+                )
             })
             .collect::<Vec<_>>()
             .join(", ");

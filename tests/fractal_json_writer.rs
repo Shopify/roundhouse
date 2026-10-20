@@ -3,10 +3,11 @@
 //! variant differs from the app's method only inside the rewritten
 //! spans and keeps every line where it was, that deselecting restores
 //! the app, and, against real Active Support
-//! (`tests/support/fractal_json_writer_test.rb`), that every probe gives
-//! the original's bytes, encoding, exceptions, effects and warnings, that
-//! the writer ran exactly where it should, and that a changed dependency
-//! keeps the app's method.
+//! (`tests/support/fractal_json_writer_test.rb`), that every probe of the
+//! declared types gives the original's bytes, encoding, exceptions,
+//! effects and warnings, and that the writer ran exactly where it should.
+//! Types come from inline RBS, an RBS sidecar in `sig/` and Sorbet
+//! signatures, through the analyzer.
 //!
 //! The runtime half needs `ruby` with minitest and `activesupport`, as
 //! CI's unit job installs; without Active Support it reports a skip.
@@ -182,7 +183,49 @@ const KEPT: &str = r#"class Kept
 end
 "#;
 
-const FILES: &[(&str, &str)] = &[("app/models/wire.rb", WIRE), ("app/models/loose.rb", LOOSE), ("app/models/kept.rb", KEPT)];
+/// Types from an RBS sidecar and from Sorbet signatures.
+const TYPED: &str = r#"class Typed
+  extend T::Sig
+
+  def initialize(title, count, flag)
+    @title = title
+    @count = count
+    @flag = flag
+  end
+
+  def title
+    @title
+  end
+
+  def count
+    @count
+  end
+
+  sig { returns(T::Boolean) }
+  def flag
+    @flag
+  end
+
+  sig { returns(T.nilable(String)) }
+  def note
+    nil
+  end
+
+  def to_wire
+    { title: title, count: count, flag: flag, note: note }.to_json
+  end
+end
+"#;
+
+const TYPED_RBS: &str = "class Typed\n  def title: () -> String\n  def count: () -> Integer\nend\n";
+
+const FILES: &[(&str, &str)] = &[
+    ("app/models/wire.rb", WIRE),
+    ("app/models/loose.rb", LOOSE),
+    ("app/models/kept.rb", KEPT),
+    ("app/models/typed.rb", TYPED),
+    ("sig/typed.rbs", TYPED_RBS),
+];
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("roundhouse-fractal-json-{name}-{}", std::process::id()));
@@ -227,11 +270,13 @@ fn files_in(dir: &Path) -> Vec<String> {
 #[test]
 fn it_rewrites_fixed_shapes_and_reports_every_site_it_keeps() {
     let dir = app_dir("plan");
-    let plan = build_plan(&dir, &["Wire", "Loose", "Kept"]);
+    let plan = build_plan(&dir, &["Wire", "Loose", "Kept", "Typed"]);
     let variants: Vec<&str> = plan.report.variants.iter().map(|v| v.key.split('@').next().unwrap()).collect();
-    assert_eq!(variants, ["Loose#fixed", "Loose#pair", "Wire#pair", "Wire#local", "Wire#noted", "Wire#fixed", "Wire#nested", "Wire#endless", "Wire#secret"]);
+    assert_eq!(
+        variants,
+        ["Loose#fixed", "Loose#pair", "Typed#to_wire", "Wire#pair", "Wire#local", "Wire#noted", "Wire#fixed", "Wire#nested", "Wire#endless", "Wire#secret"]
+    );
     assert!(plan.report.variants.iter().all(|v| v.passes == ["json-writer"]));
-    assert!(plan.report.variants.iter().all(|v| v.guards == [fractal::Guard::ActiveSupportJson]));
 
     let declined: Vec<(String, String)> = plan
         .report
@@ -352,8 +397,8 @@ fn deselecting_the_classes_gives_the_app_back() {
 #[test]
 fn every_probe_matches_the_original_against_active_support() {
     let dir = app_dir("runtime");
-    let plan = build_plan(&dir, &["Wire", "Loose"]);
-    assert_eq!(plan.report.variants.len(), 9);
+    let plan = build_plan(&dir, &["Wire", "Loose", "Typed"]);
+    assert_eq!(plan.report.variants.len(), 10);
     let base = dir.parent().unwrap().to_path_buf();
     let overlay = base.join("overlay");
     fractal::write(&overlay, &plan).unwrap();

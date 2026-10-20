@@ -10,9 +10,9 @@
 #   scripts/bench-fractal-json-writer -- --yjit
 #   scripts/bench-fractal-json-writer -- --zjit      # Ruby 4.0 and later
 #
-# --encoder JSONGemEncoder sets ActiveSupport.json_encoder in both modes,
-# for a json new enough that Active Support would pick its Coder, where
-# the variants decline.
+# --encoder NAME sets ActiveSupport.json_encoder to that Active Support
+# encoder in both modes: JSONGemEncoder on a json new enough that Active
+# Support would otherwise pick JSONGemCoderEncoder, say.
 #
 # The app is synthetic and written to a temporary directory: one class
 # whose methods build a fixed-key hash and return its Active Support
@@ -69,13 +69,16 @@ APP_SOURCE = <<~'RUBY'
   end
 RUBY
 
-# [label, method, arguments]. The last row's string needs escaping, so
-# every call takes the original expression after the checks: the cost of
-# a miss.
+# [label, method, arguments]. The 1000-byte rows show what the String
+# check costs as a string grows. The last row's string needs escaping,
+# so every call takes the original expression after the check: the cost
+# of a miss.
 WORKLOAD = [
   ["pair", :pair, ["Quarterly report", 42]],
   ["card (6 values)", :card, ["Quarterly report", "Numbers are up for the third quarter.", "Zoë Example", 123_456, 7, false]],
   ["nilable", :nilable, ["Draft", nil]],
+  ["pair, 1000-byte ASCII string", :pair, [("Numbers are up for the third quarter. " * 27)[0, 1000], 42]],
+  ["pair, 1000-byte UTF-8 string", :pair, [("Grüße aus Köln, café crème. " * 40).byteslice(0, 1000).scrub(""), 42]],
   ["pair, needs escaping", :pair, ["Fish & chips", 42]],
 ].freeze
 
@@ -104,6 +107,10 @@ def measure(app, mode, calls, rounds, flags, encoder)
       end
     end
     object = Payloads.new
+    # Steady state first: every row once, as a running app would have
+    # done long before, so no row is measured before another has warmed
+    # what they share.
+    workload.each { |_, method, args| object.public_send(method, *args) }
     slot_bytes = -> { GC.stat_heap.sum { |_, h| h[:total_allocated_objects] * h[:slot_size] } }
     results = workload.each_with_index.map do |(label, method, args), index|
       # A direct call with the same argument objects every time, so the
@@ -142,7 +149,11 @@ def measure(app, mode, calls, rounds, flags, encoder)
       }
     end
     GC.start
-    rss = File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i
+    rss = if File.exist?("/proc/self/status")
+      File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i
+    else
+      Integer(`ps -o rss= -p #{Process.pid}`.strip)
+    end
     jit = if defined?(RubyVM::ZJIT) && RubyVM::ZJIT.enabled?
       stats = RubyVM::ZJIT.stats rescue {}
       ["zjit", stats[:code_region_bytes] || stats[:zjit_alloc_bytes]]

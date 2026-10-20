@@ -96,11 +96,10 @@ method stays:
   that do nothing for a method that already exists: Current attributes'
   delegator generation and Active Record's relation delegation. The
   method must not also be a `module_function` copy;
-- every guard a pass added holds. `defined_at` checks that another
-  app method is still the definition at a given file and line, which
-  is what a variant that relies on that method's body needs to know.
-  `active_support_json` checks what a `json-writer` variant relies on
-  (see below).
+- every guard a pass added holds. The one guard kind so far,
+  `defined_at`, checks that another app method is still the definition
+  at a given file and line, which is what a variant that relies on that
+  method's body needs to know.
 
 A variant whose method a later reopening defines, or whose guard names
 a constant that has not loaded, stays pending and is tried again at the
@@ -166,20 +165,24 @@ Rails' `Hash#to_json` walks the hash into a second one (`jsonify`), has
 the json gem generate that, then scans the result again to escape
 `<`, `>`, `&` and U+2028/U+2029. The variant evaluates the values,
 once each and in source order as the literal did, into temporaries,
-checks each one, and when every value is exactly a JSON scalar whose
-bytes it knows, returns them written into a string literal: no hash is
-built and nothing is traversed twice. Otherwise it evaluates the
-original expression over the temporaries, so the encoding is the
-app's own.
+and returns them written into a string literal: no hash is built and
+nothing is traversed twice.
 
-The checks use only core methods, never a method of the value itself
-until it is known to be a String: a String must be an instance of
-`String` itself (a subclass may have its own `to_json`), ASCII-only or
-valid UTF-8, and contain nothing either the json gem or Active Support
-would escape. An Integer, `true`, `false` or `nil` is written as is. A
-literal value whose JSON cannot vary is written into the template at
-build time. The analyzer's types choose which checks a value gets, and
-nothing more: a value they mispredict fails its check.
+Types come from the analyzer, which reads the app's RBS (`sig/`
+sidecars and inline `#:` comments) and Sorbet signatures, and they are
+taken as correct. An Integer, `true`, `false` or `nil` value is written
+as is; a value typed `String?` is written as `null` when it is nil. A
+String is checked on every call, because its JSON depends on its
+content (`Fractal::JsonWriter.exact_plain_string?`): it must be an instance of `String`
+itself, ASCII-only or valid UTF-8, and contain nothing the json gem or
+Active Support would escape. A string that fails sends the call to the
+original expression over the temporaries, so the encoding is the
+app's own. The check scans with one regexp of fixed binary encoding, as
+Active Support's escaping does: a regexp whose encoding is not fixed is
+recompiled for the first non-ASCII string it meets and keeps that
+form, which made every later scan, of ASCII strings too, several times
+slower. A literal value whose JSON cannot vary is written into the
+template at build time.
 
 The hash must not be observable outside the encoding. It is the
 literal receiver of `to_json`, or a local assigned that literal once,
@@ -190,37 +193,23 @@ reports and keeps: `JSON.generate` (the json gem writes small hashes
 natively, and a Ruby writer measured slower than it under YJIT and
 ZJIT); `to_json` with options or `&.`; non-literal, non-identifier or
 duplicate keys (an overwritten value can still have effects); splats
-and implicit values; values outside String, Integer, true, false and
-nil (or one of those or nil); methods that can observe their locals
-(`binding`, `eval`, `local_variables`, ...), because the variant adds
-temporaries; and methods with a heredoc. Every line of a variant is
-the line it was in the app, so a value that raises does so on its own
-line.
+and implicit values; values whose type is not String, Integer,
+true/false or nil (or one of those or nil); methods that can observe
+their locals (`binding`, `eval`, `local_variables`, ...), because the
+variant adds temporaries; and methods with a heredoc. Every line of a
+variant is the line it was in the app, so a value that raises does so
+on its own line.
 
-`active_support_json`, its guard, waits for Active Support's
-`to_json` to load, then requires, before installing: that
-`Hash#to_json` is Active Support's; that `ActiveSupport.json_encoder`
-is Active Support's `JSONGemEncoder`, unmodified, without options;
-that the json gem generates natively; and that the core methods the
-checks and the writer call (`String#encoding`, `Integer#to_s`,
-`Regexp#match?`, ...) are Ruby's own C methods. Like every guard it is
-checked once, when the owner loads, not per call.
-
-It declines when Active Support encodes with the json gem's `Coder`
-(Rails 8.1 does with json 2.15.2 and later). The original is then
-native from end to end: on Ruby 4.0 the writer was still about twice
-as fast for two values, but slower for six, so which shapes win there
-needs a cost model the pass does not have yet. A value that needs
-escaping costs the checks on top of the original expression.
-
-Assumed and not checked: a String is not given its own `to_json` on
-its singleton class, and a String subclass does not redefine
-`instance_of?`. The json gem would honour the first, and the check
-would call the second.
+Assumed and not checked: the declared types are right; `Hash#to_json`
+is Active Support's or the json gem's (for the values the writer
+covers they agree); and nothing has redefined the core methods the
+string check calls. A wrong type gives the writer's output for it, not
+the original's.
 
 `scripts/bench-fractal-json-writer` measures the pass: the app's
 methods and the variants, each in its own process, on the same Ruby,
-JIT, workload and warmup.
+JIT, workload and warmup. The script reads RSS from `/proc/self/status`
+on Linux and `ps` on macOS.
 
 ## Writing a pass
 

@@ -8,7 +8,9 @@
 #
 #   original   the app's own methods (the initializer is not loaded)
 #   fractal    the variants installed
-#   tamper-*   something the variants rely on changed before they load
+#
+# Every probe passes values of the declared types: the writer takes the
+# app's RBS and Sorbet types as correct.
 #
 # Each run calls every probe and records the bytes, encoding and frozen
 # state of the result, or the exception's class, message and line in the
@@ -33,7 +35,7 @@ def path(file) = File.join(APP, file)
 
 # The probe inputs the writer reproduces; every other one must take the
 # original expression.
-FAST_STRINGS = %i[plain empty utf8 slash del us_ascii binary_ascii sjis_ascii frozen].freeze
+FAST_STRINGS = %i[plain empty utf8 slash del us_ascii binary_ascii sjis_ascii frozen near_sep].freeze
 FAST_INTEGERS = %i[zero negative big].freeze
 
 if MODE
@@ -63,29 +65,23 @@ if MODE
     end
   end
 
-  case MODE
-  when "tamper-encoder"
-    class UpcasingEncoder < ActiveSupport.json_encoder
-      def encode(value) = super.upcase
+  # Enough of sorbet-runtime for `extend T::Sig` and `sig { ... }`.
+  module T
+    module Sig
+      def sig(*) = nil
     end
-    ActiveSupport.json_encoder = UpcasingEncoder
-  when "tamper-hash"
-    Hash.prepend(Module.new { def to_json(*args) = super })
-  when "tamper-integer"
-    Integer.prepend(Module.new { def to_s(*args) = super })
   end
 
   load path("config/initializers/fractal.rb") unless MODE == "original"
 
-  CLASSES = [%w[Wire app/models/wire.rb], %w[Loose app/models/loose.rb]].freeze
+  CLASSES = [%w[Wire app/models/wire.rb], %w[Loose app/models/loose.rb], %w[Typed app/models/typed.rb]].freeze
   CLASSES.each do |cpath, file|
     load path(file)
     klass = Object.const_get(cpath)
     Rails.autoloaders.main.callbacks.fetch(cpath, []).each { |callback| callback.call(klass, path(file)) }
   end
 
-  # Counted after the variants installed, so the guard saw Active
-  # Support's own `to_json`.
+  # Count after the variants install.
   $to_json_calls = 0
   Hash.prepend(Module.new do
     def to_json(*args)
@@ -100,27 +96,22 @@ if MODE
     def to_json(*) = %("custom")
   end
 
-  class AsJson
-    def as_json(*) = { "as" => "json" }
-  end
-
   STRINGS = {
     plain: "Quarterly report", empty: "", utf8: "Grüße, 日本", slash: "a/b", del: "a\u007fb",
     us_ascii: "plain".encode("US-ASCII"), binary_ascii: "plain".b, sjis_ascii: "plain".encode("Shift_JIS"),
     frozen: "frozen".freeze,
+    # U+2027 and U+202A share their first two UTF-8 bytes with U+2028
+    # and U+2029, and need no escaping.
+    near_sep: "a\u2027\u202ab",
     # Every one of these takes the original expression.
     quote: %(say "hi"), backslash: "a\\b", newline: "a\nb", tab: "a\tb", control: "a\u0001b",
     lt: "a<b", gt: "a>b", amp: "a&b", line_sep: "a\u2028b", para_sep: "a\u2029b",
     binary_utf8: "Grüße".b, invalid: "a\xFFb", sjis: "日本".encode("Shift_JIS"),
     latin1: "Grüße".encode("ISO-8859-1"), utf16: "plain".encode("UTF-16LE"),
     subclass: SubString.new("sub"), custom: CustomString.new("mine"),
-    nil: nil, float: 1.5, symbol: :sym, integer: 42, object: AsJson.new, time: Time.utc(2026, 1, 2, 3, 4, 5),
   }.freeze
 
-  INTEGERS = {
-    zero: 0, negative: -7, big: 2**70,
-    float: 1.5, nan: Float::NAN, string: "42", nil: nil, true: true,
-  }.freeze
+  INTEGERS = { zero: 0, negative: -7, big: 2**70 }.freeze
 
   def record(name)
     $to_json_calls = 0
@@ -143,7 +134,7 @@ if MODE
   records = []
   STRINGS.each { |key, value| records << record("pair string #{key}") { Wire.new.pair(value, 1) } }
   INTEGERS.each { |key, value| records << record("pair integer #{key}") { Wire.new.pair("x", value) } }
-  [nil, "t", "a<b", 3].product([nil, true, false, 1]).each do |title, flag|
+  [nil, "t", "a<b"].product([nil, true, false]).each do |title, flag|
     records << record("local #{title.inspect} #{flag.inspect}") { Wire.new.local(title, flag) }
   end
   records << record("noted fast") { |log| Wire.new(log).noted("a", "b") }
@@ -157,6 +148,8 @@ if MODE
   records << record("loose pair") { Loose.new.pair("loose") }
   records << record("endless") { Wire.new.endless(3) }
   records << record("nested") { Wire.new.nested("in") }
+  records << record("typed fast") { Typed.new("Title", 3, true).to_wire }
+  records << record("typed escapes") { Typed.new("Fish & chips", 3, false).to_wire }
 
   first, second = Loose.new.fixed, Loose.new.fixed
   facts = {
@@ -165,6 +158,9 @@ if MODE
     secret_private: Wire.private_method_defined?(:secret),
     locations: %i[pair local noted fixed nested secret endless].to_h { |m| [m, Wire.instance_method(m).source_location] },
     json_encoder: ActiveSupport.json_encoder.name,
+    # After every probe, non-ASCII ones included: still one binary form.
+    escape_binary: defined?(Fractal) &&
+      Fractal::JsonWriter::ESCAPE.fixed_encoding? && Fractal::JsonWriter::ESCAPE.encoding == Encoding::BINARY,
   }
   File.binwrite(ENV.fetch("FRACTAL_JSON_OUT"), Marshal.dump([records, facts]))
   exit 0
@@ -174,7 +170,7 @@ require "minitest/autorun"
 require "tmpdir"
 
 RUNS = Dir.mktmpdir("fractal-json") do |dir|
-  %w[original fractal tamper-encoder tamper-hash tamper-integer].to_h do |mode|
+  %w[original fractal].to_h do |mode|
     out = File.join(dir, "#{mode}.bin")
     env = { "FRACTAL_JSON_MODE" => mode, "FRACTAL_JSON_OUT" => out }
     system(env, RbConfig.ruby, __FILE__, exception: true)
@@ -187,23 +183,10 @@ class JsonWriterTest < Minitest::Test
   def facts(mode) = RUNS.fetch(mode).last
   def comparable(record) = record.reject { |key, _| key == :to_json_calls }
 
-  # With json 2.15.2 and later Active Support encodes with the json
-  # gem's native Coder, and the variants decline: the writer was not
-  # measured faster than it for every shape.
-  def coder? = facts("fractal")[:json_encoder].end_with?("JSONGemCoderEncoder")
-  CODER = /native Coder, which the writer is not faster than/
-
-  def test_every_variant_installed_or_declined_for_the_coder
+  def test_every_variant_installed
     statuses = facts("fractal")[:status]
-    assert_equal 9, statuses.size, statuses.keys.inspect
-    statuses.each do |key, (state, reason)|
-      if coder?
-        assert_equal :declined, state, key
-        assert_match CODER, reason, key
-      else
-        assert_equal [:installed, nil], [state, reason], key
-      end
-    end
+    assert_equal 10, statuses.size, statuses.keys.inspect
+    statuses.each { |key, status| assert_equal [:installed, nil], status, key }
   end
 
   def test_the_variants_keep_owner_file_line_and_visibility
@@ -222,8 +205,8 @@ class JsonWriterTest < Minitest::Test
       fast = case r[:name]
              when /\Apair string (\w+)/ then FAST_STRINGS.include?(Regexp.last_match(1).to_sym)
              when /\Apair integer (\w+)/ then FAST_INTEGERS.include?(Regexp.last_match(1).to_sym)
-             when "local nil nil", "local nil true", "local nil false", 'local "t" nil', 'local "t" true', 'local "t" false' then true
-             when "noted fast", "fixed", "reveal", "loose fixed", "loose pair", "endless" then true
+             when /\Alocal (nil|"t") / then true
+             when "noted fast", "fixed", "reveal", "loose fixed", "loose pair", "endless", "typed fast" then true
              # A value raised, so neither version reached the encoding.
              when "noted raises" then true
              else false
@@ -233,11 +216,18 @@ class JsonWriterTest < Minitest::Test
       next [r[:name], 2] if r[:name] == "nested"
       next [r[:name], 0] if r[:name] == "noted raises"
 
-      [r[:name], fast && !coder? ? 0 : 1]
+      [r[:name], fast ? 0 : 1]
     end
     assert_equal expected, records("fractal").to_h { |r| [r[:name], r[:to_json_calls]] }
     original = records("original").to_h { |r| [r[:name], r[:to_json_calls]] }
     assert_equal({ "noted raises" => 0, "nested" => 2 }, original.reject { |_, calls| calls == 1 })
+  end
+
+  # A regexp whose encoding is not fixed is recompiled for the first
+  # non-ASCII string it sees and keeps that slower form for every later
+  # string, so the check's must stay binary through every probe.
+  def test_the_escape_regexp_keeps_its_binary_form
+    assert facts("fractal")[:escape_binary]
   end
 
   def test_the_writer_returns_a_new_unfrozen_string_every_call
@@ -251,21 +241,5 @@ class JsonWriterTest < Minitest::Test
     assert_equal %w[a boom], raised[:log]
     assert_equal "ArgumentError", raised[:error]
     assert_equal records("original").find { |r| r[:name] == "noted raises" }[:line], raised[:line]
-  end
-
-  def test_a_changed_dependency_keeps_the_apps_method
-    {
-      "tamper-encoder" => /json_encoder is UpcasingEncoder/,
-      "tamper-hash" => /Hash#to_json is defined by/,
-      "tamper-integer" => coder? ? CODER : /Integer#to_s is redefined/,
-    }.each do |mode, reason|
-      facts(mode)[:status].each do |key, (state, why)|
-        assert_equal :declined, state, "#{mode} #{key}"
-        assert_match reason, why, "#{mode} #{key}"
-      end
-      assert_equal facts("original")[:locations], facts(mode)[:locations], mode
-    end
-    upcased = records("tamper-encoder").find { |r| r[:name] == "pair string plain" }
-    assert_equal %({"LABEL":"QUARTERLY REPORT","COUNT":1}).b, upcased[:bytes]
   end
 end
