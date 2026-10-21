@@ -20,8 +20,8 @@
 //! declined:
 //!
 //! - Active Record is 7.1 or later in `Gemfile.lock`;
-//! - the enum is declared with literals in a selected body of the same
-//!   class (`enum :status, {...}`, `enum :status, [...]` or
+//! - the enum is declared with literals in a class body of the compiled
+//!   file (`enum :status, {...}`, `enum :status, [...]` or
 //!   `enum :status, a: 0, b: 1`), with literal `prefix:`/`suffix:`;
 //!   symbol values are declined, because Rails 8.1 compares their name and
 //!   earlier versions the symbol;
@@ -30,7 +30,7 @@
 //!   predicate, and no subclass (or module one includes) declares an enum
 //!   this pass cannot read, which could produce it;
 //! - the call has no receiver, arguments or block, sits directly in an
-//!   instance method of the class (not in a block, where `self` may
+//!   instance method of that class in the same file (not in a block, where `self` may
 //!   differ, nor under `defined?`), and the method has no local variable
 //!   named `<name>_for_database`.
 
@@ -75,7 +75,7 @@ impl Pass for EnumPredicates {
 
     fn scope(&self) -> Scope {
         // Everything it needs it reads from source through `Cx`.
-        Scope::Classes(Vec::new())
+        Scope::Files(Vec::new())
     }
 
     fn run(&self, cx: &Cx<'_>, unit: &Unit<'_>) -> Proposal {
@@ -83,7 +83,7 @@ impl Pass for EnumPredicates {
         let parsed = ruby_prism::parse(unit.text.as_bytes());
         let frozen = unit.frozen_string_literals();
 
-        // The enums each selected class declares in this file.
+        // The enums each class declares in this file.
         let mut collect = Declarations { unit, frozen, by_owner: BTreeMap::new(), twice: BTreeSet::new(), declined: Vec::new() };
         collect.visit(&parsed.node());
         proposal.declined.append(&mut collect.declined);
@@ -203,7 +203,7 @@ fn hierarchy_files(cx: &Cx<'_>, owner: &str) -> Vec<String> {
     files
 }
 
-/// Collects the enum declarations written directly in each selected class
+/// Collects the enum declarations written directly in each class
 /// body of a unit.
 struct Declarations<'u, 'a> {
     unit: &'u Unit<'a>,

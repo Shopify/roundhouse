@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use roundhouse::analyze::Analyzer;
 use roundhouse::emit::fractal::{self, Pass, Plan};
 
+const ORDER_RB: &str = "app/models/order.rb";
+
 const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activerecord (8.1.4)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  activerecord\n\nBUNDLED WITH\n   2.6.9\n";
 
 const SCHEMA: &str = r#"ActiveRecord::Schema.define do
@@ -86,18 +88,18 @@ fn app_dir(name: &str, extra: &[(&str, &str)]) -> PathBuf {
 
 /// Plan as the CLI does: ingest only what the scope names, so a file
 /// elsewhere in the app that ingest cannot read does not stop the build.
-fn build(dir: &Path, classes: &[&str]) -> Plan {
+fn build(dir: &Path, files: &[&str]) -> Plan {
     let root = dir.canonicalize().unwrap();
-    let classes: Vec<String> = classes.iter().map(|c| c.to_string()).collect();
+    let compiled: Vec<String> = files.iter().map(|f| f.to_string()).collect();
     let pass = fractal::enum_predicates::EnumPredicates::default();
     let passes: [&dyn Pass; 1] = [&pass];
-    let fractal::Ingest::Files { files, .. } = fractal::scope::decide(&root, &classes, &passes, false).unwrap() else {
+    let fractal::Ingest::Files { files, .. } = fractal::scope::decide(&root, &compiled, &passes, false).unwrap() else {
         panic!("expected a scoped ingest")
     };
     let fs = roundhouse::vfs::FsVfs::new();
     let mut app = roundhouse::ingest::app::ingest_app_with_vfs(&roundhouse::vfs::ScopedVfs::new(&fs, files), &root).unwrap();
     Analyzer::new(&app).analyze(&mut app);
-    fractal::plan(&app, &root, &classes, &[], &passes).unwrap()
+    fractal::plan(&app, &root, &compiled, &[], &passes).unwrap()
 }
 
 fn rewrites(plan: &Plan) -> Vec<(String, String)> {
@@ -111,7 +113,7 @@ fn declined(plan: &Plan) -> Vec<String> {
 #[test]
 fn calls_in_the_classs_own_instance_methods_become_rails_comparison() {
     let dir = app_dir("rewrites", &[]);
-    let plan = build(&dir, &["Order"]);
+    let plan = build(&dir, &[ORDER_RB]);
     let pair = |from: &str, to: &str| (from.to_string(), to.to_string());
     assert_eq!(
         rewrites(&plan),
@@ -137,14 +139,14 @@ fn calls_in_the_classs_own_instance_methods_become_rails_comparison() {
 fn a_frozen_file_compares_against_its_own_literal() {
     let frozen = format!("# frozen_string_literal: true\n\n{ORDER}");
     let dir = app_dir("frozen", &[("app/models/order.rb", &frozen)]);
-    let plan = build(&dir, &["Order"]);
+    let plan = build(&dir, &[ORDER_RB]);
     assert!(rewrites(&plan).iter().any(|(_, to)| to == "(kind_for_database == \"r\")"), "{:?}", rewrites(&plan));
 }
 
 #[test]
-fn a_class_not_selected_is_not_rewritten() {
+fn a_file_not_compiled_is_not_rewritten() {
     let dir = app_dir("unselected", &[("app/models/note.rb", "class Note < ApplicationRecord\nend\n")]);
-    let plan = build(&dir, &["Note"]);
+    let plan = build(&dir, &["app/models/note.rb"]);
     assert!(plan.rewritten.is_empty() && plan.report.declined.is_empty());
 }
 
@@ -152,7 +154,7 @@ fn a_class_not_selected_is_not_rewritten() {
 fn an_app_definition_of_the_predicate_or_its_reader_declines_it() {
     let concern = "module Paying\n  def paid?\n    true\n  end\nend\n";
     let dir = app_dir("defined", &[("app/models/concerns/paying.rb", concern)]);
-    let plan = build(&dir, &["Order"]);
+    let plan = build(&dir, &[ORDER_RB]);
     assert!(!rewrites(&plan).iter().any(|(from, _)| from == "paid?"), "{:?}", rewrites(&plan));
     assert!(declined(&plan).iter().any(|d| d.contains("the app defines `paid?` itself (app/models/concerns/paying.rb:2)")), "{:?}", declined(&plan));
     // The other predicates are unaffected.
@@ -160,7 +162,7 @@ fn an_app_definition_of_the_predicate_or_its_reader_declines_it() {
 
     let reader = "class Audit\n  attr_reader :status_for_database\nend\n";
     let dir = app_dir("reader", &[("app/models/audit.rb", reader)]);
-    let plan = build(&dir, &["Order"]);
+    let plan = build(&dir, &[ORDER_RB]);
     assert!(!rewrites(&plan).iter().any(|(_, to)| to.contains("status_for_database")), "{:?}", rewrites(&plan));
     assert!(declined(&plan).iter().any(|d| d.contains("the app defines `status_for_database` itself")), "{:?}", declined(&plan));
 }
@@ -169,7 +171,7 @@ fn an_app_definition_of_the_predicate_or_its_reader_declines_it() {
 fn another_enum_producing_the_same_predicate_declines_it() {
     let refund = "class Refund < ApplicationRecord\n  enum :state, [:paid, :void]\nend\n";
     let dir = app_dir("duplicate", &[("app/models/refund.rb", refund)]);
-    let plan = build(&dir, &["Order"]);
+    let plan = build(&dir, &[ORDER_RB]);
     assert!(declined(&plan).iter().any(|d| d.contains("another enum in the app also defines `paid?`")), "{:?}", declined(&plan));
     assert!(!rewrites(&plan).iter().any(|(from, _)| from == "paid?"));
 }
@@ -178,7 +180,7 @@ fn another_enum_producing_the_same_predicate_declines_it() {
 fn an_unreadable_enum_below_the_class_declines_everything_it_could_shadow() {
     let sub = "class RushOrder < Order\n  enum :speed, SPEEDS\nend\n";
     let dir = app_dir("subclass", &[("app/models/rush_order.rb", sub)]);
-    let plan = build(&dir, &["Order"]);
+    let plan = build(&dir, &[ORDER_RB]);
     assert!(plan.rewritten.is_empty(), "{:?}", rewrites(&plan));
     assert!(declined(&plan).iter().any(|d| d.contains("declares an enum this pass cannot read (app/models/rush_order.rb)")), "{:?}", declined(&plan));
     // The same enum in an unrelated class does not matter.
@@ -188,14 +190,14 @@ fn an_unreadable_enum_below_the_class_declines_everything_it_could_shadow() {
 }
 
 fn plan_rewrite_count(dir: &Path) -> usize {
-    build(dir, &["Order"]).report.rewrites.len()
+    build(dir, &[ORDER_RB]).report.rewrites.len()
 }
 
 #[test]
 fn computed_method_names_in_the_class_decline_it() {
     let order = ORDER.replace("  def shippable?", "  %w[a b].each { |n| define_method(\"#{n}?\") { true } }\n\n  def shippable?");
     let dir = app_dir("computed", &[("app/models/order.rb", &order)]);
-    let plan = build(&dir, &["Order"]);
+    let plan = build(&dir, &[ORDER_RB]);
     assert!(plan.rewritten.is_empty(), "{:?}", rewrites(&plan));
     assert!(declined(&plan).iter().any(|d| d.contains("defines methods with computed names (app/models/order.rb:5)")), "{:?}", declined(&plan));
 }
@@ -204,7 +206,7 @@ fn computed_method_names_in_the_class_decline_it() {
 fn declarations_it_cannot_reproduce_are_declined_with_why() {
     let order = "class Order < ApplicationRecord\n  enum :status, { pending: :p, paid: :q }\n  enum kind: { retail: 0 }\n\n  def check\n    paid? || retail?\n  end\nend\n";
     let dir = app_dir("unreadable", &[("app/models/order.rb", order)]);
-    let plan = build(&dir, &["Order"]);
+    let plan = build(&dir, &[ORDER_RB]);
     assert!(plan.rewritten.is_empty());
     let declined = declined(&plan);
     assert!(declined.iter().any(|d| d.contains("order.rb:2:3: `pending` has a symbol value")), "{declined:?}");
@@ -214,13 +216,13 @@ fn declarations_it_cannot_reproduce_are_declined_with_why() {
 #[test]
 fn rails_older_than_7_1_or_unpinned_declines_the_pass() {
     let dir = app_dir("old-rails", &[("Gemfile.lock", &LOCK.replace("8.1.4", "7.0.8"))]);
-    let plan = build(&dir, &["Order"]);
+    let plan = build(&dir, &[ORDER_RB]);
     assert!(plan.rewritten.is_empty());
     assert!(declined(&plan)[0].contains("activerecord 7.0.8 is older than 7.1"), "{:?}", declined(&plan));
 
     let dir = app_dir("no-lock", &[]);
     fs::remove_file(dir.join("Gemfile.lock")).unwrap();
-    let plan = build(&dir, &["Order"]);
+    let plan = build(&dir, &[ORDER_RB]);
     assert!(plan.rewritten.is_empty());
     assert!(declined(&plan)[0].contains("Gemfile.lock pins no activerecord"), "{:?}", declined(&plan));
 }

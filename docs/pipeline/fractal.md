@@ -1,15 +1,14 @@
 # Fractal: compile a Rails app in place, one file at a time
 
-`roundhouse --target fractal --class NAME APP -o OUT` writes the
-*compiled app*: a complete copy of `APP` in which the files it compiles
-have been rewritten. `--class NAME` says which files those are: every
-file that defines `NAME` (reopenings included), with the passes
-rewriting the code written in `NAME`'s bodies there. The compiled app is still a Rails
-app, it runs on the same Rails and gems, and every line sits where it
-did in the source. It is the program you test and ship. Nothing in it
-installs code at boot, checks assumptions at load or keeps the original
-code around: the rewritten code is the only code there is. Dropping a
-`--class` and rebuilding gives its files back as written.
+`roundhouse --target fractal --file PATH APP -o OUT` writes the
+*compiled app*: a complete copy of `APP` in which the files named with
+`--file` (paths relative to `APP`, repeatable) have been rewritten. The
+compiled app is still a Rails app, it runs on the same Rails and gems,
+and every line sits where it did in the source. It is the program you
+test and ship. Nothing in it installs code at boot, checks assumptions
+at load or keeps the original code around: the rewritten code is the
+only code there is. Dropping a `--file` and rebuilding gives that file
+back as written.
 
 The point is application knowledge. Roundhouse ingests and analyzes the
 files it compiles and what its passes need, so at build time it knows
@@ -31,45 +30,42 @@ time) are the same kind of edit, applied the same way.
 
 All of it lives in [`src/emit/fractal/`](../../src/emit/fractal/).
 
-1. **Scope** ([`scope.rs`](../../src/emit/fractal/scope.rs)). A Rubydex
-   index of the app's constants decides which files to ingest: the files
-   defining the `--class` names, plus what each pass declares it needs
-   ([`Pass::scope`](../../src/emit/fractal/pass.rs)), or the whole app
-   when a pass needs it or `--whole-app` asks.
+1. **Scope** ([`scope.rs`](../../src/emit/fractal/scope.rs)). The build
+   ingests the files it compiles, plus what each pass declares it needs
+   ([`Pass::scope`](../../src/emit/fractal/pass.rs)), found through a
+   Rubydex index of the app's constants (the files defining the
+   ancestors of the classes the compiled files define, say), or the
+   whole app when a pass needs it or `--whole-app` asks. A `--file` that
+   does not exist, or lies outside the app, is an error.
 2. **Ingest and analyze** those files, without lowering. Files ingest
    can only partly read (a `--survey` gap, a syntax error) are copied
    as written and never rewritten.
-3. **Select** ([`select.rs`](../../src/emit/fractal/select.rs)). Rubydex
-   finds every `class`/`module` body whose resolved name is a `--class`,
-   reopenings included; the files holding them are the files the build
-   compiles. Within them, bodies of other classes nested inside are not
-   selected; the innermost body around a site decides, so `--class A
-   --class A::B::C` covers what is written in `A` and in `C` but not in
-   `B`. A name the app does not define is an error.
-4. **Passes** ([`pass.rs`](../../src/emit/fractal/pass.rs)). Each file the
-   build compiles is a [`Unit`](../../src/emit/fractal/pass.rs): its text,
-   its selected bodies, and the methods in them with the analyzer's facts
+3. **Select** ([`select.rs`](../../src/emit/fractal/select.rs)). The
+   compiled files, and every `class`/`module` body in them, so a pass
+   knows which class each site belongs to: the innermost body around it.
+4. **Passes** ([`pass.rs`](../../src/emit/fractal/pass.rs)). Each
+   compiled file is a [`Unit`](../../src/emit/fractal/pass.rs): its text,
+   its class bodies, and its methods with the analyzer's facts
    ([`region.rs`](../../src/emit/fractal/region.rs)). Each pass proposes
-   edits to it, and declines what it cannot show equivalent, with a
-   reason.
+   edits anywhere in it, and declines what it cannot show equivalent,
+   with a reason.
 5. **Rewrite** ([`rewrite.rs`](../../src/emit/fractal/rewrite.rs)). The
    driver applies the proposals in pass order. A proposal is refused
-   whole, and reported, when an edit falls outside the selected bodies or
-   the file, overlaps another edit, or changes the number of lines; or
-   when the rewritten file parses with an error or warning the original
-   did not have.
+   whole, and reported, when an edit falls outside the file, overlaps
+   another edit, or changes the number of lines; or when the rewritten
+   file parses with an error or warning the original did not have.
 6. **Write** ([`tree.rs`](../../src/emit/fractal/tree.rs)). The output
    directory gets a full copy of the app (except `.git`, `tmp`, `log`
    and `node_modules` at its root) with the rewritten files in place of
    the originals, and `.roundhouse-fractal.json`, which lists the
-   `--class` names, passes and rewritten files. A rebuild replaces an earlier
-   build; any other non-empty directory is refused, as is the app itself
-   or a directory containing it. An output inside the app is left out of
-   the copy.
+   compiled files, the passes and the rewritten files. A rebuild
+   replaces an earlier build; any other non-empty directory is refused,
+   as is the app itself or a directory containing it. An output inside
+   the app is left out of the copy.
 
-`--report PATH` writes the build's decisions as JSON: the selected
-bodies (and so the files compiled), every method with the analyzer's facts, files skipped and why,
-every rewrite (`path:line:col`, pass, old and new text) and every
+`--report PATH` writes the build's decisions as JSON: the compiled
+files, every method in them with the analyzer's facts, files skipped
+and why, every rewrite (`path:line:col`, pass, old and new text) and every
 declined site with the pass and reason.
 
 ## Line numbers
@@ -108,8 +104,9 @@ on a large app; this proof of concept does not do them yet.
 [`enum_predicates.rs`](../../src/emit/fractal/enum_predicates.rs). Rails
 defines each enum predicate with
 `define_method("#{value_method_name}?") { public_send(:"#{name}_for_database") == value }`
-(unchanged from 7.1 to 8.1). Inside an instance method of the enum's own
-class, a call to it becomes that comparison:
+(unchanged from 7.1 to 8.1). In a compiled file that declares an enum in
+a class body, a call to its predicate inside an instance method of that
+class becomes that comparison:
 
 ```ruby
 enum :status, { pending: 0, paid: 1 }

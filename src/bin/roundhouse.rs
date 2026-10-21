@@ -37,7 +37,7 @@ fn usage() -> &'static str {
     "\
 Usage: roundhouse --target LANG [INPUT] [-o OUT]
        roundhouse --site [INPUT] [-o OUT]
-       roundhouse --target fractal [--class NAME]... [--whole-app] [--report PATH] [INPUT] [-o OUT]
+       roundhouse --target fractal [--file PATH]... [--whole-app] [--report PATH] [INPUT] [-o OUT]
        roundhouse --archives LANG,LANG [INPUT] [-o OUT]
        roundhouse check [--continue] [--inventory PATH] [--hotspots] [APP]
        roundhouse lsp
@@ -62,21 +62,18 @@ Options:
                          spinel
                        Default INPUT=.  Default OUT=./out/<lang>/
                        `fractal` compiles the app in place: the output is
-                       a complete copy of the app with the files that
-                       define the --class names rewritten (still Rails,
-                       same line numbers), to be tested and shipped.
-      --class NAME     With --target fractal: compile the files that
-                       define this class or module, by its full name
-                       (`Shop`, `Admin::Report`). Repeatable. Every file
-                       holding a definition of it is compiled (Rubydex),
-                       and passes rewrite the code in its bodies there.
-                       No --class copies the app unchanged.
-                       Only the files to compile, and what the
-                       registered passes say they need, are ingested.
+                       a complete copy of the app with the files named
+                       with --file rewritten (still Rails, same line
+                       numbers), to be tested and shipped.
+      --file PATH      With --target fractal: a file to compile, relative
+                       to INPUT (`app/models/order.rb`). Repeatable.
+                       No --file copies the app unchanged. Only these
+                       files, and what the registered passes say they
+                       need, are ingested.
       --whole-app      With --target fractal: ingest and analyze the
                        whole app instead, as a pass that needs it does.
       --report PATH    With --target fractal: write the build's decisions
-                       (selection, methods, rewrites, declines) as JSON.
+                       (compiled files, methods, rewrites, declines) as JSON.
       --site           Build all targets + landing-page assets.
                        Default INPUT=fixtures/real-blog  Default OUT=./_site/
       --archives LIST  Build only comma-separated targets' browse archives.
@@ -133,8 +130,8 @@ fn cli() -> ExitCode {
             println!("roundhouse {}", roundhouse::version::describe());
             ExitCode::SUCCESS
         }
-        Ok(Action::Fractal { classes, input, out, survey, report, whole_app }) => {
-            match run_fractal(&classes, &input, &out, survey, report.as_deref(), whole_app) {
+        Ok(Action::Fractal { files, input, out, survey, report, whole_app }) => {
+            match run_fractal(&files, &input, &out, survey, report.as_deref(), whole_app) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("roundhouse: {e}");
@@ -189,7 +186,7 @@ enum Action {
         out: PathBuf,
     },
     Fractal {
-        classes: Vec<String>,
+        files: Vec<String>,
         input: PathBuf,
         out: PathBuf,
         survey: bool,
@@ -211,7 +208,7 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
     let mut allow_unsupported = false;
     let mut survey = false;
     let mut fractal = false;
-    let mut classes: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
     let mut report: Option<PathBuf> = None;
     let mut whole_app = false;
     let mut positional: Vec<String> = Vec::new();
@@ -243,7 +240,7 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
                     target = Some(parse_target(&v)?);
                 }
             }
-            "--class" => classes.push(iter.next().ok_or("--class requires a class name")?),
+            "--file" => files.push(iter.next().ok_or("--file requires a path")?),
             "--whole-app" => whole_app = true,
             "--report" => report = Some(PathBuf::from(iter.next().ok_or("--report requires a path")?)),
             "-o" | "--output" => {
@@ -253,7 +250,7 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
                 out = Some(PathBuf::from(v));
             }
             "--target=fractal" => fractal = true,
-            s if s.starts_with("--class=") => classes.push(s["--class=".len()..].to_string()),
+            s if s.starts_with("--file=") => files.push(s["--file=".len()..].to_string()),
             s if s.starts_with("--report=") => report = Some(PathBuf::from(&s["--report=".len()..])),
             s if s.starts_with("--target=") => {
                 target = Some(parse_target(&s["--target=".len()..])?);
@@ -281,7 +278,7 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
             return Err("--target fractal cannot be combined with another --target, --site, --archives or --allow-unsupported".into());
         }
         return Ok(Action::Fractal {
-            classes,
+            files,
             input: positional.pop().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")),
             out: out.unwrap_or_else(|| PathBuf::from("out/fractal")),
             survey,
@@ -289,8 +286,8 @@ fn parse_args(args: Vec<String>) -> Result<Action, String> {
             whole_app,
         });
     }
-    if !classes.is_empty() || report.is_some() || whole_app {
-        return Err("--class, --whole-app and --report are only meaningful with --target fractal".into());
+    if !files.is_empty() || report.is_some() || whole_app {
+        return Err("--file, --whole-app and --report are only meaningful with --target fractal".into());
     }
     if let Some(targets) = archives {
         if target.is_some() || site || allow_unsupported || survey {
@@ -342,12 +339,12 @@ fn parse_target(s: &str) -> Result<BuildTarget, String> {
     }
 }
 
-/// `--target fractal`: decide what to ingest (the selected classes and
+/// `--target fractal`: decide what to ingest (the files to compile and
 /// what the passes need, or the whole app), ingest and analyze it (no
 /// lowerings: the compiled app still runs on Rails), plan the rewrites,
 /// and write the compiled tree.
 fn run_fractal(
-    classes: &[String],
+    files: &[String],
     input: &std::path::Path,
     out: &std::path::Path,
     survey: bool,
@@ -361,7 +358,8 @@ fn run_fractal(
     let passes = fractal::pass::registered();
     let passes: Vec<&dyn fractal::Pass> = passes.iter().map(|p| p.as_ref()).collect();
     let root = input.canonicalize().map_err(|e| format!("input {}: {e}", input.display()))?;
-    let ingest = fractal::scope::decide(&root, classes, &passes, whole_app)?;
+    let files = fractal::scope::normalize_files(&root, files)?;
+    let ingest = fractal::scope::decide(&root, &files, &passes, whole_app)?;
     if survey {
         roundhouse::ingest::survey::activate();
     }
@@ -372,7 +370,7 @@ fn run_fractal(
         }
         fractal::Ingest::Files { files, indexed } => {
             eprintln!(
-                "roundhouse: fractal: ingesting {} file(s) the selection and passes need (Rubydex indexed {indexed}); --whole-app reads everything",
+                "roundhouse: fractal: ingesting {} file(s) the compiled files and passes need (Rubydex indexed {indexed}); --whole-app reads everything",
                 files.len()
             );
             let fs = roundhouse::vfs::FsVfs::new();
@@ -417,7 +415,7 @@ fn run_fractal(
         }
     }
     roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
-    let plan = fractal::plan(&app, input, classes, &untrusted, &passes)?;
+    let plan = fractal::plan(&app, input, &files, &untrusted, &passes)?;
     for line in plan.report.render().lines() {
         eprintln!("roundhouse: {line}");
     }

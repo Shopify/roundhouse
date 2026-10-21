@@ -33,8 +33,8 @@ pub struct Outcome {
 }
 
 /// Apply `proposals` (in pass order) to `unit`. A proposal is taken
-/// whole or not at all: an edit that falls outside a selected body,
-/// overlaps an earlier edit, or changes the number of lines refuses the
+/// whole or not at all: an edit that falls outside the file, overlaps an
+/// earlier edit, or changes the number of lines refuses the
 /// proposal, and so does a result that parses with more errors or
 /// warnings than the file before it.
 pub fn apply(unit: &Unit<'_>, proposals: Vec<(&'static str, Proposal)>) -> Outcome {
@@ -97,9 +97,6 @@ fn refuse<'e>(unit: &Unit<'_>, edit: &Edit, earlier: &[Edit], accepted: impl Ite
     let (start, end) = (edit.span.start as usize, edit.span.end as usize);
     if edit.span.file != unit.file || start > end || end > unit.text.len() || !unit.text.is_char_boundary(start) || !unit.text.is_char_boundary(end) {
         return Some("an edit falls outside the file".to_string());
-    }
-    if unit.owner_of(edit.span).is_none() {
-        return Some("an edit falls outside the selected class bodies".to_string());
     }
     if unit.text[start..end].matches('\n').count() != edit.text.matches('\n').count() {
         return Some("an edit changes the number of lines, which would move every line after it".to_string());

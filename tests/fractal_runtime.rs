@@ -132,7 +132,7 @@ fn the_compiled_app_answers_as_the_app_does() {
     let out = base.join("out");
     write_app(&app);
     let build = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
-        .args(["--target", "fractal", "--class", "Order", "--class", "RushOrder", "--class", "Note"])
+        .args(["--target", "fractal", "--file", "app/models/order.rb", "--file", "app/models/rush_order.rb", "--file", "app/models/note.rb"])
         .arg(&app)
         .arg("-o")
         .arg(&out)
@@ -146,7 +146,7 @@ fn the_compiled_app_answers_as_the_app_does() {
     assert!(order.contains("(status_for_database == 1) && !archived?"), "{order}");
     assert!(order.contains("(kind_for_database == \"r\") ? \"retail\""), "{order}");
     assert!(order.contains("private def hidden = (size_for_database == 0)"), "{order}");
-    assert!(fs::read_to_string(out.join("app/models/rush_order.rb")).unwrap() == RUSH, "a subclass's calls are not the enum's own class");
+    assert!(fs::read_to_string(out.join("app/models/rush_order.rb")).unwrap() == RUSH, "a subclass's calls are not in the enum's own class");
     assert!(fs::read_to_string(out.join("app/models/note.rb")).unwrap().contains("(kind_for_database == \"r\".freeze) ? \"R\""));
     assert!(stderr.contains("rewrite(s) in 2 file(s)"), "{stderr}");
 

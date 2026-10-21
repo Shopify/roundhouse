@@ -43,10 +43,9 @@ references explain design, while working plans are point-in-time proposals.
   whole-route replacement, which serves the routes the analysis clears
   from the lowered app in a `Ruby::Box` inside Rails.
 - [`fractal.md`](pipeline/fractal.md) — `--target fractal`: compile a
-  Rails app in place, one file at a time. The files that define the
-  classes named with `--class` are rewritten, line for line, into a
-  complete copy of the app that still runs on Rails and is what gets
-  tested and shipped; every assumption a
+  Rails app in place, one file at a time. The files named with `--file`
+  are rewritten, line for line, into a complete copy of the app that
+  still runs on Rails and is what gets tested and shipped; every assumption a
   rewrite rests on is checked at build time.
 - [`emit.md`](pipeline/emit.md) — per-target emitters and the shared
   emit machinery.

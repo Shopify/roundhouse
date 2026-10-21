@@ -4,8 +4,7 @@
 //! edits to its text. The driver, not the pass,
 //! applies them, so every pass gets the same guarantees:
 //!
-//! - an edit lands only inside a selected class body, never in a class
-//!   nested in one that was not selected, and never outside the file;
+//! - an edit lands only inside the file it was proposed for;
 //! - an edit keeps every line where it was: its replacement has exactly
 //!   as many line breaks as the text it replaces, so backtraces,
 //!   `__LINE__` and `source_location` in the compiled tree point at the
@@ -126,22 +125,22 @@ pub struct Unit<'a> {
     /// Relative to the app root.
     pub path: String,
     pub text: &'a str,
-    /// The selected bodies in this file: (class name, span of the whole
-    /// `class`/`module` definition).
+    /// The `class`/`module` bodies in this file: (fully qualified name,
+    /// span of the whole definition).
     pub bodies: Vec<(String, Span)>,
-    /// The methods written in those bodies, with the analyzer's facts.
+    /// The methods written in this file, with the analyzer's facts.
     pub methods: Vec<Region<'a>>,
     pub(super) selection: &'a Selection,
 }
 
 impl Unit<'_> {
-    /// The selected class whose body is the innermost one around `at`,
-    /// or `None` when that innermost body is not selected.
+    /// The class or module whose body is the innermost one around `at`,
+    /// or `None` at the file's top level.
     pub fn owner_of(&self, at: Span) -> Option<&str> {
         self.selection.owner_of(at)
     }
 
-    /// The selected class a `class`/`module` definition at exactly
+    /// The class or module a `class`/`module` definition at exactly
     /// `span` is a body of.
     pub fn body_at(&self, span: Span) -> Option<&str> {
         self.bodies.iter().find(|(_, s)| *s == span).map(|(name, _)| name.as_str())

@@ -1,10 +1,10 @@
-//! Regions: the methods a selection covers, each with what the analyzer
+//! Regions: the methods in a compiled file, each with what the analyzer
 //! knows about it. Passes read them for application knowledge (types,
 //! effects) about the code they rewrite; the report lists them.
 //!
-//! A region is one `def` written in a selected class body. Rewrites are
-//! made in place, so any `def` can be edited whatever surrounds it; a
-//! region is just where the analyzer's facts about one are found.
+//! A region is one `def` written in a compiled file. Rewrites are made in
+//! place, so any `def` can be edited whatever surrounds it; a region is
+//! just where the analyzer's facts about one are found.
 
 use std::collections::HashMap;
 
@@ -103,9 +103,10 @@ fn walk<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
     e.node.for_each_child(&mut |child| walk(child, f));
 }
 
-/// A method in a selected class body.
+/// A method in a compiled file.
 pub struct Region<'a> {
-    /// The selected class or module, fully qualified.
+    /// The class or module whose body holds the `def`, fully qualified
+    /// (`Object` for one at a file's top level).
     pub owner: String,
     pub name: String,
     /// `def self.name`, or a `def` inside `class << self`.
@@ -127,8 +128,8 @@ impl Region<'_> {
     }
 }
 
-/// Every `def` written in a selected body of `file` (a `def` nested in
-/// another `def` belongs to the outer one's region). `path` is the file's
+/// Every `def` written in `file` (a `def` nested in another `def` belongs
+/// to the outer one's region). `path` is the file's
 /// path relative to the app root.
 pub fn find<'a>(app: &'a App, selection: &Selection, file: FileId, path: &str) -> Vec<Region<'a>> {
     let analyzed = analyzed_by_name(app);
@@ -189,7 +190,7 @@ impl<'pr> Visit<'pr> for Finder<'_> {
             end: loc.end_offset() as u32,
         };
         let name_span = span(node.name_loc());
-        let Some(owner) = self.selection.owner_of(name_span) else { return };
+        let owner = self.selection.owner_of(name_span).unwrap_or("Object");
         self.found.push(Found {
             owner: owner.to_string(),
             name: text(node.name().as_slice()),
