@@ -12,7 +12,7 @@
 //! Outside the scope, files read as absent. What they would have told
 //! the analyzer (a column's type, a method another file defines) is then
 //! unknown, and a pass that needed it declines: a narrower scope can
-//! produce fewer variants, never a different one.
+//! produce fewer rewrites, never a different one.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -185,7 +185,7 @@ fn ruby_sources(root: &Path) -> Vec<SourceFile> {
 
 /// Visit every file under `dir`, not following symlinked directories and
 /// skipping hidden directories and the ones `skip` names.
-fn walk(dir: &Path, skip: &dyn Fn(&str) -> bool, visit: &mut dyn FnMut(&Path)) {
+pub(super) fn walk(dir: &Path, skip: &dyn Fn(&str) -> bool, visit: &mut dyn FnMut(&Path)) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();

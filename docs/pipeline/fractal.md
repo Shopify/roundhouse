@@ -1,181 +1,169 @@
-# Fractal: specialize a running Rails app, one class at a time
+# Fractal: compile a Rails app in place, one class at a time
 
-`roundhouse --target fractal --class NAME APP` emits specialized
-variants of the methods of the classes it names, as an overlay to place
-on the app's root. It never edits an app file, so the overlay holds only
-what it generates; every other file is the app's own. Rails keeps
-loading and running the app. A variant replaces
-one method only when the assumptions it was built under still hold at
-load time; otherwise the app's own method runs. Deselecting a class
-and rebuilding gives the app back.
+`roundhouse --target fractal --class NAME APP -o OUT` writes the
+*compiled app*: a complete copy of `APP` in which the source of the
+classes it names has been rewritten. The compiled app is still a Rails
+app, it runs on the same Rails and gems, and every line sits where it
+did in the source. It is the program you test and ship. Nothing in it
+installs code at boot, checks assumptions at load or keeps the original
+code around: the rewritten code is the only code there is. Deselecting a
+class and rebuilding gives that class's source back.
 
 The point is application knowledge. Roundhouse ingests and analyzes the
-selected classes and what its passes need to know about them (or the
-whole app, when a pass needs it), so at build time it knows things a
-JIT cannot learn from inside one method: the types flowing through a body, its effects, which
-definitions exist and where, which shapes never vary. A Fractal pass
-uses that to remove work the JIT would have to keep, such as framework
-machinery that interprets a description fixed at build time, or an
-intermediate object nothing outside the method can observe. Inlining
-calls for their own sake, devirtualization and constant folding are the
-JIT's job, not Fractal's.
+selected classes and what its passes need, so at build time it knows
+things a JIT cannot learn from inside one method, and that Rails
+recomputes on every boot: the types flowing through a body, its effects,
+which definitions exist and where, which descriptions (an `enum`
+mapping, a column list) are fixed. A Fractal pass uses that to remove
+work: framework machinery that interprets a description fixed at build
+time, an intermediate object nothing can observe, a method Rails
+generates at boot from a description the build already read. Inlining
+for its own sake, devirtualization and constant folding are the JIT's
+job, not Fractal's.
 
-**This baseline registers no pass.** It is the pipeline, the contract
-and the runtime that passes attach to. A build today reports what it
-would work with and emits nothing.
+Because a rewrite is an edit to source, a rewrite of a class body (work
+Rails does at boot) and a rewrite of a method body (work it does at run
+time) are the same kind of edit, applied the same way.
 
 ## Pipeline
 
 All of it lives in [`src/emit/fractal/`](../../src/emit/fractal/).
 
-1. **Scope** ([`scope.rs`](../../src/emit/fractal/scope.rs)). Before
-   anything is ingested, Rubydex indexes the app's Ruby for constants
-   alone (outside `test/`, `spec/`, `db/`, `vendor/` and the like) and
-   answers where each `--class` is defined. The build ingests those
-   files, plus what each registered pass declares with `Pass::scope`:
-   `Reach::Ancestors` (the files defining the selected classes'
-   superclasses and mixins), `Reach::Signatures` (`sig/**/*.rbs`),
-   `Reach::Schema` (`db/schema.rb`, else `db/structure.sql`), or a
-   `Reach::Custom` function over the index. It always keeps what tells
-   ingest the app's shape: `Gemfile.lock`, `roundhouse.yml`,
-   `config/application.rb`, the inflections initializer, and, for a
-   kept file, its Packwerk `package.yml` or its component's
-   `Rails::Engine` declaration. Everything else reads as absent, so what
-   it would have told the analyzer is unknown and a pass that needed it
-   declines: a narrower scope gives fewer variants, never different
-   ones. A pass that returns `Scope::WholeApp`, or `--whole-app`, makes
-   the build ingest everything instead.
-2. **Ingest and analyze**, without lowering. Files ingest can only
-   partly read (a `--survey` gap, a syntax error) are still copied, but
-   none of their methods gets a variant.
+1. **Scope** ([`scope.rs`](../../src/emit/fractal/scope.rs)). A Rubydex
+   index of the app's constants decides which files to ingest: the files
+   defining the `--class` names, plus what each pass declares it needs
+   ([`Pass::scope`](../../src/emit/fractal/pass.rs)), or the whole app
+   when a pass needs it or `--whole-app` asks.
+2. **Ingest and analyze** those files, without lowering. Files ingest
+   can only partly read (a `--survey` gap, a syntax error) are copied
+   as written and never rewritten.
 3. **Select** ([`select.rs`](../../src/emit/fractal/select.rs)). Rubydex
    finds every `class`/`module` body whose resolved name is a `--class`,
    reopenings included. Bodies of other classes nested inside are not
-   selected; the innermost body around a definition decides, so `--class
-   A --class A::B::C` covers what is written in `A` and in `C` but not in
+   selected; the innermost body around a site decides, so `--class A
+   --class A::B::C` covers what is written in `A` and in `C` but not in
    `B`. A name the app does not define is an error.
-4. **Regions** ([`region.rs`](../../src/emit/fractal/region.rs)). Each
-   `def` written directly in a selected body is a region, with the
-   analyzer's IR for it (one copy per includer for a concern's methods)
-   and a summary of what the analyzer knows: how much of the body is
-   typed, whether it records effects or writes state. A region is
-   *admitted* when a variant could be attached to it. It is not when the
-   method is defined inside a block or condition, as an argument to a
-   call that may wrap it (`memoize def ...`; the visibility calls are
-   fine), on an object other than the class, or when its body calls
-   `__dir__` or `require_relative`, or defines a method.
-5. **Passes** ([`pass.rs`](../../src/emit/fractal/pass.rs)). Each pass
-   sees every admitted region and may propose edits inside the method's
-   definition, the guards they rely on, and whether replaying the method
-   is unobservable. `pass::registered()` is empty.
-6. **Variants** ([`variant.rs`](../../src/emit/fractal/variant.rs)). The
-   proposals for one region are combined, in pass order. A proposal
-   with an edit outside the definition, or overlapping an earlier edit,
-   is dropped and reported. A region nothing edited gets no variant.
-7. **Write** ([`overlay.rs`](../../src/emit/fractal/overlay.rs)). The
-   output directory gets `config/initializers/fractal.rb` when there is
-   at least one variant, and nothing otherwise: a large app is never
-   copied. A rebuild first removes what an earlier build wrote there, so
-   deselecting a class leaves no stale initializer; a directory holding
-   anything else is refused, which keeps `-o` from pointing at the app.
-   Placing the overlay on the app's root is the deploy step, and so is
-   removing the initializer when a rebuild no longer generates it.
+4. **Passes** ([`pass.rs`](../../src/emit/fractal/pass.rs)). Each file of
+   the selection is a [`Unit`](../../src/emit/fractal/pass.rs): its text,
+   its selected bodies, and the methods in them with the analyzer's facts
+   ([`region.rs`](../../src/emit/fractal/region.rs)). Each pass proposes
+   edits to it, and declines what it cannot show equivalent, with a
+   reason.
+5. **Rewrite** ([`rewrite.rs`](../../src/emit/fractal/rewrite.rs)). The
+   driver applies the proposals in pass order. A proposal is refused
+   whole, and reported, when an edit falls outside the selected bodies or
+   the file, overlaps another edit, or changes the number of lines; or
+   when the rewritten file parses with an error or warning the original
+   did not have.
+6. **Write** ([`tree.rs`](../../src/emit/fractal/tree.rs)). The output
+   directory gets a full copy of the app (except `.git`, `tmp`, `log`
+   and `node_modules` at its root) with the rewritten files in place of
+   the originals, and `.roundhouse-fractal.json`, which lists the
+   classes, passes and rewritten files. A rebuild replaces an earlier
+   build; any other non-empty directory is refused, as is the app itself
+   or a directory containing it. An output inside the app is left out of
+   the copy.
 
 `--report PATH` writes the build's decisions as JSON: the selected
-bodies, every region with its admission and knowledge, the variants and
-their guards, and every declined site with the pass and reason.
+bodies, every method with the analyzer's facts, files skipped and why,
+every rewrite (`path:line:col`, pass, old and new text) and every
+declined site with the pass and reason.
 
-## What a variant is
+## Line numbers
 
-The variant of `Owner#name` is the method's definition with the edits
-applied, wrapped in the class and module headers that reproduce its
-lexical nesting, preceded by the file's `frozen_string_literal` comment,
-and evaluated with the original file and line. Installed, it is a plain
-`def` in the method's own class, so callers, `super`, constant lookup,
-backtraces and `instance_method(...).owner` and `.source_location` see
-what they saw before. The runtime restores the method's visibility.
+Every edit keeps the number of lines it replaces, so a line of the
+compiled app is the same line of the source. Backtraces, error grouping,
+coverage, `__LINE__` and `source_location` point at the code a person
+wrote, and the compiled file can be read side by side with the original.
+A pass that needs more room writes several statements on one line.
 
-## Runtime
+## No runtime fallback
 
-[`fractal.rb`](../../src/emit/fractal/fractal.rb), at the top of the
-generated initializer, registers each variant and installs it when its
-owner loads: from Zeitwerk's `on_load` (every load, so a reload gets it
-again), and from `to_prepare` for owners loaded some other way. A
-variant installs only if all of these hold, and otherwise the app's
-method stays:
+The compiled app has no guard that declines a rewrite when an assumption
+fails at load, and no original to fall back to. Every assumption a
+rewrite rests on is checked at build time, from the app's source and
+lockfile, and anything a pass cannot check is declined. That makes the
+build, not the boot, responsible for correctness:
 
-- the method is still the app's definition at its file and line, owned
-  by its class: nothing prepended, wrapped or redefined it;
-- the file is the one the build read (size and CRC-32);
-- defining the variant runs no `method_added` (or
-  `singleton_method_added`) hook, other than the two framework hooks
-  that do nothing for a method that already exists: Current attributes'
-  delegator generation and Active Record's relation delegation. The
-  method must not also be a `module_function` copy;
-- every guard a pass added holds. The one guard kind so far,
-  `defined_at`, checks that another app method is still the definition
-  at a given file and line, which is what a variant that relies on that
-  method's body needs to know.
+- a pass must account for every way the app could make its rewrite
+  wrong (an app definition of a framework method it relies on, a
+  subclass that overrides it, a version of Rails that behaves
+  differently), and decline where it cannot;
+- the compiled app is what gets tested: run the app's test suite
+  against the output, not against the source;
+- the build must see what the deploy will run: the same source, the same
+  `Gemfile.lock`.
 
-A variant whose method a later reopening defines, or whose guard names
-a constant that has not loaded, stays pending and is tried again at the
-next prepare or when that constant loads. `Fractal.status` reports each
-variant as installed, declined (with the reason) or pending. `FRACTAL_STRICT=1` raises on a decline instead, for
-CI. `FRACTAL_VERIFY=1` runs the original and the variant one after the
-other on every call and raises `Fractal::Mismatch` when their values,
-or their exceptions' classes and messages, differ; `Fractal.calls`
-counts the comparisons. It does so only for a variant whose pass vouched
-that replay is unobservable and whose method the analyzer sees as fully
-typed, effect-free and writing no state. Calls with a block are not
-replayed.
+Checking a booted app's state against the source's, and stamping a build
+with what it was compiled from, are natural next steps for running this
+on a large app; this proof of concept does not do them yet.
 
-`tests/fractal.rs` covers selection, admission, knowledge, variant
-construction and the CLI. `tests/fractal_runtime.rs` builds an app with
-a test pass and checks every install, pending and decline rule against
-Ruby, with Active Record and Current attributes when they are
-installed.
+## Passes
 
-## JIT shape
+### `inline-enum-predicates`
 
-Fractal emits Ruby for CRuby's JITs to compile, so its output shape is
-a choice. Where YJIT and ZJIT would want different shapes, it takes
-ZJIT's.
+[`enum_predicates.rs`](../../src/emit/fractal/enum_predicates.rs). Rails
+defines each enum predicate with
+`define_method("#{value_method_name}?") { public_send(:"#{name}_for_database") == value }`
+(unchanged from 7.1 to 8.1). Inside an instance method of the enum's own
+class, a call to it becomes that comparison:
 
-- **The unit of specialization is a whole method.** ZJIT compiles a
-  method at a time and profiles each ISEQ separately. A variant is its
-  own ISEQ, so its profile holds only its own types, and the original's
-  paths are not in the code ZJIT optimizes.
-- **The choice is made once, at load.** Guards run when the owner loads,
-  never per call, so a variant's body carries no check for the JIT to
-  compile around. Installing at load, before the first call, also means
-  the JIT never compiles the original only to invalidate it when the
-  method is redefined.
-- **Variants are `def`s, never `define_method`.** ZJIT calls an ISEQ
-  method directly in more situations than a `define_method` one: a call
-  to a block-backed method that passes a block, or whose proc is not
-  shareable outside single-Ractor mode, stays a dynamic send
-  ([`zjit/src/hir.rs`](https://github.com/ruby/ruby/blob/master/zjit/src/hir.rs)).
-  Only verify mode wraps a method with `define_method`.
-- **The runtime never creates singleton classes on instances.** ZJIT's
-  direct sends assume no instance of the receiver's class has one, and
-  creating one invalidates that code.
+```ruby
+enum :status, { pending: 0, paid: 1 }
+def shippable? = paid? && !archived?
+# compiled
+def shippable? = (status_for_database == 1) && !archived?
+```
 
-Measuring a pass means comparing the original with the JIT against the
-variant with the same JIT, after warmup, for CPU and for allocated
-objects and bytes, GC time and retained memory.
+The call no longer goes through a block-backed method, which ZJIT cannot
+call directly, or a `public_send` of a dynamic symbol; `status_for_database`
+is an ordinary `def` Active Record generates. A string value is frozen
+(`"r".freeze`) unless the file freezes its literals, so the comparison
+allocates nothing, as Rails' does not.
+
+It declines, with a reason, when:
+
+- `Gemfile.lock` pins no activerecord, or one older than 7.1;
+- the declaration is not literal (`enum :status, STATUSES`), uses the
+  keyword form removed in 8.0 (`enum status: {...}`), maps a label to a
+  symbol (8.1 compares the symbol's name, earlier versions the symbol),
+  or has an option it does not know;
+- the app's own source defines the predicate or `<name>_for_database`
+  anywhere, by `def`, `define_method`, `alias`, `alias_method`, `attr_*`
+  or `delegate`;
+- another enum in the app produces the same predicate, or the class, a
+  subclass, or a module a subclass includes declares an enum it cannot
+  read or defines methods with computed names, either of which could
+  produce it;
+- the method has a local variable named `<name>_for_database`.
+
+It leaves alone calls with a receiver, arguments or a block; calls
+inside a block or lambda (where `self` may differ), under `defined?`, in
+class methods, and in subclasses' methods; and labels Ruby cannot call
+bare.
 
 ## Writing a pass
 
-Implement [`Pass`](../../src/emit/fractal/pass.rs): a name, a `scope`
-and a `run` that takes a [`Region`](../../src/emit/fractal/region.rs)
-and returns a `Proposal`. The scope says what the build has to ingest
-for the pass to know what it needs: start from `Scope::Classes` with
-the narrowest reaches that give it its facts, and say
-`Scope::WholeApp` only when they can come from anywhere in the app. Read the analyzed IR in `region.analyzed`; express
-replacements as `Edit`s on source spans inside `region.def_span`; add a
-`Guard` for every app definition outside the method the variant relies
-on; set `replayable` only when running the method twice is
-unobservable. Decline, with a reason, whatever cannot be shown to
-behave as the original does for every caller. Register the pass in
-`pass::registered()` and pin it with a `tests/fractal_runtime.rs` case
-that runs the variant.
+Implement [`Pass`](../../src/emit/fractal/pass.rs): a name, a `scope`,
+and a `run` that reads a [`Unit`](../../src/emit/fractal/pass.rs) and
+returns a `Proposal` of `Edit`s (spans of the unit's file and their
+replacement text) and declined sites. [`Cx`](../../src/emit/fractal/pass.rs)
+gives app-wide facts read from source without ingest: every Ruby file of
+the program, a Rubydex index of classes and their ancestors and
+descendants, every method name the app defines, and the lockfile's gem
+versions. Decline, with a reason, whatever cannot be shown to behave as
+the original does for every caller of the compiled app. Register the pass
+in `pass::registered()`, pin its rewrites and declines in a build test,
+and add a case to `tests/fractal_runtime.rs`, which runs an app and its
+compiled tree against Active Record and SQLite and compares what they
+answer.
+
+## JIT shape
+
+Fractal emits Ruby for CRuby's JITs to compile, so its output shape is a
+choice. Where YJIT and ZJIT would want different shapes, it takes ZJIT's:
+plain `def`s rather than `define_method`, direct calls rather than
+`send`, and no singleton classes created on instances. Measuring a pass
+means comparing the app with the JIT against the compiled app with the
+same JIT, after warmup, for CPU, allocated objects and bytes, GC time and
+retained memory, and for boot time when the pass removes boot work.

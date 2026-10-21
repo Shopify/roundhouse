@@ -1,22 +1,20 @@
-//! `--target fractal` (`emit::fractal`): the baseline every Fractal
-//! transformation attaches to.
+//! `--target fractal` (`emit::fractal`): the driver every Fractal rewrite
+//! goes through.
 //!
-//! What it promises with no transformation registered: the output (an
-//! overlay of generated files) is empty, the selection is exactly the
-//! named classes' own bodies, and every method in it is reported with
-//! what the analyzer knows and whether a variant could be attached. With
-//! a pass (here a test pass that swaps literal text) it promises that the
-//! overlay holds only the initializer, no app file is touched, and the
-//! variant carries the method's nesting, line and magic comment.
+//! What it promises: the output is a complete copy of the app with only
+//! the rewritten files changed; the selection is exactly the named
+//! classes' own bodies; an edit lands only inside them, keeps every line
+//! where it was and leaves the file parsing as it did, or the whole
+//! proposal is refused and reported. A test pass that swaps literal text
+//! makes rewrites observable.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use roundhouse::analyze::Analyzer;
-use roundhouse::emit::fractal::{self, Cx, Edit, Guard, INITIALIZER, Pass, Plan, Proposal, Region, Scope};
+use roundhouse::emit::fractal::{self, Cx, Edit, MANIFEST, Pass, Plan, Proposal, Scope, Unit};
 use roundhouse::ingest::ingest_app;
-use roundhouse::span::Span;
 
 const SCHEMA: &str = r#"ActiveRecord::Schema.define do
   create_table "accounts", force: :cascade do |t|
@@ -68,7 +66,8 @@ const CURRENT_REOPENED: &str = r#"class Current
 end
 "#;
 
-/// Shapes a variant cannot be attached to, next to ones it can.
+/// Definitions an overlay could not replace; rewritten in place they are
+/// ordinary source.
 const SHAPES: &str = r#"class Shapes
   def plain
     "original"
@@ -176,16 +175,16 @@ fn build_plan(dir: &Path, classes: &[&str], passes: &[&dyn Pass]) -> Result<Plan
     fractal::plan(&app, dir, &classes, &[], passes)
 }
 
-fn region<'r>(plan: &'r Plan, key_prefix: &str) -> &'r fractal::RegionReport {
+fn method<'r>(plan: &'r Plan, key_prefix: &str) -> &'r fractal::MethodReport {
     plan.report
-        .regions
+        .methods
         .iter()
-        .find(|r| r.key.starts_with(key_prefix))
-        .unwrap_or_else(|| panic!("no region {key_prefix} in {:?}", plan.report.regions.iter().map(|r| &r.key).collect::<Vec<_>>()))
+        .find(|m| m.key.starts_with(key_prefix))
+        .unwrap_or_else(|| panic!("no method {key_prefix} in {:?}", plan.report.methods.iter().map(|m| &m.key).collect::<Vec<_>>()))
 }
 
 fn keys(plan: &Plan) -> Vec<String> {
-    plan.report.regions.iter().map(|r| r.key.split('@').next().unwrap().to_string()).collect()
+    plan.report.methods.iter().map(|m| m.key.split('@').next().unwrap().to_string()).collect()
 }
 
 /// Every file under `dir`, relative to it.
@@ -206,19 +205,17 @@ fn files_in(dir: &Path) -> Vec<String> {
     out
 }
 
-/// Swaps every occurrence of `from` inside the method's definition for
-/// `to`. A test fixture that makes a variant observable, not an
+/// Swaps every occurrence of `from` in the unit's selected bodies for
+/// `to`. A test fixture that makes a rewrite observable, not an
 /// optimization.
 struct Swap {
     from: &'static str,
     to: &'static str,
-    replayable: bool,
-    guards: Vec<Guard>,
 }
 
 impl Swap {
     fn new(from: &'static str, to: &'static str) -> Swap {
-        Swap { from, to, replayable: true, guards: Vec::new() }
+        Swap { from, to }
     }
 }
 
@@ -231,22 +228,19 @@ impl Pass for Swap {
         Scope::Classes(Vec::new())
     }
 
-    fn run(&self, cx: &Cx<'_>, region: &Region<'_>) -> Proposal {
-        let text = &cx.app.sources[region.file.0 as usize - 1].text;
-        let (start, end) = (region.def_span.start as usize, region.def_span.end as usize);
-        let edits = text[start..end]
+    fn run(&self, _cx: &Cx<'_>, unit: &Unit<'_>) -> Proposal {
+        let edits = unit
+            .text
             .match_indices(self.from)
-            .map(|(at, _)| Edit {
-                span: Span { file: region.file, start: (start + at) as u32, end: (start + at + self.from.len()) as u32 },
-                text: self.to.to_string(),
-            })
+            .map(|(at, _)| Edit { span: unit.span(at, at + self.from.len()), text: self.to.to_string() })
+            .filter(|edit| unit.owner_of(edit.span).is_some())
             .collect();
-        Proposal { edits, guards: self.guards.clone(), declined: Vec::new(), replayable: self.replayable }
+        Proposal { edits, declined: Vec::new() }
     }
 }
 
 /// Proposes whatever edits it is given, for the driver's refusals.
-struct Fixed(Box<dyn Fn(&Region<'_>) -> Vec<Edit>>);
+struct Fixed(Box<dyn Fn(&Unit<'_>) -> Vec<Edit>>);
 
 impl Pass for Fixed {
     fn name(&self) -> &'static str {
@@ -257,21 +251,33 @@ impl Pass for Fixed {
         Scope::Classes(Vec::new())
     }
 
-    fn run(&self, _cx: &Cx<'_>, region: &Region<'_>) -> Proposal {
-        Proposal { edits: (self.0)(region), ..Proposal::default() }
+    fn run(&self, _cx: &Cx<'_>, unit: &Unit<'_>) -> Proposal {
+        Proposal { edits: (self.0)(unit), ..Proposal::default() }
     }
 }
 
+/// An edit replacing the first `needle` in the unit's text.
+fn at(unit: &Unit<'_>, needle: &str, text: &str) -> Edit {
+    let start = unit.text.find(needle).unwrap_or_else(|| panic!("{needle} not in {}", unit.path));
+    Edit { span: unit.span(start, start + needle.len()), text: text.to_string() }
+}
+
 #[test]
-fn no_class_and_no_pass_both_emit_nothing() {
+fn no_class_or_no_pass_compiles_to_the_app_unchanged() {
     let dir = app_dir("identity", &base_files());
     for (name, classes) in [("none", vec![]), ("selected", vec!["Current", "Shapes"])] {
         let plan = build_plan(&dir, &classes, &[]).unwrap();
-        assert!(plan.generated.is_empty(), "{name}: nothing to generate without a pass");
-        assert!(plan.report.variants.is_empty());
+        assert!(plan.rewritten.is_empty() && plan.report.rewrites.is_empty(), "{name}");
         let out = scratch(&format!("identity-out-{name}")).join("out");
-        assert_eq!(fractal::write(&out, &plan).unwrap(), 0);
-        assert!(files_in(&out).is_empty(), "{name}: every file is the app's own");
+        let written = fractal::write(&dir, &out, &plan).unwrap();
+        assert_eq!((written.copied, written.rewritten), (base_files().len(), 0), "{name}");
+        let mut expected: Vec<String> = base_files().iter().map(|(p, _)| p.to_string()).collect();
+        expected.push(MANIFEST.to_string());
+        expected.sort();
+        assert_eq!(files_in(&out), expected, "{name}");
+        for (path, content) in base_files() {
+            assert_eq!(fs::read_to_string(out.join(path)).unwrap(), content, "{name}: {path}");
+        }
     }
 }
 
@@ -281,7 +287,7 @@ fn the_selection_is_every_body_of_the_class_and_nothing_nested_in_it() {
     let plan = build_plan(&dir, &["Current"], &[]).unwrap();
     assert_eq!(
         keys(&plan),
-        ["Current#account", "Current#label", "Current#secret", "Current.build", "Current.other", "Current#room"],
+        ["Current#account", "Current#label", "Current#room", "Current#secret", "Current.build", "Current.other"],
     );
     assert_eq!(plan.report.bodies, ["Current app/models/current.rb:3", "Current app/models/current/reopened.rb:1"]);
 }
@@ -291,6 +297,12 @@ fn the_innermost_class_body_decides() {
     let dir = app_dir("nesting", &base_files());
     let plan = build_plan(&dir, &["Outer", "Outer::Middle::Inner"], &[]).unwrap();
     assert_eq!(keys(&plan), ["Outer#outer_label", "Outer::Middle::Inner#inner_label"]);
+    // Rewrites follow the selection: `Middle`'s literal stays.
+    let swap = Swap::new("\"original\"", "\"rewritten\"");
+    let plan = build_plan(&dir, &["Outer", "Outer::Middle::Inner"], &[&swap]).unwrap();
+    let text = &plan.rewritten[0].1;
+    assert_eq!(text.matches("\"rewritten\"").count(), 2, "{text}");
+    assert!(text.contains("def middle_label\n      \"original\""), "{text}");
 }
 
 #[test]
@@ -301,19 +313,95 @@ fn a_class_the_app_does_not_define_is_an_error() {
 }
 
 #[test]
-fn methods_a_variant_cannot_replace_are_reported_with_why() {
+fn any_definition_can_be_rewritten_in_place() {
     let dir = app_dir("shapes", &base_files());
-    let plan = build_plan(&dir, &["Shapes"], &[]).unwrap();
-    let reason = |key: &str| region(&plan, key).reason.clone();
-    assert_eq!(reason("Shapes#plain"), None);
-    assert!(reason("Shapes#in_a_block").unwrap().contains("`each`"));
-    assert!(reason("Shapes#wrapped").unwrap().contains("`memoize`"));
-    assert!(reason("Shapes#located").unwrap().contains("`__dir__`"));
-    assert!(reason("Shapes#defines").unwrap().contains("defines another method"));
+    let swap = Swap::new("\"original\"", "\"rewritten\"");
+    let plan = build_plan(&dir, &["Shapes"], &[&swap]).unwrap();
+    // Inside a `memoize` argument too: the rewritten source is what runs.
+    assert_eq!(plan.report.rewrites.len(), 2, "{:?}", plan.report.rewrites);
+    assert!(plan.report.declined.is_empty(), "{:?}", plan.report.declined);
+    assert_eq!(plan.rewritten[0].1, SHAPES.replace("\"original\"", "\"rewritten\""));
 }
 
 #[test]
-fn definitions_on_other_objects_are_reported_under_survey() {
+fn knowledge_reports_types_and_effects() {
+    let dir = app_dir("knowledge", &base_files());
+    let plan = build_plan(&dir, &["Current"], &[]).unwrap();
+    let label = &method(&plan, "Current#label").knowledge;
+    assert_eq!((label.copies, label.typed, label.expressions), (1, 1, 1));
+    assert!(label.no_recorded_effects && !label.writes_state, "{label:?}");
+    // `Account.first` reads the database.
+    assert!(!method(&plan, "Current#account").knowledge.no_recorded_effects);
+    // An ivar read the analyzer cannot type.
+    let room = &method(&plan, "Current#room").knowledge;
+    assert!(room.typed < room.expressions, "{room:?}");
+}
+
+#[test]
+fn the_compiled_tree_replaces_only_rewritten_files_and_keeps_lines() {
+    let dir = app_dir("rewrite", &base_files());
+    let swap = Swap::new("\"original\" + NAME", "NAME.dup.prepend(\"rewritten\")");
+    let plan = build_plan(&dir, &["Admin::Report"], &[&swap]).unwrap();
+    assert_eq!(plan.report.files, ["app/models/admin/report.rb"]);
+    let r = &plan.report.rewrites[0];
+    assert_eq!((r.at.as_str(), r.pass.as_str(), r.from.as_str()), ("app/models/admin/report.rb:8:7", "test-swap", "\"original\" + NAME"));
+
+    let out = scratch("rewrite-out").join("out");
+    fractal::write(&dir, &out, &plan).unwrap();
+    let compiled = fs::read_to_string(out.join("app/models/admin/report.rb")).unwrap();
+    assert_eq!(compiled, REPORT.replace("\"original\" + NAME", "NAME.dup.prepend(\"rewritten\")"));
+    assert_eq!(compiled.lines().count(), REPORT.lines().count());
+    // Every other file is the app's, and the app itself is untouched.
+    assert_eq!(fs::read_to_string(out.join("app/models/current.rb")).unwrap(), CURRENT);
+    assert_eq!(fs::read_to_string(dir.join("app/models/admin/report.rb")).unwrap(), REPORT);
+    let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(out.join(MANIFEST)).unwrap()).unwrap();
+    assert_eq!(manifest["files"][0], "app/models/admin/report.rb");
+    assert_eq!(manifest["passes"][0], "test-swap");
+}
+
+#[test]
+fn edits_that_leave_the_selection_overlap_move_lines_or_break_the_parse_are_refused() {
+    let dir = app_dir("refusals", &base_files());
+    let cases: Vec<(&str, Fixed)> = vec![
+        ("outside the selected class bodies", Fixed(Box::new(|u| vec![at(u, "def middle_label", "def middle")]))),
+        ("outside the file", Fixed(Box::new(|u| vec![Edit { span: u.span(u.text.len(), u.text.len() + 1), text: String::new() }]))),
+        (
+            "overlaps another edit",
+            Fixed(Box::new(|u| {
+                let start = u.text.find("def outer_label").unwrap();
+                vec![Edit { span: u.span(start, start + 3), text: "def".into() }, Edit { span: u.span(start + 2, start + 4), text: "f ".into() }]
+            })),
+        ),
+        ("changes the number of lines", Fixed(Box::new(|u| vec![at(u, "\"original\"", "\"a\"\n    \"b\"")]))),
+        ("parse error", Fixed(Box::new(|u| vec![at(u, "\"original\"", "\"unterminated")]))),
+    ];
+    for (reason, pass) in &cases {
+        let plan = build_plan(&dir, &["Outer"], &[pass]).unwrap();
+        assert!(plan.rewritten.is_empty(), "{reason}");
+        assert_eq!(plan.report.declined.len(), 1, "{reason}: {:?}", plan.report.declined);
+        assert_eq!(plan.report.declined[0].pass, "test-fixed");
+        assert!(plan.report.declined[0].reason.contains(reason), "{reason}: {:?}", plan.report.declined);
+    }
+    // A refused proposal does not take a later pass's edits with it.
+    let swap = Swap::new("\"original\"", "\"rewritten\"");
+    let plan = build_plan(&dir, &["Outer"], &[&cases[0].1, &swap]).unwrap();
+    assert_eq!(plan.report.rewrites.len(), 1);
+    assert_eq!(plan.report.declined.len(), 1);
+}
+
+#[test]
+fn a_file_with_an_ingest_gap_keeps_the_apps_code() {
+    let dir = app_dir("untrusted", &base_files());
+    let mut app = ingest_app(&dir).unwrap();
+    Analyzer::new(&app).analyze(&mut app);
+    let swap = Swap::new("\"original\"", "\"rewritten\"");
+    let plan = fractal::plan(&app, &dir, &["Outer".into()], &["app/models/outer.rb".into()], &[&swap]).unwrap();
+    assert!(plan.rewritten.is_empty());
+    assert!(plan.report.skipped[0].reason.contains("ingest could not read"), "{:?}", plan.report.skipped);
+}
+
+#[test]
+fn definitions_on_other_objects_leave_their_file_untrusted_under_survey() {
     let mut files = base_files();
     files.push(("app/models/foreign.rb", FOREIGN));
     let dir = app_dir("foreign", &files);
@@ -330,156 +418,46 @@ fn definitions_on_other_objects_are_reported_under_survey() {
         })
         .collect();
     assert!(!untrusted.is_empty());
-    let plan = fractal::plan(&app, &dir, &["Foreign".into()], &untrusted, &[]).unwrap();
-    let reason = |key: &str| region(&plan, key).reason.clone().unwrap();
-    assert!(reason("Foreign#plain").contains("ingest could not read"));
-    assert!(reason("Foreign#elsewhere").contains("receiver other than the class"));
-    assert!(reason("Foreign#also_elsewhere").contains("class << <expression>"));
-}
-
-#[test]
-fn private_and_singleton_definitions_are_admitted() {
-    let dir = app_dir("visibility", &base_files());
-    let plan = build_plan(&dir, &["Current"], &[]).unwrap();
-    for key in ["Current#secret", "Current.build", "Current.other"] {
-        assert!(region(&plan, key).admitted, "{key}");
-    }
-}
-
-#[test]
-fn knowledge_reports_types_effects_and_whether_a_method_may_be_replayed() {
-    let dir = app_dir("knowledge", &base_files());
-    let plan = build_plan(&dir, &["Current"], &[]).unwrap();
-    let label = &region(&plan, "Current#label").knowledge;
-    assert_eq!((label.copies, label.typed, label.expressions), (1, 1, 1));
-    assert!(label.replayable(), "{label:?}");
-    // `Account.first` reads the database.
-    let account = &region(&plan, "Current#account").knowledge;
-    assert!(!account.no_recorded_effects && !account.replayable(), "{account:?}");
-    // An ivar read the analyzer cannot type.
-    let room = &region(&plan, "Current#room").knowledge;
-    assert!(room.typed < room.expressions && !room.replayable(), "{room:?}");
-
-    let swap = Swap::new("\"original\"", "\"variant\"");
-    let plan = build_plan(&dir, &["Current"], &[&swap]).unwrap();
-    let replayable: Vec<_> = plan.report.variants.iter().map(|v| (v.method.as_str(), v.replayable)).collect();
-    assert!(replayable.contains(&("label", true)), "{replayable:?}");
-}
-
-#[test]
-fn a_variant_keeps_nesting_magic_comment_and_line_and_the_app_keeps_its_files() {
-    let dir = app_dir("variant", &base_files());
-    let swap = Swap::new("\"original\"", "\"variant\"");
-    let plan = build_plan(&dir, &["Admin::Report"], &[&swap]).unwrap();
-    assert_eq!(plan.report.variants.len(), 1);
-    let v = &plan.report.variants[0];
-    assert_eq!((v.key.as_str(), v.line, v.passes.as_slice()), ("Admin::Report#title@app/models/admin/report.rb:7", 7, &["test-swap".to_string()][..]));
-
-    let (path, init) = &plan.generated[0];
-    assert_eq!(path, INITIALIZER);
-    let source = "# frozen_string_literal: true\nmodule Admin\nclass Report\ndef title\n      \"variant\" + NAME\n    end\nend\nend\n";
-    assert!(init.contains(source), "{init}");
-    // Line 7 minus the three prelude lines: `def` evaluates at its own line.
-    assert!(init.contains("eval_line: 4,"), "{init}");
-    assert!(init.contains(&format!("file_size: {}, file_crc: {},", REPORT.len(), fractal::variant::crc32(REPORT.as_bytes()))), "{init}");
-    assert!(init.starts_with(fractal::RUNTIME));
-    assert!(init.ends_with("Fractal.attach(Rails.application)\n"));
-
-    let out = scratch("variant-out").join("out");
-    fractal::write(&out, &plan).unwrap();
-    assert_eq!(files_in(&out), [INITIALIZER]);
-    assert_eq!(fs::read_to_string(out.join(INITIALIZER)).unwrap(), *init);
-    assert_eq!(fs::read_to_string(dir.join("app/models/admin/report.rb")).unwrap(), REPORT);
-}
-
-#[test]
-fn a_method_no_pass_changed_keeps_the_apps_definition() {
-    let dir = app_dir("unchanged", &base_files());
-    let swap = Swap::new("\"absent\"", "\"variant\"");
-    let plan = build_plan(&dir, &["Current"], &[&swap]).unwrap();
-    assert!(plan.report.variants.is_empty() && plan.generated.is_empty());
-}
-
-#[test]
-fn guards_from_passes_are_registered_and_the_verify_flag_needs_both_pass_and_analyzer() {
-    let dir = app_dir("guards", &base_files());
-    let guard = Guard::DefinedAt {
-        constant: "Current".into(),
-        method: "label".into(),
-        singleton: false,
-        file: "app/models/current.rb".into(),
-        line: 10,
-    };
-    let swap = Swap { replayable: true, guards: vec![guard], ..Swap::new("Account.first", "Account.take") };
-    let plan = build_plan(&dir, &["Current"], &[&swap]).unwrap();
-    let init = &plan.generated[0].1;
-    assert!(
-        init.contains("guards: [{ kind: :defined_at, constant: 'Current', method: 'label', singleton: false, file: 'app/models/current.rb', line: 10 }]"),
-        "{init}"
-    );
-    // The pass says replayable; the analyzer sees a database read.
-    assert!(!plan.report.variants[0].replayable);
-}
-
-#[test]
-fn edits_outside_the_definition_or_overlapping_are_refused() {
-    let dir = app_dir("refusals", &base_files());
-    let outside = Fixed(Box::new(|r: &Region<'_>| vec![Edit { span: Span { end: r.def_span.end + 1, ..r.def_span }, text: String::new() }]));
-    let overlapping = Fixed(Box::new(|r: &Region<'_>| {
-        let at = r.def_span.start;
-        vec![
-            Edit { span: Span { start: at, end: at + 3, ..r.def_span }, text: "def".into() },
-            Edit { span: Span { start: at + 2, end: at + 4, ..r.def_span }, text: "f ".into() },
-        ]
-    }));
-    for pass in [&outside, &overlapping] {
-        let plan = build_plan(&dir, &["Outer"], &[pass]).unwrap();
-        assert!(plan.report.variants.is_empty());
-        assert_eq!(plan.report.declined.len(), 1, "{:?}", plan.report.declined);
-        assert_eq!(plan.report.declined[0].pass, "test-fixed");
-    }
-}
-
-#[test]
-fn a_file_with_an_ingest_gap_keeps_the_apps_code() {
-    let dir = app_dir("untrusted", &base_files());
-    let mut app = ingest_app(&dir).unwrap();
-    Analyzer::new(&app).analyze(&mut app);
-    let swap = Swap::new("\"original\"", "\"variant\"");
-    let plan = fractal::plan(&app, &dir, &["Outer".into()], &["app/models/outer.rb".into()], &[&swap]).unwrap();
-    assert!(plan.report.variants.is_empty());
-    assert!(region(&plan, "Outer#outer_label").reason.as_deref().unwrap().contains("ingest could not read"));
-}
-
-#[test]
-fn an_app_that_defines_fractal_is_refused_once_there_is_a_variant() {
-    let mut files = base_files();
-    files.push(("app/models/fractal.rb", "class Fractal\nend\n"));
-    let dir = app_dir("collision", &files);
-    let swap = Swap::new("\"original\"", "\"variant\"");
-    let err = build_plan(&dir, &["Outer"], &[&swap]).err().unwrap();
-    assert!(err.contains("defines `Fractal`"), "{err}");
+    let swap = Swap::new("\"original\"", "\"rewritten\"");
+    let plan = fractal::plan(&app, &dir, &["Foreign".into()], &untrusted, &[&swap]).unwrap();
+    assert!(plan.rewritten.is_empty());
+    assert_eq!(plan.report.skipped[0].file, "app/models/foreign.rb");
 }
 
 #[test]
 fn a_rebuild_replaces_its_own_output_and_refuses_anything_else() {
     let dir = app_dir("rebuild", &base_files());
     let out = scratch("rebuild-out").join("out");
-    let swap = Swap::new("\"original\"", "\"variant\"");
-    fractal::write(&out, &build_plan(&dir, &["Outer"], &[&swap]).unwrap()).unwrap();
-    assert_eq!(files_in(&out), [INITIALIZER]);
-    // Deselected: the initializer goes, and the directories it left empty.
-    fractal::write(&out, &build_plan(&dir, &[], &[]).unwrap()).unwrap();
-    assert!(files_in(&out).is_empty());
-    assert!(!out.join("config").exists());
+    let swap = Swap::new("\"original\"", "\"rewritten\"");
+    fractal::write(&dir, &out, &build_plan(&dir, &["Outer"], &[&swap]).unwrap()).unwrap();
+    assert!(fs::read_to_string(out.join("app/models/outer.rb")).unwrap().contains("rewritten"));
+    // Deselected: the earlier build is replaced, so the rewrite is gone.
+    fractal::write(&dir, &out, &build_plan(&dir, &[], &[]).unwrap()).unwrap();
+    assert_eq!(fs::read_to_string(out.join("app/models/outer.rb")).unwrap(), NESTED);
 
-    fs::write(out.join("stale.rb"), "").unwrap();
-    let err = fractal::write(&out, &build_plan(&dir, &[], &[]).unwrap()).err().unwrap();
-    assert!(err.contains("did not write (stale.rb"), "{err}");
-    // Pointed at the app itself.
-    let err = fractal::write(&dir, &build_plan(&dir, &[], &[]).unwrap()).err().unwrap();
-    assert!(err.contains("a fractal build did not write"), "{err}");
+    // Not an earlier build.
+    let foreign = scratch("rebuild-foreign");
+    fs::write(foreign.join("keep.rb"), "").unwrap();
+    let err = fractal::write(&dir, &foreign, &build_plan(&dir, &[], &[]).unwrap()).err().unwrap();
+    assert!(err.contains("is not an earlier fractal build"), "{err}");
+    assert!(foreign.join("keep.rb").exists());
+    // The app itself, or a directory holding it.
+    for target in [dir.clone(), dir.parent().unwrap().to_path_buf()] {
+        let err = fractal::write(&dir, &target, &build_plan(&dir, &[], &[]).unwrap()).err().unwrap();
+        assert!(err.contains("is the app or contains it"), "{err}");
+    }
     assert_eq!(fs::read_to_string(dir.join("app/models/current.rb")).unwrap(), CURRENT);
+}
+
+#[test]
+fn an_output_inside_the_app_is_not_copied_into_itself() {
+    let dir = app_dir("nested-out", &base_files());
+    let out = dir.join("out/fractal");
+    fractal::write(&dir, &out, &build_plan(&dir, &[], &[]).unwrap()).unwrap();
+    // A second build sees the first one inside the app and leaves it out.
+    fractal::write(&dir, &out, &build_plan(&dir, &[], &[]).unwrap()).unwrap();
+    assert!(!out.join("out").exists());
+    assert!(out.join("app/models/current.rb").is_file());
 }
 
 #[test]
@@ -493,13 +471,13 @@ fn the_cli_builds_reports_and_rejects_fractal_flags_elsewhere() {
     let ok = run(&["--target", "fractal", "--class", "Current", "--report", report.to_str().unwrap(), dir.to_str().unwrap(), "-o", out.to_str().unwrap()]);
     let stderr = String::from_utf8_lossy(&ok.stderr);
     assert!(ok.status.success(), "{stderr}");
-    assert!(stderr.contains("fractal: 6 method(s) in the selection, 6 admitted"), "{stderr}");
-    assert!(stderr.contains("0 pass(es): none registered"), "{stderr}");
+    assert!(stderr.contains("fractal: 6 method(s) in the selection"), "{stderr}");
+    assert!(stderr.contains("1 pass(es): inline-enum-predicates"), "{stderr}");
     let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
     assert_eq!(json["classes"][0], "Current");
-    assert_eq!(json["regions"].as_array().unwrap().len(), 6);
-    assert!(files_in(&out).is_empty(), "no variant, so nothing to write");
-    assert!(stderr.contains("emitted 0 file(s)"), "{stderr}");
+    assert_eq!(json["methods"].as_array().unwrap().len(), 6);
+    assert!(stderr.contains(&format!("({} file(s), 0 rewritten)", base_files().len())), "{stderr}");
+    assert_eq!(fs::read_to_string(out.join("app/models/current.rb")).unwrap(), CURRENT);
 
     let misplaced = run(&["--target", "ruby", "--class", "Current", dir.to_str().unwrap()]);
     assert!(!misplaced.status.success());
@@ -520,7 +498,7 @@ impl Pass for Scoped {
         (self.0)()
     }
 
-    fn run(&self, _cx: &Cx<'_>, _region: &Region<'_>) -> Proposal {
+    fn run(&self, _cx: &Cx<'_>, _unit: &Unit<'_>) -> Proposal {
         Proposal::default()
     }
 }
@@ -640,10 +618,10 @@ fn a_scoped_ingest_reads_only_its_files_and_plans_the_selection_the_same() {
     let read: Vec<&str> = app.sources.iter().map(|s| s.path.as_str()).filter(|p| p.ends_with(".rb")).collect();
     assert!(read.iter().all(|p| !p.contains("unrelated") && !p.contains("migrate") && !p.contains("base_widget")), "{read:?}");
     Analyzer::new(&app).analyze(&mut app);
-    let swap = Swap::new("original", "variant");
+    let swap = Swap::new("original", "rewritten");
     let plan = fractal::plan(&app, &root, &["Widget".to_string()], &[], &[&swap]).unwrap();
     assert_eq!(keys(&plan), ["Widget#label", "Widget#other"]);
-    assert_eq!(plan.report.variants.len(), 2);
+    assert_eq!(plan.report.files, ["app/models/widget/reopened.rb", "app/models/widget.rb"]);
 }
 
 /// A component: an in-repository gem with its own `app/`, which ingest

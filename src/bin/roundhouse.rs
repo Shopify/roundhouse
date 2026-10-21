@@ -61,21 +61,21 @@ Options:
                          swift, typescript, typescript-worker, ruby, jruby,
                          spinel
                        Default INPUT=.  Default OUT=./out/<lang>/
-                       `fractal` keeps the app on Rails: the output is an
-                       overlay for the app's root holding only the files
-                       it generates (specialized variants of the methods
-                       of the classes named with --class), empty when
-                       there are none.
+                       `fractal` compiles the app in place: the output is
+                       a complete copy of the app with the source of the
+                       classes named with --class rewritten (still Rails,
+                       same line numbers), to be tested and shipped.
       --class NAME     With --target fractal: a class or module to
                        specialize, by its full name (`Shop`,
                        `Admin::Report`). Repeatable. Every definition of it
-                       is selected (Rubydex). No --class emits nothing.
+                       is selected (Rubydex). No --class copies the app
+                       unchanged.
                        Only the files defining these classes, and what
                        the registered passes say they need, are ingested.
       --whole-app      With --target fractal: ingest and analyze the
                        whole app instead, as a pass that needs it does.
       --report PATH    With --target fractal: write the build's decisions
-                       (selection, methods, variants, declines) as JSON.
+                       (selection, methods, rewrites, declines) as JSON.
       --site           Build all targets + landing-page assets.
                        Default INPUT=fixtures/real-blog  Default OUT=./_site/
       --archives LIST  Build only comma-separated targets' browse archives.
@@ -343,8 +343,8 @@ fn parse_target(s: &str) -> Result<BuildTarget, String> {
 
 /// `--target fractal`: decide what to ingest (the selected classes and
 /// what the passes need, or the whole app), ingest and analyze it (no
-/// lowerings: Rails keeps running the app), plan the build, and write
-/// the overlay of what the plan generates.
+/// lowerings: the compiled app still runs on Rails), plan the rewrites,
+/// and write the compiled tree.
 fn run_fractal(
     classes: &[String],
     input: &std::path::Path,
@@ -396,8 +396,8 @@ fn run_fractal(
         }
     };
     // A file with a syntax error or a recorded gap is still copied as the
-    // app wrote it, but its IR holds placeholders, so none of its methods
-    // gets a variant. Warnings say nothing about a file's IR.
+    // app wrote it, but its IR holds placeholders, so no pass rewrites it.
+    // Warnings say nothing about a file's IR.
     let mut untrusted: Vec<String> = Vec::new();
     for d in parse_diags.iter().filter(|d| d.severity == Severity::Error) {
         eprintln!("roundhouse: {}", d.render(&app.sources));
@@ -424,8 +424,13 @@ fn run_fractal(
         let json = serde_json::to_string_pretty(&plan.report).map_err(|e| format!("report: {e}"))?;
         std::fs::write(path, json + "\n").map_err(|e| format!("write {}: {e}", path.display()))?;
     }
-    let written = fractal::write(out, &plan)?;
-    eprintln!("roundhouse: emitted {written} file(s) to {} (fractal overlay; every other file is the app's own)", out.display());
+    let written = fractal::write(input, out, &plan)?;
+    eprintln!(
+        "roundhouse: wrote the compiled app to {} ({} file(s), {} rewritten)",
+        out.display(),
+        written.copied,
+        written.rewritten
+    );
     Ok(())
 }
 
