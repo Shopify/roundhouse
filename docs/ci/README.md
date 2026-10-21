@@ -241,12 +241,45 @@ broaden comparison masks merely to turn CI green.
 
 ## Publication is separate
 
-PR checks never deploy Pages. Pushes to canonical `main` run Ruby+Spinel
-without publication. The three-hour scheduled cycle on canonical
-`rubys/roundhouse` main is what runs the extra-language matrix and requests
-publication. Manual publication is opt-in on canonical main.
+PR checks never deploy Pages. Both publication workflows accept only canonical
+`rubys/roundhouse` main. Neither workflow publishes a PR or fork branch.
 
-Pages requires the compact publication floor (Ruby plus any selected
+### Update the site without full validation
+
+1. Merge the site changes into `rubys/roundhouse` main.
+2. Start the site-only workflow:
+
+   ```sh
+   gh workflow run publish-site.yml --repo rubys/roundhouse --ref main
+   ```
+
+3. Check the **Publish site** run. Its `site` job checks the assembled files;
+   its `deploy` job publishes them after those checks pass.
+
+The workflow restores the artifact from the last successful Pages deployment.
+It updates `site/` and the browser entrypoints from the selected main commit.
+It rebuilds WebAssembly only when compiler, runtime, or toolchain inputs change.
+It runs page checks and the affected browser suites, not the language matrix.
+
+Generated archives, the user guide, benchmark data, demo inputs, and archive
+validation records keep their published bytes. This workflow does not refresh
+those generated results or claim that they validate the new source revision.
+`ci/site-publication.json` records the page, compiler, and retained archive
+revisions separately.
+
+The latest deployed artifact must exist, have a valid digest, and remain
+unexpired. Its source must be an ancestor of the selected main commit.
+If no usable baseline exists, publish through **Full validation** once.
+Site-only artifacts remain available for seven days. Both publication paths
+share the Pages lock, including baseline selection for a site-only update.
+
+### Refresh generated downloads and reports
+
+Pushes to main do not publish directly. The three-hour scheduled
+**Full validation** cycle rebuilds the generated site and requests publication.
+Manual full publication remains available with `publish=true`.
+
+Full publication requires the compact floor (Ruby plus any selected
 Rust/TypeScript lanes) and verified same-run assembly before deployment.
 Main advancing while Full validation is still running does **not** abort
 publish: deploy ships that run's assembled artifact for its validated SHA.
@@ -270,7 +303,7 @@ Read the owner and its executable contract before editing:
 | Toolchain selection | [ci.yml](../../.github/workflows/ci.yml), [`.ruby-version`](../../.ruby-version), [bin/rh](../../bin/rh) | `tests/ci_toolchain_workflow.rs`, `tests/rh_verify.rs` |
 | Receipt reuse | [ci-reuse.py](../../scripts/ci-reuse.py) | `tests/ci_reuse_test.py` |
 | Fixture caching | [generate-fixture in ci.yml](../../.github/workflows/ci.yml) | `tests/ci_fixture_workflow.rs` |
-| Archive evidence and Pages | [ci-archive-evidence.py](../../scripts/ci-archive-evidence.py), [full-ci.yml](../../.github/workflows/full-ci.yml) | `tests/ci_policy_workflow.rs` |
+| Archive evidence and Pages | [ci-archive-evidence.py](../../scripts/ci-archive-evidence.py), [ci-site.py](../../scripts/ci-site.py), [full-ci.yml](../../.github/workflows/full-ci.yml), [publish-site.yml](../../.github/workflows/publish-site.yml) | `tests/ci_site_test.py`, `tests/ci_policy_workflow.rs` |
 
 Run the relevant suites with `cargo test --test <stem>`; Python tests can run
 directly with `python3 -B tests/ci_reuse_test.py -v`, for example. Detailed

@@ -434,16 +434,6 @@ fn rust_ci_uses_the_repository_pin_before_restoring_caches() {
             }
         }
     }
-    let wasm_setup = workflow["jobs"]["build-wasm"]["steps"]
-        .as_sequence()
-        .unwrap()
-        .iter()
-        .find(|step| step["uses"].as_str() == Some("./.github/actions/setup-rust"))
-        .unwrap();
-    assert_eq!(
-        wasm_setup["with"]["targets"].as_str(),
-        Some("wasm32-wasip1")
-    );
     let smoke_setup = workflow["jobs"]["smoke"]["steps"]
         .as_sequence()
         .unwrap()

@@ -387,6 +387,7 @@ fn routing_and_required_results_reject_false_green() {
         "tests/ci_plan_test.py",
         "tests/ci_plan_focus_test.py",
         "tests/ci_archive_evidence_test.py",
+        "tests/ci_site_test.py",
     ] {
         let result = std::process::Command::new("python3")
             .args(["-B", test, "-v"])

@@ -335,41 +335,9 @@ jobs:
     # build-site → smoke → deploy tail behind it (2026-08-19).
     timeout-minutes: 15
 
-    env:
-      WASI_SDK_VERSION: "33.0"
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-rust
-        with:
-          targets: wasm32-wasip1
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: wasm
-      - name: Install libclang (host bindgen)
-        timeout-minutes: 8
-        run: |
-          "$GITHUB_WORKSPACE/scripts/ci-apt-install" libclang-dev
-      - name: Cache WASI SDK
-        id: wasi-sdk
-        uses: actions/cache@v6
-        with:
-          path: /opt/wasi-sdk
-          key: wasi-sdk-${{ env.WASI_SDK_VERSION }}-x86_64-linux
-      - name: Install WASI SDK
-        if: steps.wasi-sdk.outputs.cache-hit != 'true'
-        run: |
-          ver="${WASI_SDK_VERSION}"; major="${ver%%.*}"
-          url="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${major}/wasi-sdk-${ver}-x86_64-linux.tar.gz"
-          curl -fsSL "$url" -o /tmp/wasi-sdk.tar.gz
-          sudo mkdir -p /opt/wasi-sdk
-          sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
-      - name: Build roundhouse_wasm.wasm
-        env:
-          WASI_SDK_PATH: /opt/wasi-sdk
-          # Stamped into the wasm's `version` export, which /ide/ puts on
-          # its copyable summary line.
-          ROUNDHOUSE_COMMIT: ${{ github.sha }}
-        run: cargo build --release --target wasm32-wasip1 --manifest-path wasm/Cargo.toml
+      - uses: ./.github/actions/build-wasm
       - name: Upload wasm artifact
         uses: actions/upload-artifact@v7
         with:
@@ -3230,24 +3198,12 @@ jobs:
         if: needs.plan.outputs.site == 'true'
         run: |
           set -euo pipefail
-          mkdir -p _site/lib _site/playground _site/studio
-          # Shared lib: every code module + the freshly-built compiler wasm (from
-          # the build-wasm artifact — not committed; see that job + wasm/vendor/).
-          # A glob, not a list: browser-smoke-ide serves wasm/ directly, so a
-          # module missing from a hand-kept list only fails on the live site
-          # (local-bundle.mjs, 2026-09-15).
-          cp wasm/lib/*.mjs wasm/lib/*.js _site/lib/
+          # Shared with the site-only publisher, including each browser entrypoint.
+          python3 scripts/ci-site.py browser-assets --root _site
           cp wasm-artifact/roundhouse_wasm.wasm _site/lib/
           # Fresh seed app from the just-generated real-blog fixture (→ lib).
           (cd wasm/browser-spike && node gen-fixture.mjs)
           cp wasm/browser-spike/fixture.json _site/lib/fixture.json
-          # Each surface: its own HTML + entry module(s). Studio also ships its
-          # app-host service worker (sw.js), which serves the running app.
-          cp wasm/playground/index.html wasm/playground/playground.js _site/playground/
-          cp wasm/studio/index.html wasm/studio/studio.js wasm/studio/sw.js _site/studio/
-          # The Fractal pass explorer (linked from site/fractal.html).
-          mkdir -p _site/fractal
-          cp wasm/fractal/index.html wasm/fractal/fractal.js _site/fractal/
           echo "lib files:";        find _site/lib -type f | sort
           echo "playground files:"; find _site/playground -type f | sort
           echo "studio files:";     find _site/studio -type f | sort
@@ -3276,8 +3232,6 @@ jobs:
         if: needs.plan.outputs.site == 'true'
         run: |
           set -euo pipefail
-          mkdir -p _site/ide
-          cp wasm/ide/index.html wasm/ide/ide.js _site/ide/
           cp wasm/ide/app-src.json _site/ide/
           echo "ide files:"; find _site/ide -type f | sort
 
