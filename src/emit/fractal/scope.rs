@@ -202,10 +202,13 @@ fn layout_files(root: &Path, files: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
 /// Exclude root-level non-program directories, dependency trees at any
 /// depth, and earlier emitted overlays.
 pub(super) fn skip_source_dir(root: &Path, dir: &Path, root_only: &[&str]) -> bool {
+    skip_program_dir(root, dir, root_only) || dir.join(super::tree::MANIFEST).is_file()
+}
+
+/// Directory exclusions shared by disk and in-memory source trees.
+pub(super) fn skip_program_dir(root: &Path, dir: &Path, root_only: &[&str]) -> bool {
     let name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
-    name == "node_modules"
-        || (dir.parent() == Some(root) && root_only.contains(&name))
-        || dir.join(super::tree::MANIFEST).is_file()
+    name.starts_with('.') || name == "node_modules" || (dir.parent() == Some(root) && root_only.contains(&name))
 }
 
 /// Every `.rb` under `root` outside [`UNINDEXED`] and hidden directories,

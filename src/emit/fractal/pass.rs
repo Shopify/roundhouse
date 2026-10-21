@@ -36,6 +36,12 @@ pub trait Pass {
     /// Stable, short, kebab-case: it appears in reports.
     fn name(&self) -> &'static str;
 
+    /// One line on what the pass does, for the pass explorer
+    /// ([`super::stages`]).
+    fn summary(&self) -> &'static str {
+        ""
+    }
+
     /// What the build must ingest for this pass to know what it needs.
     /// Anything outside the scope is unknown to the analyzer, so a pass
     /// that under-declares gets fewer facts and should decline where it
@@ -62,6 +68,24 @@ pub struct Cx<'a> {
 impl<'a> Cx<'a> {
     pub fn new(app: &'a App, root: &'a Path) -> Cx<'a> {
         Cx { app, root, sources: OnceCell::new(), index: OnceCell::new(), defined: OnceCell::new(), gems: OnceCell::new() }
+    }
+
+    /// A context over sources already in memory rather than an app on
+    /// disk (the browser explorer has no filesystem): `sources` are the
+    /// app's Ruby files with paths relative to `root`, filtered the way
+    /// [`Cx::app_sources`] filters a tree, and `lockfile` is the text of
+    /// `Gemfile.lock`, if the app has one.
+    pub fn in_memory(app: &'a App, root: &'a Path, sources: Vec<SourceFile>, lockfile: Option<&str>) -> Cx<'a> {
+        let cx = Cx::new(app, root);
+        let program = sources.into_iter().filter(|source| {
+            let path = Path::new(&source.path);
+            let relative = path.strip_prefix(root).unwrap_or(path);
+            relative.extension().is_some_and(|ext| ext == "rb")
+                && !relative.ancestors().skip(1).any(|dir| super::scope::skip_program_dir(Path::new(""), dir, NOT_PROGRAM))
+        });
+        let _ = cx.sources.set(program.collect());
+        let _ = cx.gems.set(lockfile.map(parse_lockfile).unwrap_or_default());
+        cx
     }
 
     /// Every Ruby file of the app the program can load, read from disk
@@ -162,7 +186,7 @@ impl Unit<'_> {
 }
 
 /// A pass's answer for one unit.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Proposal {
     pub edits: Vec<Edit>,
     /// Sites the pass looked at and left alone, with why.
@@ -204,8 +228,11 @@ fn app_ruby_sources(root: &Path) -> Vec<SourceFile> {
 /// `gem => version` from a lockfile's specs (the four-space-indented
 /// `name (version)` lines).
 fn lockfile_versions(path: &Path) -> BTreeMap<String, String> {
+    std::fs::read_to_string(path).map(|text| parse_lockfile(&text)).unwrap_or_default()
+}
+
+fn parse_lockfile(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(path) else { return out };
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("    ") else { continue };
         if rest.starts_with(' ') {

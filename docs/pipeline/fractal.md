@@ -182,7 +182,8 @@ bare.
 
 ## Writing a pass
 
-Implement [`Pass`](../../src/emit/fractal/pass.rs): a name, a `scope`,
+Implement [`Pass`](../../src/emit/fractal/pass.rs): a name, a one-line
+`summary` (what the pass explorer shows), a `scope`,
 and a `run` that reads a [`Unit`](../../src/emit/fractal/pass.rs) and
 returns a `Proposal` of `Edit`s (spans of the unit's file and their
 replacement text) and declined sites. [`Cx`](../../src/emit/fractal/pass.rs)
@@ -195,6 +196,27 @@ in `pass::registered()`, pin its rewrites and declines in a build test,
 and add a case to `tests/fractal_runtime.rs`. That test emits and applies
 the overlay against Active Record and SQLite. It compares the app's
 answers before and after apply.
+
+## Pass explorer
+
+[`wasm/fractal/`](../../wasm/fractal/) runs the passes in the browser,
+on the compiler wasm, over a small app a person can edit: pick the file
+to compile and step through the stages, from the source to the file
+after each pass, with what each pass rewrote and what it declined and
+why. It calls the wasm's `fractal_stages` export, which runs
+[`stages.rs`](../../src/emit/fractal/stages.rs): the same selection,
+passes and driver as a build, over sources already in memory
+(`Cx::in_memory`, since the browser has no app on disk), keeping what
+each pass added. Stage *n* is the passes `1..=n` applied together, the
+way a build applies them. It writes nothing. The explorer shows the
+complete selected file at each stage, but `fractal emit` writes only
+changed files. Use `fractal apply` to overwrite those files in the base app.
+
+The example defines `pending?` in `app/models/public/order_policy.rb`.
+The browser and disk source filters both keep this nested namespace.
+The pass declines the app-defined predicate instead of replacing its call.
+[`site/fractal.html`](../../site/fractal.html) introduces Fractal and
+links to the explorer.
 
 ## JIT shape
 
