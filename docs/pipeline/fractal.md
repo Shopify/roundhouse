@@ -1,13 +1,13 @@
 # Fractal: specialize a running Rails app, one class at a time
 
-`roundhouse --target fractal --class NAME APP` emits specialized
-variants of the methods of the classes it names, as an overlay to place
-on the app's root. It never edits an app file, so the overlay holds only
-what it generates; every other file is the app's own. Rails keeps
-loading and running the app. A variant replaces
-one method only when the assumptions it was built under still hold at
-load time; otherwise the app's own method runs. Deselecting a class
-and rebuilding gives the app back.
+`fractal emit` writes only the generated files in the app's directory
+structure. It does not copy the app or change its files.
+`fractal apply` copies those files onto the base app and replaces files
+with the same paths. Files absent from the overlay stay unchanged.
+
+Rails keeps loading and running the app. The selected methods get
+specialized variants. A variant replaces one method only when its
+assumptions hold at load time. Otherwise, the app's own method runs.
 
 The point is application knowledge. Roundhouse ingests and analyzes the
 selected classes and what its passes need to know about them (or the
@@ -23,6 +23,34 @@ JIT's job, not Fractal's.
 **This baseline registers no pass.** It is the pipeline, the contract
 and the runtime that passes attach to. A build today reports what it
 would work with and emits nothing.
+
+## Emit, then apply
+
+1. Emit the file overlay:
+
+   ```sh
+   fractal emit --class Shop path/to/app -o out/fractal
+   ```
+
+2. Apply the overlay to the base app:
+
+   ```sh
+   fractal apply out/fractal path/to/app
+   ```
+
+The Cargo binary is `fractal`. The shipped binary accepts the same
+commands as `roundhouse fractal emit` and `roundhouse fractal apply`.
+`roundhouse --target fractal` also uses the same emission step.
+
+Emit defaults to the current app and `out/fractal`. Apply uses the same
+defaults. The overlay can be inside the base app. Apply does not create
+a second app. It rejects symbolic links and incompatible destination
+types before it copies files.
+
+Apply never deletes files. An empty overlay changes nothing in the
+base app. Removing a class from the selection removes its variants
+from the next generated initializer. If no variants remain, remove
+the previously applied `config/initializers/fractal.rb` from the base app.
 
 ## Pipeline
 
@@ -46,8 +74,8 @@ All of it lives in [`src/emit/fractal/`](../../src/emit/fractal/).
    ones. A pass that returns `Scope::WholeApp`, or `--whole-app`, makes
    the build ingest everything instead.
 2. **Ingest and analyze**, without lowering. Files ingest can only
-   partly read (a `--survey` gap, a syntax error) are still copied, but
-   none of their methods gets a variant.
+   partly read (a `--survey` gap, a syntax error) keep the app's code.
+   None of their methods gets a variant.
 3. **Select** ([`select.rs`](../../src/emit/fractal/select.rs)). Rubydex
    finds every `class`/`module` body whose resolved name is a `--class`,
    reopenings included. Bodies of other classes nested inside are not
@@ -72,18 +100,20 @@ All of it lives in [`src/emit/fractal/`](../../src/emit/fractal/).
    proposals for one region are combined, in pass order. A proposal
    with an edit outside the definition, or overlapping an earlier edit,
    is dropped and reported. A region nothing edited gets no variant.
-7. **Write** ([`overlay.rs`](../../src/emit/fractal/overlay.rs)). The
-   output directory gets `config/initializers/fractal.rb` when there is
-   at least one variant, and nothing otherwise: a large app is never
-   copied. A rebuild first removes what an earlier build wrote there, so
-   deselecting a class leaves no stale initializer; a directory holding
-   anything else is refused, which keeps `-o` from pointing at the app.
-   Placing the overlay on the app's root is the deploy step, and so is
-   removing the initializer when a rebuild no longer generates it.
+7. **Emit** ([`overlay.rs`](../../src/emit/fractal/overlay.rs)). The
+   output directory gets `config/initializers/fractal.rb` when at least
+   one variant exists. Otherwise, it is empty. Emit never copies the app.
+   A rebuild removes files from an earlier build in the output directory.
+   It refuses other files there, which keeps `-o` from pointing at the app.
+8. **Apply** ([`overlay.rs`](../../src/emit/fractal/overlay.rs)). The
+   separate apply command copies only overlay files onto the existing app.
+   It adds generated files and overwrites files with the same paths.
+   It leaves all other files unchanged.
 
 `--report PATH` writes the build's decisions as JSON: the selected
-bodies, every region with its admission and knowledge, the variants and
-their guards, and every declined site with the pass and reason.
+bodies, each region with its admission and knowledge, the variants and
+their guards, and each declined site with the pass and reason.
+Keep the report outside the overlay directory.
 
 ## What a variant is
 
@@ -130,10 +160,11 @@ typed, effect-free and writing no state. Calls with a block are not
 replayed.
 
 `tests/fractal.rs` covers selection, admission, knowledge, variant
-construction and the CLI. `tests/fractal_runtime.rs` builds an app with
-a test pass and checks every install, pending and decline rule against
-Ruby, with Active Record and Current attributes when they are
-installed.
+construction and the CLI. `tests/fractal_apply.rs` covers file replacement,
+unchanged files, path checks, empty overlays, and the separate commands.
+`tests/fractal_runtime.rs` emits an overlay with a test pass, applies it to
+the base app, and checks the runtime against Ruby. It includes Active
+Record and Current attributes when installed.
 
 ## JIT shape
 

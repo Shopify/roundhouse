@@ -38,6 +38,8 @@ fn usage() -> &'static str {
 Usage: roundhouse --target LANG [INPUT] [-o OUT]
        roundhouse --site [INPUT] [-o OUT]
        roundhouse --target fractal [--class NAME]... [--whole-app] [--report PATH] [INPUT] [-o OUT]
+       roundhouse fractal emit [OPTIONS] [APP] [-o OUT]
+       roundhouse fractal apply [OVERLAY] [APP]
        roundhouse --archives LANG,LANG [INPUT] [-o OUT]
        roundhouse check [--continue] [--inventory PATH] [--hotspots] [APP]
        roundhouse lsp
@@ -54,6 +56,7 @@ Subcommands (each takes --help):
                        ranked hotspot report. --inventory PATH writes JSON.
   lsp                  Serve the Language Server over stdio.
   mcp                  Serve the MCP tools over stdio for APP (default .).
+  fractal              Emit a file overlay, or apply it to an existing app.
 
 Options:
   -t, --target LANG    Transpile target. One of:
@@ -121,6 +124,7 @@ fn cli() -> ExitCode {
         Some("check") => return roundhouse::cli::check(&args[1..], "."),
         Some("lsp") => return roundhouse::cli::lsp(&args[1..]),
         Some("mcp") => return roundhouse::cli::mcp(&args[1..]),
+        Some("fractal") => return roundhouse::cli::fractal::run(&args[1..]),
         _ => {}
     }
     match parse_args(args) {
@@ -133,7 +137,7 @@ fn cli() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Action::Fractal { classes, input, out, survey, report, whole_app }) => {
-            match run_fractal(&classes, &input, &out, survey, report.as_deref(), whole_app) {
+            match roundhouse::cli::fractal::emit(&classes, &input, &out, survey, report.as_deref(), whole_app) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("roundhouse: {e}");
@@ -339,94 +343,6 @@ fn parse_target(s: &str) -> Result<BuildTarget, String> {
             Err(format!("unknown target '{s}'. Valid: {valid}"))
         }
     }
-}
-
-/// `--target fractal`: decide what to ingest (the selected classes and
-/// what the passes need, or the whole app), ingest and analyze it (no
-/// lowerings: Rails keeps running the app), plan the build, and write
-/// the overlay of what the plan generates.
-fn run_fractal(
-    classes: &[String],
-    input: &std::path::Path,
-    out: &std::path::Path,
-    survey: bool,
-    report_path: Option<&std::path::Path>,
-    whole_app: bool,
-) -> Result<(), String> {
-    use roundhouse::emit::fractal;
-    if !input.exists() {
-        return Err(format!("input {} does not exist", input.display()));
-    }
-    let passes = fractal::pass::registered();
-    let passes: Vec<&dyn fractal::Pass> = passes.iter().map(|p| p.as_ref()).collect();
-    let root = input.canonicalize().map_err(|e| format!("input {}: {e}", input.display()))?;
-    let ingest = fractal::scope::decide(&root, classes, &passes, whole_app)?;
-    if survey {
-        roundhouse::ingest::survey::activate();
-    }
-    let (app_result, parse_diags) = roundhouse::ingest::prism::scope(|| match &ingest {
-        fractal::Ingest::WholeApp { reason } => {
-            eprintln!("roundhouse: fractal: ingesting the whole app ({reason})");
-            ingest_app(input)
-        }
-        fractal::Ingest::Files { files, indexed } => {
-            eprintln!(
-                "roundhouse: fractal: ingesting {} file(s) the selection and passes need (Rubydex indexed {indexed}); --whole-app reads everything",
-                files.len()
-            );
-            let fs = roundhouse::vfs::FsVfs::new();
-            let vfs = roundhouse::vfs::ScopedVfs::new(&fs, files.iter().cloned());
-            roundhouse::ingest::app::ingest_app_with_vfs(&vfs, &root)
-        }
-    });
-    let gaps = if survey { roundhouse::ingest::survey::drain() } else { Vec::new() };
-    let mut app = match app_result {
-        Ok(app) => app,
-        Err(e) => {
-            for d in &parse_diags {
-                eprintln!("roundhouse: {}", d.render(&[]));
-            }
-            if !gaps.is_empty() {
-                eprintln!();
-                eprint!("{}", roundhouse::ingest::survey::render_report(&gaps));
-            } else if !survey {
-                eprintln!("roundhouse: hint: re-run with --survey to record unsupported constructs and keep going");
-            }
-            return Err(format!("ingest {}: {e}", input.display()));
-        }
-    };
-    // A file with a syntax error or a recorded gap is still copied as the
-    // app wrote it, but its IR holds placeholders, so none of its methods
-    // gets a variant. Warnings say nothing about a file's IR.
-    let mut untrusted: Vec<String> = Vec::new();
-    for d in parse_diags.iter().filter(|d| d.severity == Severity::Error) {
-        eprintln!("roundhouse: {}", d.render(&app.sources));
-        if let Some(source) = (d.span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) {
-            untrusted.push(source.path.clone());
-        }
-    }
-    if !gaps.is_empty() {
-        eprintln!();
-        eprint!("{}", roundhouse::ingest::survey::render_report(&gaps));
-        eprintln!("roundhouse: {} ingest gap(s) recorded; their files keep the app's code", gaps.len());
-        for gap in &gaps {
-            if let roundhouse::ingest::IngestError::Unsupported { file, .. } | roundhouse::ingest::IngestError::Parse { file, .. } = gap {
-                untrusted.push(file.clone());
-            }
-        }
-    }
-    roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
-    let plan = fractal::plan(&app, input, classes, &untrusted, &passes)?;
-    for line in plan.report.render().lines() {
-        eprintln!("roundhouse: {line}");
-    }
-    if let Some(path) = report_path {
-        let json = serde_json::to_string_pretty(&plan.report).map_err(|e| format!("report: {e}"))?;
-        std::fs::write(path, json + "\n").map_err(|e| format!("write {}: {e}", path.display()))?;
-    }
-    let written = fractal::write(out, &plan)?;
-    eprintln!("roundhouse: emitted {written} file(s) to {} (fractal overlay; every other file is the app's own)", out.display());
-    Ok(())
 }
 
 fn run_transpile(

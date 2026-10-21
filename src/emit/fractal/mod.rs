@@ -9,7 +9,7 @@
 //! definitions exist), and uses that application knowledge to produce
 //! specialized *variants* of the selected classes' methods. Everything
 //! else, including every method no pass changes, is the app's own code.
-//! Deselecting a class and rebuilding gives the app back.
+//! Emit changes only the overlay; [`apply`] copies it onto the base app.
 //!
 //! The pieces, in the order a build runs them:
 //!
@@ -29,10 +29,10 @@
 //!   loads, only after its guards hold, and leaves the app's own method
 //!   in place otherwise.
 //!
-//! No app file is edited, so the output is an overlay holding only what
-//! a build generates (`config/initializers/fractal.rb`, when there is at
-//! least one variant) to be placed on the app's root. With no variant it
-//! is empty.
+//! Emission edits no app file. It writes an overlay holding only what a
+//! build generates (`config/initializers/fractal.rb`, when there is at
+//! least one variant). With no variant it is empty. The separate
+//! [`apply`] step copies only overlay files onto the existing app.
 //!
 //! Where YJIT and ZJIT would want different shapes, Fractal takes ZJIT's.
 //! The unit of specialization is a whole method, chosen once at load:
@@ -204,7 +204,7 @@ pub fn write(out: &Path, plan: &Plan) -> Result<usize, String> {
     overlay::write(out, &plan.generated)
 }
 
-pub use overlay::OWNED;
+pub use overlay::{OWNED, apply};
 
 /// Is `rel` the tail of `path` at a path boundary?
 fn is_suffix_path(path: &str, rel: &str) -> bool {

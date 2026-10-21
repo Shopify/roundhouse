@@ -22,13 +22,14 @@ pub fn write(out: &Path, generated: &[(String, String)]) -> Result<usize, String
     }
     if out.exists() {
         let mut found = Vec::new();
-        walk(out, out, &mut found)?;
-        let foreign: Vec<&String> = found.iter().filter(|rel| !OWNED.contains(&rel.as_str())).collect();
+        walk(out, out, &mut found, false)?;
+        let foreign: Vec<&PathBuf> = found.iter().filter(|rel| !OWNED.iter().any(|owned| Path::new(owned) == *rel)).collect();
         if let Some(first) = foreign.first() {
             return Err(format!(
-                "output {} holds {} file(s) a fractal build did not write ({first}, ...); use an empty directory or an earlier fractal output",
+                "output {} holds {} file(s) a fractal build did not write ({}, ...); use an empty directory or an earlier fractal output",
                 out.display(),
-                foreign.len()
+                foreign.len(),
+                first.display()
             ));
         }
         for rel in &found {
@@ -48,16 +49,69 @@ pub fn write(out: &Path, generated: &[(String, String)]) -> Result<usize, String
     Ok(generated.len())
 }
 
-/// Every file and symlink under `dir`, relative to `root`.
-fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), String> {
+/// Copy only the overlay's files onto an existing app. Files absent from
+/// the overlay stay untouched; an empty overlay changes nothing.
+pub fn apply(overlay: &Path, app: &Path) -> Result<usize, String> {
+    for dir in [overlay, app] {
+        let meta = fs::symlink_metadata(dir).map_err(|e| format!("stat {}: {e}", dir.display()))?;
+        if !meta.is_dir() {
+            return Err(format!("{} must be a directory, not a file or symlink", dir.display()));
+        }
+    }
+    let overlay = overlay.canonicalize().map_err(|e| format!("resolve {}: {e}", overlay.display()))?;
+    let app = app.canonicalize().map_err(|e| format!("resolve {}: {e}", app.display()))?;
+    if app.starts_with(&overlay) {
+        return Err("the app must not be the overlay directory or inside it".into());
+    }
+    let mut files = Vec::new();
+    walk(&overlay, &overlay, &mut files, true)?;
+    // Check every path before copying, so a bad entry cannot leave a
+    // predictably partial apply. I/O errors can still interrupt copying.
+    for rel in &files {
+        let dest = app.join(rel);
+        if dest.starts_with(&overlay) {
+            return Err(format!("destination {} is inside the overlay", dest.display()));
+        }
+        let mut path = app.clone();
+        let mut components = rel.components().peekable();
+        while let Some(component) = components.next() {
+            path.push(component);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => {
+                    let expected = if components.peek().is_some() { meta.is_dir() } else { meta.is_file() };
+                    if !expected {
+                        return Err(format!("destination {} has the wrong type or is a symlink", path.display()));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(format!("stat {}: {e}", path.display())),
+            }
+        }
+    }
+    for rel in &files {
+        let dest = app.join(rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        fs::copy(overlay.join(rel), &dest).map_err(|e| format!("copy {}: {e}", dest.display()))?;
+    }
+    Ok(files.len())
+}
+
+/// Every file and symlink under `dir`, relative to `root`. Applying an
+/// overlay permits only regular files, never links or special files.
+fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>, regular_only: bool) -> Result<(), String> {
     for entry in fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
         let path: PathBuf = entry.map_err(|e| format!("read {}: {e}", dir.display()))?.path();
         let meta = fs::symlink_metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
         if meta.is_dir() {
-            walk(root, &path, out)?;
+            walk(root, &path, out, regular_only)?;
         } else {
+            if regular_only && !meta.is_file() {
+                return Err(format!("overlay {} is not a regular file", path.display()));
+            }
             let rel = path.strip_prefix(root).map_err(|e| format!("{}: {e}", path.display()))?;
-            out.push(rel.to_string_lossy().replace('\\', "/"));
+            out.push(rel.to_path_buf());
         }
     }
     Ok(())

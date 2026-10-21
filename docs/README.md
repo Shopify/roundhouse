@@ -42,11 +42,10 @@ references explain design, while working plans are point-in-time proposals.
   the strict targets, `futamura` and `roda` apart; and `futamura`'s
   whole-route replacement, which serves the routes the analysis clears
   from the lowered app in a `Ruby::Box` inside Rails.
-- [`fractal.md`](pipeline/fractal.md) — `--target fractal`: Rails keeps
-  running the app, and the methods of the classes named with `--class`
-  get specialized variants, emitted as an overlay of generated files and
-  installed at load only while the assumptions they were built under
-  hold.
+- [`fractal.md`](pipeline/fractal.md) — `fractal emit` writes only generated
+  files; `fractal apply` copies them onto the base app. Rails keeps running
+  the app. Specialized variants replace the selected methods only while
+  their assumptions hold at load time.
 - [`emit.md`](pipeline/emit.md) — per-target emitters and the shared
   emit machinery.
 - [`runtime.md`](pipeline/runtime.md) — the two-layer runtime

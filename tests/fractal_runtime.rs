@@ -123,13 +123,11 @@ fn build() -> PathBuf {
     assert_eq!(refused, ["Patched#label@app/models/patched.rb:7"]);
     // Every other method with `original` in it.
     assert_eq!(plan.report.variants.len(), 20, "{:?}", plan.report.variants.iter().map(|v| &v.key).collect::<Vec<_>>());
-    // The app with the overlay placed on its root, as a deploy would.
+    // Emit separately, then apply only the overlay to the existing app.
     let overlay = base.join("overlay");
     fractal::write(&overlay, &plan).expect("write");
-    let out = base.join("out");
-    assert!(Command::new("cp").arg("-a").arg(&app_dir).arg(&out).status().unwrap().success());
-    assert!(Command::new("cp").arg("-a").arg(format!("{}/.", overlay.display())).arg(&out).status().unwrap().success());
-    out
+    assert_eq!(fractal::apply(&overlay, &app_dir).expect("apply"), 1);
+    app_dir
 }
 
 fn ruby(out: &PathBuf, mode: &str) {
