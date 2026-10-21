@@ -3,9 +3,9 @@
 // render loop over the compiler wasm's `fractal_stages` export.
 //
 // Asserts:
-//   1. boots, compiles app/models/order.rb, and the last stage is
+//   1. boots, compiles app/models/article.rb, and the last stage is
 //      inline-enum-predicates with its rewrites, on the lines they replace;
-//   2. the app's `pending?` in app/models/public/ is declined, with the reason;
+//   2. the app's `draft?` in app/models/public/ is declined, with the reason;
 //   3. editing Gemfile.lock to Active Record 7.0.8 re-runs the passes and
 //      the pass declines instead of rewriting;
 //   4. no console or page errors.
@@ -54,16 +54,16 @@ await page.waitForSelector("#status.ok", { timeout: 60000 });
 console.log("=== boot ===");
 let s = await state();
 console.log(s.status, "|", s.chips.join(" → "), "|", s.file);
-if (s.file !== "app/models/order.rb") fail(`expected order.rb to be compiled, got ${s.file}`);
+if (s.file !== "app/models/article.rb") fail(`expected article.rb to be compiled, got ${s.file}`);
 if (s.chips[0] !== "source" || s.chips.at(-1) !== "inline-enum-predicates") fail(`unexpected stages: ${s.chips.join(", ")}`);
 const rewrites = Number((s.status.match(/^(\d+) rewrite/) || [])[1]);
 if (rewrites !== 4) fail(`expected 4 rewrites and no rewrite of the nested app predicate, got "${s.status}"`);
-if (!s.added.some((t) => t.includes("(status_for_database == 1) && !(status_for_database == 3)")))
-  fail(`shippable? not rewritten: ${JSON.stringify(s.added)}`);
-if (!s.added.some((t) => t.includes('(channel_for_database == "pos")')))
-  fail(`channel_pos? not rewritten: ${JSON.stringify(s.added)}`);
+if (!s.added.some((t) => t.includes("(status_for_database == 1) && !(status_for_database == 2)")))
+  fail(`listed? not rewritten: ${JSON.stringify(s.added)}`);
+if (!s.added.some((t) => t.includes('(visibility_for_database == "members")')))
+  fail(`visibility_members? not rewritten: ${JSON.stringify(s.added)}`);
 if (s.added.length !== s.removed.length) fail(`a rewrite moved a line: ${s.added.length} added vs ${s.removed.length} removed`);
-if (!/defines `?pending\?`? itself/.test(s.notes)) fail(`pending? not declined: ${s.notes}`);
+if (!/defines `?draft\?`? itself/.test(s.notes)) fail(`draft? not declined: ${s.notes}`);
 
 console.log("=== edit Gemfile.lock to activerecord 7.0.8 ===");
 await page.click("#srcTabs button[title='Gemfile.lock']");

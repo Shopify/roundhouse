@@ -30,7 +30,7 @@ time) are the same kind of edit, applied the same way.
 1. Emit the file overlay:
 
    ```sh
-   fractal emit --file app/models/order.rb path/to/app -o out/fractal
+   fractal emit --file app/models/article.rb path/to/app -o out/fractal
    ```
 
 2. Apply the overlay to the base app:
@@ -147,10 +147,10 @@ a class body, a call to its predicate inside an instance method of that
 class becomes that comparison:
 
 ```ruby
-enum :status, { pending: 0, paid: 1 }
-def shippable? = paid? && !archived?
+enum :status, { draft: 0, published: 1 }
+def listed? = published? && !hidden?
 # compiled
-def shippable? = (status_for_database == 1) && !archived?
+def listed? = (status_for_database == 1) && !hidden?
 ```
 
 The call no longer goes through a block-backed method, which ZJIT cannot
@@ -212,7 +212,7 @@ way a build applies them. It writes nothing. The explorer shows the
 complete selected file at each stage, but `fractal emit` writes only
 changed files. Use `fractal apply` to overwrite those files in the base app.
 
-The example defines `pending?` in `app/models/public/order_policy.rb`.
+The example defines `draft?` in `app/models/public/listing.rb`.
 The browser and disk source filters both keep this nested namespace.
 The pass declines the app-defined predicate instead of replacing its call.
 [`site/fractal.html`](../../site/fractal.html) introduces Fractal and

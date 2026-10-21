@@ -17,25 +17,25 @@ import { createClient } from "../lib/wasm-client.mjs";
 const EXAMPLES = {
   enum: {
     label: "Enum predicates (inline-enum-predicates)",
-    file: "app/models/order.rb",
+    file: "app/models/article.rb",
     src: {
-      "app/models/order.rb": `# frozen_string_literal: true
+      "app/models/article.rb": `# frozen_string_literal: true
 
-class Order < ApplicationRecord
-  enum :status, { pending: 0, paid: 1, shipped: 2, refunded: 3 }
-  enum :channel, { web: "web", pos: "pos" }, prefix: true
-  include Public::OrderPolicy
+class Article < ApplicationRecord
+  enum :status, { draft: 0, published: 1, archived: 2 }
+  enum :visibility, { everyone: "everyone", members: "members" }, prefix: true
+  include Public::Listing
 
-  def shippable?
-    paid? && !refunded?
+  def listed?
+    published? && !archived?
   end
 
-  def label
-    return "done" if shipped?
-    channel_pos? ? "in store" : "online"
+  def badge
+    return "archived" if archived?
+    visibility_members? ? "members only" : "public"
   end
 
-  def waiting? = pending?
+  def unfinished? = draft?
 end
 `,
       "app/models/application_record.rb": `class ApplicationRecord < ActiveRecord::Base
@@ -43,10 +43,10 @@ end
 end
 `,
       // A nested application namespace still belongs to the program.
-      "app/models/public/order_policy.rb": `module Public
-  module OrderPolicy
-    def pending?
-      super && created_at > 1.day.ago
+      "app/models/public/listing.rb": `module Public
+  module Listing
+    def draft?
+      super || published_at.nil?
     end
   end
 end

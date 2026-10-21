@@ -97,7 +97,7 @@
     </div>
     <ol>
       <li>Emit the changed files:
-        <pre><code>fractal emit --file app/models/order.rb path/to/app -o out/fractal</code></pre>
+        <pre><code>fractal emit --file app/models/article.rb path/to/app -o out/fractal</code></pre>
       </li>
       <li>Apply them to the base app:
         <pre><code>fractal apply out/fractal path/to/app</code></pre>
@@ -145,7 +145,7 @@
       </svg>
     </figure>
     <div class="cards">
-      <div class="card"><b>The file</b> is what you compile: <code>--file app/models/order.rb</code>. Emit includes it only when a pass changes it.</div>
+      <div class="card"><b>The file</b> is what you compile: <code>--file app/models/article.rb</code>. Emit includes it only when a pass changes it.</div>
       <div class="card python"><b>An edit</b> is where a rewrite happens: a span of the file replaced, on the same line.</div>
       <div class="card go"><b>Not sure?</b> Fractal leaves the code as written and says why.</div>
     </div>
@@ -239,11 +239,11 @@
       The first pass, <code>inline-enum-predicates</code>, looks at the
       predicates an Active Record <code>enum</code> generates:
     </p>
-<pre><code><span class="k">class</span> Order &lt; ApplicationRecord
-  enum :status, { pending: 0, paid: 1, shipped: 2, refunded: 3 }
+<pre><code><span class="k">class</span> Article &lt; ApplicationRecord
+  enum :status, { draft: 0, published: 1, archived: 2 }
 
-  <span class="k">def</span> shippable?
-    <mark>paid?</mark> &amp;&amp; !<mark>refunded?</mark>
+  <span class="k">def</span> listed?
+    <mark>published?</mark> &amp;&amp; !<mark>archived?</mark>
   <span class="k">end</span>
 <span class="k">end</span></code></pre>
     <p>
@@ -253,8 +253,8 @@
       dynamic symbol on every call. The mapping is written right there in the
       class, so the pass writes the comparison in place of the call:
     </p>
-<pre><code><span class="k">def</span> shippable?
-  <mark>(status_for_database == 1)</mark> &amp;&amp; !<mark>(status_for_database == 3)</mark>
+<pre><code><span class="k">def</span> listed?
+  <mark>(status_for_database == 1)</mark> &amp;&amp; !<mark>(status_for_database == 2)</mark>
 <span class="k">end</span></code></pre>
     <ul>
       <li><strong>Same comparison.</strong> <code>status_for_database</code> is the ordinary <code>def</code> Active Record generates; the predicate's block and the <code>public_send</code> are gone.</li>
@@ -264,8 +264,8 @@
     </ul>
     <p>
       The <a href="fractal/">pass explorer</a> runs the real pass in your
-      browser. Its example defines <code>pending?</code> under
-      <code>app/models/public/order_policy.rb</code>. The pass sees this nested
+      browser. Its example defines <code>draft?</code> under
+      <code>app/models/public/listing.rb</code>. The pass sees this nested
       namespace and declines the call. Edit the model or change the Active
       Record version in <code>Gemfile.lock</code> to inspect the result.
     </p>

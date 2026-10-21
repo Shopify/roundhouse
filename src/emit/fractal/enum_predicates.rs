@@ -6,11 +6,11 @@
 //! (unchanged from 7.1 to 8.1 and main), so inside a method of the model
 //!
 //! ```ruby
-//! enum :status, { pending: 0, paid: 1 }
-//! def shippable? = paid? && !archived?
+//! enum :status, { draft: 0, published: 1 }
+//! def listed? = published? && !hidden?
 //! ```
 //!
-//! `paid?` becomes `(status_for_database == 1)`: the same comparison,
+//! `published?` becomes `(status_for_database == 1)`: the same comparison,
 //! with no block-backed method (which ZJIT cannot call directly) and no
 //! `public_send` of a dynamic symbol in between. `status_for_database`
 //! is an ordinary `def` Active Record generates.
@@ -74,7 +74,7 @@ impl Pass for EnumPredicates {
     }
 
     fn summary(&self) -> &'static str {
-        "Inside the enum's own class, a call to an enum predicate (`paid?`) becomes the comparison Rails' generated method runs (`(status_for_database == 1)`)."
+        "Inside the enum's own class, a call to an enum predicate (`published?`) becomes the comparison Rails' generated method runs (`(status_for_database == 1)`)."
     }
 
     fn scope(&self) -> Scope {
