@@ -12,7 +12,7 @@ use std::process::Command;
 const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activerecord (8.1.4)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  activerecord\n\nBUNDLED WITH\n   2.6.9\n";
 
 const SCHEMA: &str = r#"ActiveRecord::Schema.define do
-  create_table "orders", force: :cascade do |t|
+  create_table "articles", force: :cascade do |t|
     t.integer "status"
     t.string "kind"
     t.integer "size"
@@ -22,28 +22,28 @@ const SCHEMA: &str = r#"ActiveRecord::Schema.define do
 end
 "#;
 
-const ORDER: &str = r#"# frozen_string_literal: true
+const ARTICLE: &str = r#"# frozen_string_literal: true
 
-class Order < ApplicationRecord
-  enum :status, { pending: 0, paid: 1, shipped: 2 }
-  enum :kind, { retail: "r", wholesale: "w" }, prefix: true, suffix: :sale
+class Article < ApplicationRecord
+  enum :status, { draft: 0, published: 1, retracted: 2 }
+  enum :kind, { news: "n", opinion: "o" }, prefix: true, suffix: :piece
   enum :size, %i[small large], scopes: false
 
-  def shippable?
-    paid? && !archived?
+  def listed?
+    published? && !archived?
   end
 
   def label
-    if pending?
-      "waiting"
-    elsif shipped?
+    if draft?
+      "unpublished"
+    elsif retracted?
       "gone"
     else
-      kind_retail_sale? ? "retail" : "other"
+      kind_news_piece? ? "news" : "other"
     end
   end
 
-  def flags = [paid?, !shipped?, large?, kind_wholesale_sale?.to_s]
+  def flags = [published?, !retracted?, large?, kind_opinion_piece?.to_s]
 
   private def hidden = small?
 
@@ -54,37 +54,37 @@ end
 "#;
 
 /// An STI subclass that relies on the parent's predicates.
-const RUSH: &str = r#"class RushOrder < Order
-  def urgent? = paid? || pending?
+const FEATURED: &str = r#"class FeaturedArticle < Article
+  def promoted? = published? || draft?
 end
 "#;
 
 /// A string-valued enum in a file without the magic comment.
 const NOTE: &str = r#"class Note < ApplicationRecord
-  self.table_name = "orders"
-  enum :kind, { retail: "r", wholesale: "w" }
+  self.table_name = "articles"
+  enum :kind, { news: "n", opinion: "o" }
 
-  def retail_label = retail? ? "R" : "W"
+  def news_label = news? ? "N" : "O"
 end
 "#;
 
 const PROBE: &str = r#"
 out = []
-Order.statuses.each_key do |status|
-  Order.kinds.each_key do |kind|
-    Order.sizes.each_key do |size|
+Article.statuses.each_key do |status|
+  Article.kinds.each_key do |kind|
+    Article.sizes.each_key do |size|
       [true, false].each do |archived|
-        o = Order.create!(status: status, kind: kind, size: size, archived: archived)
-        out << [status, kind, size, archived, o.shippable?, o.label, o.flags, o.reveal]
+        a = Article.create!(status: status, kind: kind, size: size, archived: archived)
+        out << [status, kind, size, archived, a.listed?, a.label, a.flags, a.reveal]
       end
     end
   end
 end
-blank = Order.new
-out << ["new", blank.shippable?, blank.label, blank.flags, blank.reveal]
-rush = RushOrder.create!(status: :paid)
-out << ["rush", rush.urgent?, rush.shippable?, rush.label]
-out << ["note", Note.new(kind: :retail).retail_label, Note.new(kind: :wholesale).retail_label, Note.new.retail_label]
+blank = Article.new
+out << ["new", blank.listed?, blank.label, blank.flags, blank.reveal]
+featured = FeaturedArticle.create!(status: :published)
+out << ["featured", featured.promoted?, featured.listed?, featured.label]
+out << ["note", Note.new(kind: :news).news_label, Note.new(kind: :opinion).news_label, Note.new.news_label]
 out
 "#;
 
@@ -100,8 +100,8 @@ fn write_app(dir: &Path) {
         ("Gemfile.lock", LOCK),
         ("db/schema.rb", SCHEMA),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
-        ("app/models/order.rb", ORDER),
-        ("app/models/rush_order.rb", RUSH),
+        ("app/models/article.rb", ARTICLE),
+        ("app/models/featured_article.rb", FEATURED),
         ("app/models/note.rb", NOTE),
         ("probe.rb", PROBE),
     ] {
@@ -131,7 +131,7 @@ fn the_applied_overlay_answers_as_the_original_app_does() {
     let out = base.join("out");
     write_app(&app);
     let build = Command::new(env!("CARGO_BIN_EXE_fractal"))
-        .args(["emit", "--file", "app/models/order.rb", "--file", "app/models/rush_order.rb", "--file", "app/models/note.rb"])
+        .args(["emit", "--file", "app/models/article.rb", "--file", "app/models/featured_article.rb", "--file", "app/models/note.rb"])
         .arg(&app)
         .arg("-o")
         .arg(&out)
@@ -141,17 +141,17 @@ fn the_applied_overlay_answers_as_the_original_app_does() {
     assert!(build.status.success(), "{stderr}");
 
     // The build did rewrite: otherwise the comparison proves nothing.
-    let order = fs::read_to_string(out.join("app/models/order.rb")).unwrap();
-    assert!(order.contains("(status_for_database == 1) && !archived?"), "{order}");
-    assert!(order.contains("(kind_for_database == \"r\") ? \"retail\""), "{order}");
-    assert!(order.contains("private def hidden = (size_for_database == 0)"), "{order}");
-    assert!(!out.join("app/models/rush_order.rb").exists(), "unchanged files stay in the base app");
-    assert!(fs::read_to_string(out.join("app/models/note.rb")).unwrap().contains("(kind_for_database == \"r\".freeze) ? \"R\""));
+    let article = fs::read_to_string(out.join("app/models/article.rb")).unwrap();
+    assert!(article.contains("(status_for_database == 1) && !archived?"), "{article}");
+    assert!(article.contains("(kind_for_database == \"n\") ? \"news\""), "{article}");
+    assert!(article.contains("private def hidden = (size_for_database == 0)"), "{article}");
+    assert!(!out.join("app/models/featured_article.rb").exists(), "unchanged files stay in the base app");
+    assert!(fs::read_to_string(out.join("app/models/note.rb")).unwrap().contains("(kind_for_database == \"n\".freeze) ? \"N\""));
 
     let Some(original) = answers(&app) else { return };
     let apply = Command::new(env!("CARGO_BIN_EXE_fractal")).arg("apply").arg(&out).arg(&app).output().unwrap();
     assert!(apply.status.success(), "{}", String::from_utf8_lossy(&apply.stderr));
     assert!(!app.join(roundhouse::emit::fractal::MANIFEST).exists());
-    assert_eq!(fs::read_to_string(app.join("app/models/rush_order.rb")).unwrap(), RUSH);
+    assert_eq!(fs::read_to_string(app.join("app/models/featured_article.rb")).unwrap(), FEATURED);
     assert_eq!(original, answers(&app).unwrap());
 }

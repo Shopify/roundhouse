@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 use roundhouse::analyze::Analyzer;
 use roundhouse::emit::fractal::{self, Pass, Plan};
 
-const ORDER_RB: &str = "app/models/order.rb";
+const ARTICLE_RB: &str = "app/models/article.rb";
 
 const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activerecord (8.1.4)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  activerecord\n\nBUNDLED WITH\n   2.6.9\n";
 
 const SCHEMA: &str = r#"ActiveRecord::Schema.define do
-  create_table "orders", force: :cascade do |t|
+  create_table "articles", force: :cascade do |t|
     t.integer "status"
     t.string "kind"
     t.boolean "archived"
@@ -21,40 +21,40 @@ const SCHEMA: &str = r#"ActiveRecord::Schema.define do
 end
 "#;
 
-const ORDER: &str = r#"class Order < ApplicationRecord
-  enum :status, { pending: 0, paid: 1 }
-  enum :kind, { retail: "r", wholesale: "w" }, prefix: true
+const ARTICLE: &str = r#"class Article < ApplicationRecord
+  enum :status, { draft: 0, published: 1 }
+  enum :kind, { news: "n", opinion: "o" }, prefix: true
 
-  def shippable?
-    paid? && !archived?
+  def listed?
+    published? && !archived?
   end
 
   def describe
-    return "kind" if kind_retail?
-    !pending? ? "moving" : "waiting"
+    return "kind" if kind_news?
+    !draft? ? "live" : "unpublished"
   end
 
-  private def secret = paid?
+  private def secret = published?
 
   def in_a_block
-    [1].map { paid? }
+    [1].map { published? }
   end
 
   def guarded
-    defined?(paid?)
+    defined?(published?)
   end
 
   def self.on_the_class
-    paid?
+    published?
   end
 
   def shadowed
     status_for_database = 3
-    paid?
+    published?
   end
 
   def with_receiver(other)
-    other.paid? || self.paid?
+    other.published? || self.published?
   end
 end
 "#;
@@ -72,7 +72,7 @@ fn app_dir(name: &str, extra: &[(&str, &str)]) -> PathBuf {
         ("Gemfile.lock", LOCK),
         ("db/schema.rb", SCHEMA),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
-        ("app/models/order.rb", ORDER),
+        ("app/models/article.rb", ARTICLE),
     ];
     for (path, content) in extra {
         files.retain(|(p, _)| p != path);
@@ -113,34 +113,34 @@ fn declined(plan: &Plan) -> Vec<String> {
 #[test]
 fn calls_in_the_classs_own_instance_methods_become_rails_comparison() {
     let dir = app_dir("rewrites", &[]);
-    let plan = build(&dir, &[ORDER_RB]);
+    let plan = build(&dir, &[ARTICLE_RB]);
     let pair = |from: &str, to: &str| (from.to_string(), to.to_string());
     assert_eq!(
         rewrites(&plan),
         [
-            pair("paid?", "(status_for_database == 1)"),
-            pair("kind_retail?", "(kind_for_database == \"r\".freeze)"),
-            pair("pending?", "(status_for_database == 0)"),
-            pair("paid?", "(status_for_database == 1)"),
+            pair("published?", "(status_for_database == 1)"),
+            pair("kind_news?", "(kind_for_database == \"n\".freeze)"),
+            pair("draft?", "(status_for_database == 0)"),
+            pair("published?", "(status_for_database == 1)"),
         ]
     );
     let text = &plan.rewritten[0].1;
-    assert!(text.contains("!(status_for_database == 0) ? \"moving\""), "{text}");
+    assert!(text.contains("!(status_for_database == 0) ? \"live\""), "{text}");
     assert!(text.contains("private def secret = (status_for_database == 1)"), "{text}");
     // Left alone: in a block, under defined?, on the class, with a receiver.
-    for kept in ["[1].map { paid? }", "defined?(paid?)", "def self.on_the_class\n    paid?", "other.paid? || self.paid?"] {
+    for kept in ["[1].map { published? }", "defined?(published?)", "def self.on_the_class\n    published?", "other.published? || self.published?"] {
         assert!(text.contains(kept), "{kept} in {text}");
     }
-    assert!(declined(&plan).iter().any(|d| d.contains("order.rb:30:5: the method has a local variable `status_for_database`")), "{:?}", declined(&plan));
-    assert_eq!(text.lines().count(), ORDER.lines().count());
+    assert!(declined(&plan).iter().any(|d| d.contains("article.rb:30:5: the method has a local variable `status_for_database`")), "{:?}", declined(&plan));
+    assert_eq!(text.lines().count(), ARTICLE.lines().count());
 }
 
 #[test]
 fn a_frozen_file_compares_against_its_own_literal() {
-    let frozen = format!("# frozen_string_literal: true\n\n{ORDER}");
-    let dir = app_dir("frozen", &[("app/models/order.rb", &frozen)]);
-    let plan = build(&dir, &[ORDER_RB]);
-    assert!(rewrites(&plan).iter().any(|(_, to)| to == "(kind_for_database == \"r\")"), "{:?}", rewrites(&plan));
+    let frozen = format!("# frozen_string_literal: true\n\n{ARTICLE}");
+    let dir = app_dir("frozen", &[("app/models/article.rb", &frozen)]);
+    let plan = build(&dir, &[ARTICLE_RB]);
+    assert!(rewrites(&plan).iter().any(|(_, to)| to == "(kind_for_database == \"n\")"), "{:?}", rewrites(&plan));
 }
 
 #[test]
@@ -152,88 +152,88 @@ fn a_file_not_compiled_is_not_rewritten() {
 
 #[test]
 fn an_app_definition_of_the_predicate_or_its_reader_declines_it() {
-    let concern = "module Paying\n  def paid?\n    true\n  end\nend\n";
-    let dir = app_dir("defined", &[("app/models/concerns/paying.rb", concern)]);
-    let plan = build(&dir, &[ORDER_RB]);
-    assert!(!rewrites(&plan).iter().any(|(from, _)| from == "paid?"), "{:?}", rewrites(&plan));
-    assert!(declined(&plan).iter().any(|d| d.contains("the app defines `paid?` itself (app/models/concerns/paying.rb:2)")), "{:?}", declined(&plan));
+    let concern = "module Publishing\n  def published?\n    true\n  end\nend\n";
+    let dir = app_dir("defined", &[("app/models/concerns/publishing.rb", concern)]);
+    let plan = build(&dir, &[ARTICLE_RB]);
+    assert!(!rewrites(&plan).iter().any(|(from, _)| from == "published?"), "{:?}", rewrites(&plan));
+    assert!(declined(&plan).iter().any(|d| d.contains("the app defines `published?` itself (app/models/concerns/publishing.rb:2)")), "{:?}", declined(&plan));
     // The other predicates are unaffected.
-    assert!(rewrites(&plan).iter().any(|(from, _)| from == "pending?"));
+    assert!(rewrites(&plan).iter().any(|(from, _)| from == "draft?"));
 
     let reader = "class Audit\n  attr_reader :status_for_database\nend\n";
     let dir = app_dir("reader", &[("app/models/audit.rb", reader)]);
-    let plan = build(&dir, &[ORDER_RB]);
+    let plan = build(&dir, &[ARTICLE_RB]);
     assert!(!rewrites(&plan).iter().any(|(_, to)| to.contains("status_for_database")), "{:?}", rewrites(&plan));
     assert!(declined(&plan).iter().any(|d| d.contains("the app defines `status_for_database` itself")), "{:?}", declined(&plan));
 }
 
 #[test]
 fn another_enum_producing_the_same_predicate_declines_it() {
-    let refund = "class Refund < ApplicationRecord\n  enum :state, [:paid, :void]\nend\n";
-    let dir = app_dir("duplicate", &[("app/models/refund.rb", refund)]);
-    let plan = build(&dir, &[ORDER_RB]);
-    assert!(declined(&plan).iter().any(|d| d.contains("another enum in the app also defines `paid?`")), "{:?}", declined(&plan));
-    assert!(!rewrites(&plan).iter().any(|(from, _)| from == "paid?"));
+    let revision = "class Revision < ApplicationRecord\n  enum :state, [:published, :void]\nend\n";
+    let dir = app_dir("duplicate", &[("app/models/revision.rb", revision)]);
+    let plan = build(&dir, &[ARTICLE_RB]);
+    assert!(declined(&plan).iter().any(|d| d.contains("another enum in the app also defines `published?`")), "{:?}", declined(&plan));
+    assert!(!rewrites(&plan).iter().any(|(from, _)| from == "published?"));
 }
 
 #[test]
 fn an_unreadable_enum_below_the_class_declines_everything_it_could_shadow() {
-    let sub = "class RushOrder < Order\n  enum :speed, SPEEDS\nend\n";
-    let dir = app_dir("subclass", &[("app/models/rush_order.rb", sub)]);
-    let plan = build(&dir, &[ORDER_RB]);
+    let sub = "class FeaturedArticle < Article\n  enum :placement, PLACEMENTS\nend\n";
+    let dir = app_dir("subclass", &[("app/models/featured_article.rb", sub)]);
+    let plan = build(&dir, &[ARTICLE_RB]);
     assert!(plan.rewritten.is_empty(), "{:?}", rewrites(&plan));
-    assert!(declined(&plan).iter().any(|d| d.contains("declares an enum this pass cannot read (app/models/rush_order.rb)")), "{:?}", declined(&plan));
+    assert!(declined(&plan).iter().any(|d| d.contains("declares an enum this pass cannot read (app/models/featured_article.rb)")), "{:?}", declined(&plan));
     // The same enum in an unrelated class does not matter.
-    let other = "class Shipment < ApplicationRecord\n  enum :speed, SPEEDS\nend\n";
-    let dir = app_dir("unrelated", &[("app/models/shipment.rb", other)]);
+    let other = "class Comment < ApplicationRecord\n  enum :placement, PLACEMENTS\nend\n";
+    let dir = app_dir("unrelated", &[("app/models/comment.rb", other)]);
     assert_eq!(plan_rewrite_count(&dir), 4);
 }
 
 fn plan_rewrite_count(dir: &Path) -> usize {
-    build(dir, &[ORDER_RB]).report.rewrites.len()
+    build(dir, &[ARTICLE_RB]).report.rewrites.len()
 }
 
 #[test]
 fn computed_method_names_in_the_class_decline_it() {
-    let order = ORDER.replace("  def shippable?", "  %w[a b].each { |n| define_method(\"#{n}?\") { true } }\n\n  def shippable?");
-    let dir = app_dir("computed", &[("app/models/order.rb", &order)]);
-    let plan = build(&dir, &[ORDER_RB]);
+    let article = ARTICLE.replace("  def listed?", "  %w[a b].each { |n| define_method(\"#{n}?\") { true } }\n\n  def listed?");
+    let dir = app_dir("computed", &[("app/models/article.rb", &article)]);
+    let plan = build(&dir, &[ARTICLE_RB]);
     assert!(plan.rewritten.is_empty(), "{:?}", rewrites(&plan));
-    assert!(declined(&plan).iter().any(|d| d.contains("defines methods with computed names (app/models/order.rb:5)")), "{:?}", declined(&plan));
+    assert!(declined(&plan).iter().any(|d| d.contains("defines methods with computed names (app/models/article.rb:5)")), "{:?}", declined(&plan));
 }
 
 #[test]
 fn declarations_it_cannot_reproduce_are_declined_with_why() {
-    let order = "class Order < ApplicationRecord\n  enum :status, { pending: :p, paid: :q }\n  enum kind: { retail: 0 }\n\n  def check\n    paid? || retail?\n  end\nend\n";
-    let dir = app_dir("unreadable", &[("app/models/order.rb", order)]);
-    let plan = build(&dir, &[ORDER_RB]);
+    let article = "class Article < ApplicationRecord\n  enum :status, { draft: :d, published: :p }\n  enum kind: { news: 0 }\n\n  def check\n    published? || news?\n  end\nend\n";
+    let dir = app_dir("unreadable", &[("app/models/article.rb", article)]);
+    let plan = build(&dir, &[ARTICLE_RB]);
     assert!(plan.rewritten.is_empty());
     let declined = declined(&plan);
-    assert!(declined.iter().any(|d| d.contains("order.rb:2:3: `pending` has a symbol value")), "{declined:?}");
-    assert!(declined.iter().any(|d| d.contains("order.rb:3:3: the keyword form")), "{declined:?}");
+    assert!(declined.iter().any(|d| d.contains("article.rb:2:3: `draft` has a symbol value")), "{declined:?}");
+    assert!(declined.iter().any(|d| d.contains("article.rb:3:3: the keyword form")), "{declined:?}");
 }
 
 #[test]
 fn rails_older_than_7_1_or_unpinned_declines_the_pass() {
     let dir = app_dir("old-rails", &[("Gemfile.lock", &LOCK.replace("8.1.4", "7.0.8"))]);
-    let plan = build(&dir, &[ORDER_RB]);
+    let plan = build(&dir, &[ARTICLE_RB]);
     assert!(plan.rewritten.is_empty());
     assert!(declined(&plan)[0].contains("activerecord 7.0.8 is older than 7.1"), "{:?}", declined(&plan));
 
     let dir = app_dir("no-lock", &[]);
     fs::remove_file(dir.join("Gemfile.lock")).unwrap();
-    let plan = build(&dir, &[ORDER_RB]);
+    let plan = build(&dir, &[ARTICLE_RB]);
     assert!(plan.rewritten.is_empty());
     assert!(declined(&plan)[0].contains("Gemfile.lock pins no activerecord"), "{:?}", declined(&plan));
 }
 
 #[test]
 fn nested_namespace_subclasses_are_visible_to_shadowing_checks() {
-    let sub = "class RushOrder < Order\n  enum :speed, SPEEDS\nend\n";
+    let sub = "class FeaturedArticle < Article\n  enum :placement, PLACEMENTS\nend\n";
     for namespace in ["public", "log", "test", "spec", "tmp", "coverage", "sorbet", "sig"] {
-        let path = format!("app/models/{namespace}/rush_order.rb");
+        let path = format!("app/models/{namespace}/featured_article.rb");
         let dir = app_dir(&format!("nested-{namespace}"), &[(&path, sub)]);
-        let plan = build(&dir, &[ORDER_RB]);
+        let plan = build(&dir, &[ARTICLE_RB]);
         assert!(plan.rewritten.is_empty(), "{namespace}: {:?}", rewrites(&plan));
         assert!(declined(&plan).iter().any(|d| d.contains(&path)), "{namespace}: {:?}", declined(&plan));
     }
@@ -241,11 +241,11 @@ fn nested_namespace_subclasses_are_visible_to_shadowing_checks() {
 
 #[test]
 fn nested_predicate_definitions_are_visible_but_root_test_files_are_not() {
-    let predicate = "module Public\n  def paid? = true\nend\n";
+    let predicate = "module Public\n  def published? = true\nend\n";
     let dir = app_dir("nested-definition", &[("app/controllers/public/check.rb", predicate)]);
-    let plan = build(&dir, &[ORDER_RB]);
-    assert!(!rewrites(&plan).iter().any(|(from, _)| from == "paid?"));
-    assert!(rewrites(&plan).iter().any(|(from, _)| from == "pending?"));
+    let plan = build(&dir, &[ARTICLE_RB]);
+    assert!(!rewrites(&plan).iter().any(|(from, _)| from == "published?"));
+    assert!(rewrites(&plan).iter().any(|(from, _)| from == "draft?"));
     for excluded in ["test", "spec", "tmp", "log", "public", "coverage", "sig", "sorbet", "node_modules", "app/node_modules"] {
         let path = format!("{excluded}/check.rb");
         let dir = app_dir(&format!("excluded-{}", excluded.replace('/', "-")), &[(&path, predicate)]);
@@ -256,10 +256,10 @@ fn nested_predicate_definitions_are_visible_but_root_test_files_are_not() {
 #[test]
 fn a_rebuild_does_not_index_its_previous_sparse_overlay() {
     let dir = app_dir("rebuild-overlay", &[]);
-    let first = build(&dir, &[ORDER_RB]);
+    let first = build(&dir, &[ARTICLE_RB]);
     let out = dir.join("out/fractal");
     fractal::write(&dir, &out, &first).unwrap();
-    let second = build(&dir, &[ORDER_RB]);
+    let second = build(&dir, &[ARTICLE_RB]);
     assert_eq!(rewrites(&first), rewrites(&second));
     assert_eq!(first.report.declined, second.report.declined);
 }
