@@ -62,16 +62,17 @@ Options:
                          spinel
                        Default INPUT=.  Default OUT=./out/<lang>/
                        `fractal` compiles the app in place: the output is
-                       a complete copy of the app with the source of the
-                       classes named with --class rewritten (still Rails,
+                       a complete copy of the app with the files that
+                       define the --class names rewritten (still Rails,
                        same line numbers), to be tested and shipped.
-      --class NAME     With --target fractal: a class or module to
-                       specialize, by its full name (`Shop`,
-                       `Admin::Report`). Repeatable. Every definition of it
-                       is selected (Rubydex). No --class copies the app
-                       unchanged.
-                       Only the files defining these classes, and what
-                       the registered passes say they need, are ingested.
+      --class NAME     With --target fractal: compile the files that
+                       define this class or module, by its full name
+                       (`Shop`, `Admin::Report`). Repeatable. Every file
+                       holding a definition of it is compiled (Rubydex),
+                       and passes rewrite the code in its bodies there.
+                       No --class copies the app unchanged.
+                       Only the files to compile, and what the
+                       registered passes say they need, are ingested.
       --whole-app      With --target fractal: ingest and analyze the
                        whole app instead, as a pass that needs it does.
       --report PATH    With --target fractal: write the build's decisions

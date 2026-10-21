@@ -1,12 +1,12 @@
 //! `--target fractal`: compile a Rails app by rewriting its own source,
-//! one class at a time.
+//! one file at a time.
 //!
-//! A person names the classes to work on (`--class Order`). Roundhouse
-//! ingests and analyzes those classes and what its passes say they need
+//! A person names the files to compile by the classes they define
+//! (`--class Order` compiles every file that defines `Order`). Roundhouse
+//! ingests and analyzes those files and what its passes say they need
 //! ([`scope`]), so it knows what Rails cannot see from one call site
 //! (types, effects, which definitions exist), and passes use that
-//! application knowledge to rewrite the selected classes' source in
-//! place. The output is the compiled app: a complete copy of the app's
+//! application knowledge to rewrite those files in place. The output is the compiled app: a complete copy of the app's
 //! tree with the rewritten files in place of the originals ([`tree`]).
 //! It is what gets tested and shipped. Nothing in it installs code at
 //! boot, checks assumptions at load, or keeps the original code around:
@@ -18,11 +18,12 @@
 //!
 //! - [`scope`]: which files to ingest, decided from a Rubydex index of
 //!   the app's constants before anything is ingested.
-//! - [`select`]: Rubydex finds every body of each selected class,
-//!   reopenings included, minus the bodies of other classes nested in it.
+//! - [`select`]: Rubydex finds every body of each named class,
+//!   reopenings included, minus the bodies of other classes nested in it;
+//!   the files holding them are the files the build compiles.
 //! - [`region`]: each `def` in a selected body, with the analyzer's
 //!   facts about it.
-//! - [`pass`]: the rewrites. Each reads one file of the selection (a
+//! - [`pass`]: the rewrites. Each reads one file being compiled (a
 //!   [`Unit`]) and proposes edits inside its selected bodies.
 //! - [`rewrite`]: applies the proposals, refusing any that leave the
 //!   selection, overlap, move a line, or break the parse.
@@ -64,7 +65,7 @@ pub struct Report {
     pub bodies: Vec<String>,
     pub passes: Vec<String>,
     pub methods: Vec<MethodReport>,
-    /// Files of the selection no pass may rewrite, with why.
+    /// Files to compile that no pass may rewrite, with why.
     pub skipped: Vec<Skipped>,
     /// Every edit applied, in file order.
     pub rewrites: Vec<Rewrite>,
@@ -90,11 +91,11 @@ impl Report {
     pub fn render(&self) -> String {
         let mut out = String::new();
         if self.classes.is_empty() {
-            out.push_str("fractal: no --class selected; the compiled tree is the app unchanged\n");
+            out.push_str("fractal: no --class given, so no file to compile; the compiled tree is the app unchanged\n");
             return out;
         }
         for body in &self.bodies {
-            out.push_str(&format!("fractal: selected {body}\n"));
+            out.push_str(&format!("fractal: compiling {body}\n"));
         }
         let typed = self.methods.iter().filter(|m| m.knowledge.copies > 0 && m.knowledge.typed == m.knowledge.expressions).count();
         out.push_str(&format!(
@@ -138,7 +139,7 @@ impl Plan {
     }
 }
 
-/// Decide a build: select, run `passes` over each file of the selection,
+/// Decide a build: select the files to compile, run `passes` over each,
 /// and apply what they propose. `input` is the app root ingest read;
 /// `untrusted` names files ingest could only partly read (a `--survey`
 /// gap or a syntax error), which keep the app's code.

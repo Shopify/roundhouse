@@ -1,16 +1,18 @@
-# Fractal: compile a Rails app in place, one class at a time
+# Fractal: compile a Rails app in place, one file at a time
 
 `roundhouse --target fractal --class NAME APP -o OUT` writes the
-*compiled app*: a complete copy of `APP` in which the source of the
-classes it names has been rewritten. The compiled app is still a Rails
+*compiled app*: a complete copy of `APP` in which the files it compiles
+have been rewritten. `--class NAME` says which files those are: every
+file that defines `NAME` (reopenings included), with the passes
+rewriting the code written in `NAME`'s bodies there. The compiled app is still a Rails
 app, it runs on the same Rails and gems, and every line sits where it
 did in the source. It is the program you test and ship. Nothing in it
 installs code at boot, checks assumptions at load or keeps the original
-code around: the rewritten code is the only code there is. Deselecting a
-class and rebuilding gives that class's source back.
+code around: the rewritten code is the only code there is. Dropping a
+`--class` and rebuilding gives its files back as written.
 
 The point is application knowledge. Roundhouse ingests and analyzes the
-selected classes and what its passes need, so at build time it knows
+files it compiles and what its passes need, so at build time it knows
 things a JIT cannot learn from inside one method, and that Rails
 recomputes on every boot: the types flowing through a body, its effects,
 which definitions exist and where, which descriptions (an `enum`
@@ -39,12 +41,13 @@ All of it lives in [`src/emit/fractal/`](../../src/emit/fractal/).
    as written and never rewritten.
 3. **Select** ([`select.rs`](../../src/emit/fractal/select.rs)). Rubydex
    finds every `class`/`module` body whose resolved name is a `--class`,
-   reopenings included. Bodies of other classes nested inside are not
+   reopenings included; the files holding them are the files the build
+   compiles. Within them, bodies of other classes nested inside are not
    selected; the innermost body around a site decides, so `--class A
    --class A::B::C` covers what is written in `A` and in `C` but not in
    `B`. A name the app does not define is an error.
-4. **Passes** ([`pass.rs`](../../src/emit/fractal/pass.rs)). Each file of
-   the selection is a [`Unit`](../../src/emit/fractal/pass.rs): its text,
+4. **Passes** ([`pass.rs`](../../src/emit/fractal/pass.rs)). Each file the
+   build compiles is a [`Unit`](../../src/emit/fractal/pass.rs): its text,
    its selected bodies, and the methods in them with the analyzer's facts
    ([`region.rs`](../../src/emit/fractal/region.rs)). Each pass proposes
    edits to it, and declines what it cannot show equivalent, with a
@@ -59,13 +62,13 @@ All of it lives in [`src/emit/fractal/`](../../src/emit/fractal/).
    directory gets a full copy of the app (except `.git`, `tmp`, `log`
    and `node_modules` at its root) with the rewritten files in place of
    the originals, and `.roundhouse-fractal.json`, which lists the
-   classes, passes and rewritten files. A rebuild replaces an earlier
+   `--class` names, passes and rewritten files. A rebuild replaces an earlier
    build; any other non-empty directory is refused, as is the app itself
    or a directory containing it. An output inside the app is left out of
    the copy.
 
 `--report PATH` writes the build's decisions as JSON: the selected
-bodies, every method with the analyzer's facts, files skipped and why,
+bodies (and so the files compiled), every method with the analyzer's facts, files skipped and why,
 every rewrite (`path:line:col`, pass, old and new text) and every
 declined site with the pass and reason.
 

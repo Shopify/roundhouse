@@ -1,8 +1,8 @@
 //! What a fractal build ingests.
 //!
-//! The unit is the class. By default a build ingests only the files that
-//! define the `--class` names, plus what each registered pass says it
-//! needs to know about them ([`Pass::scope`]). Rubydex answers where
+//! A build compiles the files that define the `--class` names, and by
+//! default it ingests only those files, plus what each registered pass
+//! says it needs to know about them ([`Pass::scope`]). Rubydex answers where
 //! those files are before anything is ingested: it indexes the app's Ruby
 //! for constants alone, which is far cheaper than ingesting and analyzing
 //! it. A pass whose knowledge can come from anywhere in the app says so

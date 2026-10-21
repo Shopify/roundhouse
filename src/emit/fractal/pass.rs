@@ -1,7 +1,7 @@
 //! The contract every Fractal rewrite is written against.
 //!
-//! A pass reads one [`Unit`] (a source file holding selected class
-//! bodies) and proposes edits to its text. The driver, not the pass,
+//! A pass reads one [`Unit`] (a file the build compiles) and proposes
+//! edits to its text. The driver, not the pass,
 //! applies them, so every pass gets the same guarantees:
 //!
 //! - an edit lands only inside a selected class body, never in a class
@@ -120,7 +120,7 @@ impl<'a> Cx<'a> {
     }
 }
 
-/// One file of the selection, as a pass sees it.
+/// One file the build compiles, as a pass sees it.
 pub struct Unit<'a> {
     pub file: FileId,
     /// Relative to the app root.
