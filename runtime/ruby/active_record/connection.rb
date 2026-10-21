@@ -161,6 +161,17 @@ module ActiveRecord
   # write yet: a `touch_later` the outermost transaction applies just
   # before its COMMIT (`Base._flush_deferred_touches`), whose own touch
   # then enlists as an update.
+  # Rails 7.2's `Model.current_transaction`: the open transaction, or
+  # none (Rails' NullTransaction), as far as `after_commit` is concerned.
+  # `after_commit` takes its work as a lambda, as ActiveJob's queue does:
+  # `lower::transaction_after_commit` turns the app's block into one, so
+  # the runtime types fully on every lane.
+  class Transaction
+    def after_commit(work)
+      ActiveRecord::Base._after_commit(work)
+    end
+  end
+
   class EnlistedRecord
     attr_reader :record, :kind
 
@@ -508,6 +519,51 @@ module ActiveRecord
       sanitize_sql(statement)
     end
 
+    # Rails' `current_transaction`. One database, so every model's is the
+    # same; what `after_commit` asks of it is whether one is open.
+    def self.current_transaction
+      ActiveRecord::Transaction.new
+    end
+
+    # `current_transaction.after_commit { ... }`: run the work once the
+    # outermost transaction commits (`Base.transaction` runs what is held
+    # after the records' commit callbacks), drop it on a ROLLBACK, and
+    # run it at once when none is open, as Rails' NullTransaction does.
+    # Campfire's password change closes the user's live connections this
+    # way: a later save in the same transaction could undo the change an
+    # after_commit condition would read.
+    #
+    # A transaction that cannot be joined is no `current_transaction`
+    # either (Rails 7.2's `user_transaction` is NULL_TRANSACTION for it):
+    # a transactional test's own never commits, so work registered
+    # directly under it runs at once, as Rails runs it.
+    def self._after_commit(work)
+      depth = Db._txn_depth
+      if depth == 0 || !_txn_parent_joinable?(depth)
+        work.call
+      else
+        Db._txn_callbacks << work
+      end
+      nil
+    end
+
+    # The held work registered at and after `from`, run (a COMMIT) or
+    # dropped (a ROLLBACK).
+    def self._run_after_commits_from(from)
+      held = Db._txn_callbacks
+      return nil if held.length <= from
+      work = held[from, held.length - from]
+      held.pop while held.length > from
+      work.each { |w| w.call }
+      nil
+    end
+
+    def self._drop_after_commits_from(from)
+      held = Db._txn_callbacks
+      held.pop while held.length > from
+      nil
+    end
+
     # Rails' `uncached { }`: the block's reads go to the database, not
     # the per-request replay cache, which comes back on after it.
     def self.uncached
@@ -631,6 +687,7 @@ module ActiveRecord
         # The writes a ROLLBACK TO this savepoint undoes are the ones
         # enlisted after this mark.
         mark = Db._txn_records.length
+        after_mark = Db._txn_callbacks.length
         new_depth = depth + 1
         Db._txn_depth = new_depth
         if open_savepoint
@@ -656,6 +713,7 @@ module ActiveRecord
             unless savepoint.nil?
               RawConnection._rollback_savepoint(savepoint)
               ActiveRecord::Base._rollback_enlisted(mark)
+              ActiveRecord::Base._drop_after_commits_from(after_mark)
             end
             result = nil
           rescue Exception => e
@@ -663,6 +721,7 @@ module ActiveRecord
             unless savepoint.nil?
               RawConnection._rollback_savepoint(savepoint)
               ActiveRecord::Base._rollback_enlisted(mark)
+              ActiveRecord::Base._drop_after_commits_from(after_mark)
             end
             raise e
           end
@@ -673,6 +732,7 @@ module ActiveRecord
           # re-raises; `finished` is false on that path anyway.
           if finished && run_callbacks
             ActiveRecord::Base._commit_enlisted_from(mark)
+            ActiveRecord::Base._run_after_commits_from(after_mark)
           end
         end
       elsif Db.transaction_open?
@@ -707,6 +767,7 @@ module ActiveRecord
             Db._txn_depth = 0
             Db.exec("ROLLBACK")
             ActiveRecord::Base._rollback_enlisted(0)
+            ActiveRecord::Base._drop_after_commits_from(0)
             ActiveRecord::TransactionHooks.rolled_back
             result = nil
           rescue Exception => e
@@ -721,6 +782,7 @@ module ActiveRecord
               # ROLLBACK's own failure must not hide the real error below.
             end
             ActiveRecord::Base._rollback_enlisted(0)
+            ActiveRecord::Base._drop_after_commits_from(0)
             ActiveRecord::TransactionHooks.rolled_back
             raise e
           end
@@ -741,6 +803,7 @@ module ActiveRecord
                 # Already ended; the COMMIT's error is the one to raise.
               end
               ActiveRecord::Base._rollback_enlisted(0)
+              ActiveRecord::Base._drop_after_commits_from(0)
               ActiveRecord::TransactionHooks.rolled_back
               raise e
             end
@@ -750,6 +813,7 @@ module ActiveRecord
             # callback is skipped or left to fire at a later COMMIT.
             begin
               ActiveRecord::Base._commit_enlisted
+              ActiveRecord::Base._run_after_commits_from(0)
             ensure
               ActiveRecord::TransactionHooks.committed
             end

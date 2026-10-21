@@ -201,6 +201,17 @@ module Db
     records
   end
 
+  # The work `current_transaction.after_commit` holds for the COMMIT
+  # (ActiveRecord::Base._after_commit), beside the records above.
+  def self._txn_callbacks
+    work = Fiber[:ar_txn_callbacks]
+    if work.nil?
+      work = []
+      Fiber[:ar_txn_callbacks] = work
+    end
+    work
+  end
+
   # Request-scoped connection lease. Mirrors db_cruby.rb: checks out a
   # Conn under @mutex (parking on @cv while the pool is momentarily
   # exhausted), binds it to fiber-storage so `current_dbh` resolves to it

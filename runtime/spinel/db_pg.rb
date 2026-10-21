@@ -858,6 +858,19 @@ module Db
     records
   end
 
+  # The work `current_transaction.after_commit` holds for the COMMIT
+  # (ActiveRecord::Base._after_commit), beside the records above. Seeded
+  # and cleared, as the records are, so the element type is the work's.
+  def self._txn_callbacks
+    work = Thread.current[:ar_txn_callbacks]
+    if work.nil?
+      work = [-> { nil }]
+      work.clear
+      Thread.current[:ar_txn_callbacks] = work
+    end
+    work
+  end
+
   # Not PostgreSQL's DISABLE TRIGGER: its DDL here carries no foreign keys yet (emit::shared::schema_sql), so a fixture load has nothing to defer.
   def self.without_foreign_keys
     yield

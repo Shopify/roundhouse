@@ -224,7 +224,10 @@ module Cable
       # table mid-iteration.
       def beat
         payload = %({"type":"ping","message":#{Time.now.to_i}})
-        @connections.values.each { |conn| conn.send_text(payload) }
+        @connections.values.each do |conn|
+          conn.send_text(payload)
+          conn.app_beat
+        end
         nil
       end
     end
@@ -484,6 +487,7 @@ module Cable
       @monitor = nil
       @closed = false
       @identity = identity
+      identity.transport = self unless identity.nil?
       @internal_channel = nil
 
       @driver = WebSocket::Driver.rack(EnvAdapter.new(env, self), protocols: PROTOCOLS)
@@ -531,6 +535,34 @@ module Cable
       send_json({ "type" => "disconnect", "reason" => "remote", "reconnect" => reconnect ? true : false })
       on_writable
       close
+    end
+
+    # The heartbeat's call into the app: Rails' `connection.beat`, which
+    # campfire overrides to look its session up again now and then. Reactor
+    # thread, as Rails' heartbeat runs it on its event loop; work an app
+    # wants done off it goes through `perform_work`. An app error is the
+    # app's, not the reactor's.
+    def app_beat
+      return nil if @closed || @identity.nil?
+      @identity.beat
+      nil
+    rescue StandardError => e
+      warn "[cable] beat: #{e.class}: #{e.message}"
+      nil
+    end
+
+    # `ActionCable::Connection::Base#close(reason:, reconnect:)`, from any
+    # thread: the disconnect frame and the close run on the reactor, as the
+    # internal channel's disconnect does.
+    def close_with_reason(reason, reconnect)
+      Reactor.post do
+        unless @closed
+          send_json({ "type" => "disconnect", "reason" => reason, "reconnect" => reconnect ? true : false })
+          on_writable
+          close
+        end
+      end
+      nil
     end
 
     def identifiers_for(stream)

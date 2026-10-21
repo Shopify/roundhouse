@@ -332,7 +332,9 @@ fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
         };
         let assoc = first.as_assoc_node()?;
         let key_ty = type_of_literal_node(&assoc.key())?;
-        let value_ty = type_of_literal_node(&assoc.value())?;
+        // A table of tables (`ActionCable::INTERNAL`'s `disconnect_reasons`)
+        // is typed as deep as its literals go.
+        let value_ty = type_of_const_literal(&assoc.value())?;
         return Some(Ty::Hash {
             key: std::sync::Arc::new(key_ty),
             value: std::sync::Arc::new(value_ty),

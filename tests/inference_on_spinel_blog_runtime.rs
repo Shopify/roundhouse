@@ -458,7 +458,13 @@ fn untyped_subexpressions_baseline() {
     // `_commit_enlisted_from` skips them (+4) and `transaction` calls
     // the flush (+1). Entry reads off `Db._txn_records` are vars on
     // this RBS-less probe, as `_commit_enlisted_from`'s were already.
-    const CEILING: usize = 1043;
+    // MEASURED 1082 on 2026-10-21: `current_transaction.after_commit`
+    // holds its work on `Db._txn_callbacks` until the COMMIT
+    // (`_run_after_commits_from` +20, `_drop_after_commits_from` +7,
+    // `_after_commit` +6, `transaction` +6 for the savepoint mark and
+    // the run/drop calls). The same untyped reads off a `Db` list as the
+    // records above.
+    const CEILING: usize = 1082;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

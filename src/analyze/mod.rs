@@ -325,6 +325,12 @@ impl Analyzer {
             // return whatever the block returned, which we don't
             // statically track — Untyped is the gradual escape.
             cls.class_methods.insert(Symbol::from("transaction"), Ty::Untyped);
+            // `Model.uncached { ... }`: the block's reads skip the query
+            // cache (runtime/ruby/active_record/connection.rb's
+            // `Base.uncached`), and its value is the block's, as
+            // `transaction`'s is.
+            cls.class_methods.insert(Symbol::from("uncached"), Ty::Untyped);
+            cls.class_methods.insert(Symbol::from("current_transaction"), registry::ar::transaction_ty());
             cls.class_methods.insert(Symbol::from("connection"), registry::ar::connection_ty());
             cls.class_methods.insert(Symbol::from("connection_pool"), Ty::Untyped);
             cls.class_methods.insert(Symbol::from("establish_connection"), Ty::Untyped);
