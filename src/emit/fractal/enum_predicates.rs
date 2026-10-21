@@ -73,6 +73,10 @@ impl Pass for EnumPredicates {
         "inline-enum-predicates"
     }
 
+    fn summary(&self) -> &'static str {
+        "Inside the enum's own class, a call to an enum predicate (`paid?`) becomes the comparison Rails' generated method runs (`(status_for_database == 1)`)."
+    }
+
     fn scope(&self) -> Scope {
         // Everything it needs it reads from source through `Cx`.
         Scope::Files(Vec::new())

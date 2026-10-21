@@ -100,6 +100,7 @@ export function createClient({
     related: (path) => call("related", { path }),
     traceroute: (query) => call("traceroute", { query }),
     traceTargets: () => call("traceTargets", {}),
+    fractalStages: (src, files) => call("fractalStages", { src, files }),
     dispose: () => { try { worker.terminate(); } catch { /* ignore */ } },
   };
 }

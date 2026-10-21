@@ -28,6 +28,9 @@
 //!   file, overlap, move a line, or break the parse.
 //! - [`tree`]: writes the compiled tree.
 //!
+//! [`stages`] is not part of a build: it shows the compiled files after
+//! each pass, for the browser pass explorer (`wasm/fractal/`).
+//!
 //! Every assumption a rewrite rests on is checked at build time; there is
 //! no runtime fallback. A rewrite that cannot be shown equivalent from
 //! what the build knows is declined and reported. See
@@ -40,6 +43,7 @@ pub mod region;
 pub mod rewrite;
 pub mod scope;
 pub mod select;
+pub mod stages;
 pub mod tree;
 
 use std::path::Path;

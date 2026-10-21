@@ -21,6 +21,7 @@ const OP_EXPORT = {
   traceroute: "traceroute",
   traceTargets: "trace_targets",
   version: "version",
+  fractalStages: "fractal_stages",
 };
 
 // Assigned synchronously by the `init` handler so an op that arrives before

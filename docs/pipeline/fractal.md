@@ -144,7 +144,8 @@ bare.
 
 ## Writing a pass
 
-Implement [`Pass`](../../src/emit/fractal/pass.rs): a name, a `scope`,
+Implement [`Pass`](../../src/emit/fractal/pass.rs): a name, a one-line
+`summary` (what the pass explorer shows), a `scope`,
 and a `run` that reads a [`Unit`](../../src/emit/fractal/pass.rs) and
 returns a `Proposal` of `Edit`s (spans of the unit's file and their
 replacement text) and declined sites. [`Cx`](../../src/emit/fractal/pass.rs)
@@ -157,6 +158,21 @@ in `pass::registered()`, pin its rewrites and declines in a build test,
 and add a case to `tests/fractal_runtime.rs`, which runs an app and its
 compiled tree against Active Record and SQLite and compares what they
 answer.
+
+## Pass explorer
+
+[`wasm/fractal/`](../../wasm/fractal/) runs the passes in the browser,
+on the compiler wasm, over a small app a person can edit: pick the file
+to compile and step through the stages, from the source to the file
+after each pass, with what each pass rewrote and what it declined and
+why. It calls the wasm's `fractal_stages` export, which runs
+[`stages.rs`](../../src/emit/fractal/stages.rs): the same selection,
+passes and driver as a build, over sources already in memory
+(`Cx::in_memory`, since the browser has no app on disk), keeping what
+each pass added. Stage *n* is the passes `1..=n` applied together, the
+way a build applies them. It writes nothing; a build is still the CLI.
+[`site/fractal.html`](../../site/fractal.html) introduces Fractal and
+links to it.
 
 ## JIT shape
 
