@@ -1,15 +1,14 @@
-//! Regions: the methods a selection covers, each with what the analyzer
-//! knows about it and whether Fractal can attach a variant to it.
+//! Regions: the methods in a compiled file, each with what the analyzer
+//! knows about it. Passes read them for application knowledge (types,
+//! effects) about the code they rewrite; the report lists them.
 //!
-//! A region is one `def` written directly in a selected class body. The
-//! shape checks here are the ones every pass inherits: a variant is
-//! installed by reopening the class at its original nesting and
-//! defining the method again, so the method has to be one Ruby defines
-//! exactly once, plainly, in that body.
+//! A region is one `def` written in a compiled file. Rewrites are made in
+//! place, so any `def` can be edited whatever surrounds it; a region is
+//! just where the analyzer's facts about one are found.
 
 use std::collections::HashMap;
 
-use ruby_prism::{Node, Visit};
+use ruby_prism::Visit;
 use serde::Serialize;
 
 use crate::App;
@@ -32,8 +31,8 @@ pub struct Analyzed<'a> {
     pub signature: Option<&'a Ty>,
 }
 
-/// A summary of the analyzer's facts about a region, for the report and
-/// for the runtime's verify mode. Every pass reads [`Region::analyzed`]
+/// A summary of the analyzer's facts about a region, for the report.
+/// Every pass reads [`Region::analyzed`]
 /// itself; this is not a substitute for it.
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct Knowledge {
@@ -93,20 +92,6 @@ impl Knowledge {
         (knowledge.expressions, knowledge.typed) = least.unwrap_or_default();
         knowledge
     }
-
-    /// Whether the runtime may run this method's original and its variant
-    /// one after the other to compare them (`FRACTAL_VERIFY=1`), as far as
-    /// the analyzer can tell: every expression typed, no recorded effect,
-    /// no state written. A call that mutates its receiver (`@items <<
-    /// item`) is invisible to these facts, which is why a pass must vouch
-    /// for replay as well ([`super::Proposal::replayable`]).
-    pub fn replayable(&self) -> bool {
-        self.copies > 0
-            && self.typed == self.expressions
-            && self.no_recorded_effects
-            && !self.writes_state
-            && self.mutates_self != Some(true)
-    }
 }
 
 fn writes_state(target: &LValue) -> bool {
@@ -118,9 +103,10 @@ fn walk<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
     e.node.for_each_child(&mut |child| walk(child, f));
 }
 
-/// A method in a selected class body.
+/// A method in a compiled file.
 pub struct Region<'a> {
-    /// The selected class or module, fully qualified.
+    /// The class or module whose body holds the `def`, fully qualified
+    /// (`Object` for one at a file's top level).
     pub owner: String,
     pub name: String,
     /// `def self.name`, or a `def` inside `class << self`.
@@ -134,14 +120,6 @@ pub struct Region<'a> {
     pub line: u32,
     pub analyzed: Vec<Analyzed<'a>>,
     pub knowledge: Knowledge,
-    /// `Err(reason)` when Fractal cannot attach a variant to this method.
-    /// Passes are not offered such a region.
-    pub admission: Result<(), String>,
-    /// What precedes the definition in a variant's source: the file's
-    /// `frozen_string_literal` comment, then the class and module headers
-    /// that reproduce its lexical nesting.
-    pub(super) prelude: Vec<String>,
-    pub(super) closers: usize,
 }
 
 impl Region<'_> {
@@ -150,83 +128,36 @@ impl Region<'_> {
     }
 }
 
-/// Visibility calls a `def` may be the argument of. Each takes the
-/// method's name and changes only its visibility, which the runtime
-/// carries over to a variant.
-const VISIBILITY: [&str; 5] = ["private", "protected", "public", "private_class_method", "public_class_method"];
-
-/// Calls whose answer depends on which file the code was loaded from.
-/// A variant is evaluated from the generated initializer.
-const LOCATION_DEPENDENT: [&str; 2] = ["__dir__", "require_relative"];
-
-/// Every `def` written directly in a selected body. `path_of` gives a
-/// source's path relative to the app root, or `None` when it lies outside
-/// it. `untrusted` files are the ones ingest could not read faithfully.
-pub fn find<'a>(
-    app: &'a App,
-    selection: &Selection,
-    path_of: &dyn Fn(FileId) -> Option<String>,
-    untrusted: &dyn Fn(&str) -> bool,
-) -> Vec<Region<'a>> {
+/// Every `def` written in `file` (a `def` nested in another `def` belongs
+/// to the outer one's region). `path` is the file's
+/// path relative to the app root.
+pub fn find<'a>(app: &'a App, selection: &Selection, file: FileId, path: &str) -> Vec<Region<'a>> {
     let analyzed = analyzed_by_name(app);
-    let mut files: Vec<FileId> = selection.bodies.iter().map(|(_, span)| span.file).collect();
-    files.sort_by_key(|f| f.0);
-    files.dedup();
-    let mut regions = Vec::new();
-    for file in files {
-        let Some(source) = (file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) else { continue };
-        let path = path_of(file);
-        let parsed = ruby_prism::parse(source.text.as_bytes());
-        let mut magic = Vec::new();
-        let mut file_refusal = None;
-        for comment in parsed.magic_comments() {
-            let key = String::from_utf8_lossy(comment.key()).to_ascii_lowercase().replace('-', "_");
-            let value = String::from_utf8_lossy(comment.value()).trim().to_string();
-            match key.as_str() {
-                "frozen_string_literal" => magic.push(format!("# frozen_string_literal: {value}")),
-                "encoding" | "coding" if !value.eq_ignore_ascii_case("utf-8") && !value.eq_ignore_ascii_case("utf8") => {
-                    file_refusal = Some(format!("the file is {value}, and a variant's source is UTF-8"));
-                }
-                _ => {}
-            }
-        }
-        if path.is_none() {
-            file_refusal = Some("the file is outside the app root".to_string());
-        } else if untrusted(&source.path) {
-            file_refusal = Some("ingest could not read the file faithfully (a --survey gap or a syntax error)".to_string());
-        }
-        let mut finder = Finder { file, selection, stack: Vec::new(), found: Vec::new() };
-        finder.visit(&parsed.node());
-        for found in finder.found {
+    let Some(source) = (file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) else { return Vec::new() };
+    let parsed = ruby_prism::parse(source.text.as_bytes());
+    let mut finder = Finder { file, selection, singleton_depth: 0, found: Vec::new() };
+    finder.visit(&parsed.node());
+    let mut regions: Vec<Region<'a>> = finder
+        .found
+        .into_iter()
+        .map(|found| {
             let (line, _) = source.line_col(found.def_span.start);
             let copies: Vec<Analyzed<'a>> = analyzed.get(&found.name_span).map(|v| v.iter().map(|a| a.view()).collect()).unwrap_or_default();
-            // The method's own reason first: it is the more specific one.
-            let admission = match (found.refusal, &file_refusal) {
-                (Some(reason), _) => Err(reason),
-                (None, Some(reason)) => Err(reason.clone()),
-                (None, None) => Ok(()),
-            };
-            let mut prelude = magic.clone();
-            let closers = found.headers.len();
-            prelude.extend(found.headers);
             let knowledge = Knowledge::of(&copies);
-            regions.push(Region {
+            Region {
                 owner: found.owner,
                 name: found.name,
                 singleton: found.singleton,
                 file,
-                path: path.clone().unwrap_or_else(|| source.path.clone()),
+                path: path.to_string(),
                 def_span: found.def_span,
                 line,
                 analyzed: copies,
                 knowledge,
-                admission,
-                prelude,
-                closers,
-            });
-        }
-    }
-    regions.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+            }
+        })
+        .collect();
+    regions.sort_by_key(|r| r.line);
     regions
 }
 
@@ -236,24 +167,20 @@ struct Found {
     name_span: Span,
     def_span: Span,
     singleton: bool,
-    headers: Vec<String>,
-    refusal: Option<String>,
 }
 
-struct Finder<'s, 'pr> {
+struct Finder<'s> {
     file: FileId,
     selection: &'s Selection,
-    stack: Vec<Node<'pr>>,
+    singleton_depth: usize,
     found: Vec<Found>,
 }
 
-impl<'pr> Visit<'pr> for Finder<'_, 'pr> {
-    fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
-        self.stack.push(node);
-    }
-
-    fn visit_branch_node_leave(&mut self) {
-        self.stack.pop();
+impl<'pr> Visit<'pr> for Finder<'_> {
+    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        self.singleton_depth += 1;
+        ruby_prism::visit_singleton_class_node(self, node);
+        self.singleton_depth -= 1;
     }
 
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
@@ -263,84 +190,14 @@ impl<'pr> Visit<'pr> for Finder<'_, 'pr> {
             end: loc.end_offset() as u32,
         };
         let name_span = span(node.name_loc());
-        // A def inside a def is defined when its outer method runs, not
-        // by the class body, so it is never a region and never descended.
-        let Some(owner) = self.selection.owner_of(name_span) else { return };
-        let ancestors = &self.stack[..self.stack.len().saturating_sub(1)];
-        let mut headers = Vec::new();
-        let mut refusal = None;
-        let mut in_singleton_class = false;
-        for (i, ancestor) in ancestors.iter().enumerate() {
-            if ancestor.as_program_node().is_some() || ancestor.as_statements_node().is_some() {
-            } else if let Some(class) = ancestor.as_class_node() {
-                headers.push(format!("class {}", text(class.constant_path().location().as_slice())));
-            } else if let Some(module) = ancestor.as_module_node() {
-                headers.push(format!("module {}", text(module.constant_path().location().as_slice())));
-            } else if let Some(sclass) = ancestor.as_singleton_class_node() {
-                if sclass.expression().as_self_node().is_some() {
-                    headers.push("class << self".to_string());
-                    in_singleton_class = true;
-                } else {
-                    refusal.get_or_insert_with(|| "defined inside `class << <expression>` other than self".to_string());
-                }
-            } else if ancestor.as_arguments_node().is_some()
-                && ancestors.get(i.wrapping_sub(1)).and_then(|n| n.as_call_node()).is_some_and(|call| visibility_call(&call))
-            {
-            } else if ancestor.as_call_node().is_some_and(|call| visibility_call(&call)) {
-            } else if let Some(call) = ancestor.as_call_node() {
-                let name = text(call.name().as_slice());
-                refusal.get_or_insert_with(|| format!("the definition is an argument or block of `{name}`, which may wrap or redefine it"));
-            } else {
-                refusal.get_or_insert_with(|| "defined inside a block, condition or other expression, so the class body may not define it".to_string());
-            }
-        }
-        let singleton = match node.receiver() {
-            None => in_singleton_class,
-            Some(receiver) if receiver.as_self_node().is_some() && !in_singleton_class => true,
-            Some(_) => {
-                refusal.get_or_insert_with(|| "defined on a receiver other than the class itself".to_string());
-                in_singleton_class
-            }
-        };
-        if let Some(body) = node.body() {
-            let mut scan = BodyScan { refusal: None };
-            scan.visit(&body);
-            if let Some(reason) = scan.refusal {
-                refusal.get_or_insert(reason);
-            }
-        }
+        let owner = self.selection.owner_of(name_span).unwrap_or("Object");
         self.found.push(Found {
             owner: owner.to_string(),
             name: text(node.name().as_slice()),
             name_span,
             def_span: span(node.location()),
-            singleton,
-            headers,
-            refusal,
+            singleton: node.receiver().is_some() || self.singleton_depth > 0,
         });
-    }
-}
-
-fn visibility_call(call: &ruby_prism::CallNode<'_>) -> bool {
-    call.receiver().is_none() && call.block().is_none() && VISIBILITY.contains(&text(call.name().as_slice()).as_str())
-}
-
-/// Body constructs a variant cannot reproduce from another file.
-struct BodyScan {
-    refusal: Option<String>,
-}
-
-impl<'pr> Visit<'pr> for BodyScan {
-    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
-        let name = text(node.name().as_slice());
-        if node.receiver().is_none() && LOCATION_DEPENDENT.contains(&name.as_str()) {
-            self.refusal.get_or_insert_with(|| format!("the body calls `{name}`, which depends on the defining file"));
-        }
-        ruby_prism::visit_call_node(self, node);
-    }
-
-    fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {
-        self.refusal.get_or_insert_with(|| "the body defines another method".to_string());
     }
 }
 

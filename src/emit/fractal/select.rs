@@ -1,60 +1,63 @@
-//! Which source a fractal build may change: the bodies of the classes a
-//! person names with `--class`, found by Rubydex.
+//! Which source a fractal build compiles: the files a person names with
+//! `--file`, and the `class`/`module` bodies written in them.
+
+use std::path::Path;
 
 use crate::App;
-use crate::span::Span;
+use crate::span::{FileId, Span};
 
-/// The `class`/`module` bodies `--class` selects, and the bodies of
-/// other classes nested inside them, which it does not.
+/// The files a build compiles, and every class and module body in them.
 pub struct Selection {
-    /// (fully qualified name, span of the whole definition), reopenings
-    /// included, in file order.
+    /// (file, path relative to the app root), in the order named.
+    pub files: Vec<(FileId, String)>,
+    /// (fully qualified name, span of the whole definition) of every
+    /// `class`/`module` body in those files, in file order.
     pub bodies: Vec<(String, Span)>,
-    excluded: Vec<Span>,
 }
 
 impl Selection {
-    /// Every definition of each named class or module. A name the app
-    /// does not define is an error: a misspelt `--class` must not quietly
-    /// build the identity.
-    pub fn resolve(app: &App, classes: &[String]) -> Result<Selection, String> {
-        let all = app.const_resolver.for_sources(&app.sources).class_bodies();
-        let mut bodies = Vec::new();
-        for class in classes {
-            let name = class.trim_start_matches("::");
-            let found: Vec<_> = all.iter().filter(|(full, _)| full.as_ref() == name).collect();
-            if found.is_empty() {
-                return Err(format!("--class {class}: no class or module of that name is defined in the app's sources"));
+    /// The ingested sources for `files` (paths relative to `root`, the app
+    /// root). A path ingest did not read is an error: a misspelt `--file`
+    /// must not quietly build the identity.
+    pub fn resolve(app: &App, root: &Path, files: &[String]) -> Result<Selection, String> {
+        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let mut out: Vec<(FileId, String)> = Vec::new();
+        for file in files {
+            let wanted = canonical(&root.join(file));
+            let found = app.sources.iter().position(|s| canonical(Path::new(&s.path)) == wanted);
+            let Some(index) = found else {
+                return Err(format!("--file {file}: not a Ruby source the build read"));
+            };
+            let id = FileId(index as u32 + 1);
+            if !out.iter().any(|(f, _)| *f == id) {
+                out.push((id, file.clone()));
             }
-            bodies.extend(found.into_iter().map(|(_, span)| (name.to_string(), *span)));
         }
+        let mut bodies: Vec<(String, Span)> = app
+            .const_resolver
+            .for_sources(&app.sources)
+            .class_bodies()
+            .into_iter()
+            .filter(|(_, span)| out.iter().any(|(f, _)| *f == span.file))
+            .map(|(name, span)| (name.to_string(), span))
+            .collect();
         bodies.sort_by_key(|(_, span)| (span.file.0, span.start));
         bodies.dedup();
-        let excluded = all
-            .iter()
-            .filter(|(name, span)| {
-                !bodies.iter().any(|(selected, _)| selected.as_str() == name.as_ref())
-                    && bodies.iter().any(|(_, body)| contains(body, *span) && body != span)
-            })
-            .map(|(_, span)| *span)
-            .collect();
-        Ok(Selection { bodies, excluded })
+        Ok(Selection { files: out, bodies })
     }
 
-    /// The selected class whose body is the innermost one around `at`,
-    /// if that innermost body is selected at all. `--class A --class
-    /// A::B::C` over `A::B::C` selects what is written in `A` and in `C`,
-    /// but not what is written in `B`.
+    /// The class or module whose body is the innermost one around `at`,
+    /// or `None` at a file's top level.
     pub fn owner_of(&self, at: Span) -> Option<&str> {
         if at.is_synthetic() {
             return None;
         }
-        let selected = self.bodies.iter().filter(|(_, s)| contains(s, at)).min_by_key(|(_, s)| s.end - s.start)?;
-        let excluded = self.excluded.iter().filter(|s| contains(s, at)).map(|s| s.end - s.start).min();
-        match excluded {
-            Some(len) if len < selected.1.end - selected.1.start => None,
-            _ => Some(selected.0.as_str()),
-        }
+        self.bodies.iter().filter(|(_, s)| contains(s, at)).min_by_key(|(_, s)| s.end - s.start).map(|(name, _)| name.as_str())
+    }
+
+    /// The bodies written in `file`.
+    pub fn bodies_in(&self, file: FileId) -> Vec<(String, Span)> {
+        self.bodies.iter().filter(|(_, span)| span.file == file).cloned().collect()
     }
 }
 

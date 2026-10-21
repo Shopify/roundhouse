@@ -168,18 +168,18 @@ fn emit_keeps_the_base_app_and_apply_rejects_invalid_commands() {
     put(&app, "app/models/widget.rb", source);
     put(&app, "public/keep", b"unchanged");
     let output = Command::new(env!("CARGO_BIN_EXE_fractal"))
-        .args(["emit", "--class", "Widget", "--report"]).arg(&report)
+        .args(["emit", "--file", "app/models/widget.rb", "--report"]).arg(&report)
         .arg(&app).arg("-o").arg(&out).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let decisions: serde_json::Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
-    assert_eq!(decisions["classes"], serde_json::json!(["Widget"]));
-    assert_eq!(decisions["regions"][0]["admitted"], true);
-    assert_eq!(fs::read_dir(&out).unwrap().count(), 0, "no passes are registered");
+    assert_eq!(decisions["compiled"], serde_json::json!(["app/models/widget.rb"]));
+    assert_eq!(decisions["methods"][0]["key"], "Widget#label@app/models/widget.rb:2");
+    assert!(!out.join("app").exists(), "the pass leaves non-enum source unchanged");
     assert_eq!(fs::read(app.join("app/models/widget.rb")).unwrap(), source);
     assert_eq!(fs::read(app.join("public/keep")).unwrap(), b"unchanged");
 
     for args in [
-        vec!["apply", "--class", "Widget"],
+        vec!["apply", "--file", "app/models/widget.rb"],
         vec!["apply", "one", "two", "three"],
         vec!["emit", "--output"],
         vec!["emit", "--unknown"],
@@ -193,5 +193,26 @@ fn emit_keeps_the_base_app_and_apply_rejects_invalid_commands() {
         let output = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
             .args(["fractal", "apply"]).arg(source).arg(dest).output().unwrap();
         assert_eq!(output.status.code(), Some(1));
+    }
+}
+
+#[test]
+fn invalid_rewritten_paths_preserve_the_app_and_previous_overlay() {
+    let tree = Tree::new("rewrite-paths");
+    let app = tree.dir("app");
+    let overlay = tree.dir("overlay");
+    tree.dir("app/a");
+    put(&tree.0, "outside", b"outside");
+    put(&app, "keep.rb", b"original");
+    put(&overlay, fractal::MANIFEST, b"previous manifest");
+    put(&overlay, "keep.rb", b"previous build");
+    let absolute = tree.0.join("outside").to_string_lossy().into_owned();
+    for path in ["../outside", "a/../../outside", "./keep.rb", "", absolute.as_str()] {
+        let rewritten = vec![(path.to_string(), "changed".to_string())];
+        assert!(fractal::tree::write(&app, &overlay, &rewritten, "{}").is_err(), "{path}");
+        assert_eq!(fs::read(tree.0.join("outside")).unwrap(), b"outside");
+        assert_eq!(fs::read(app.join("keep.rb")).unwrap(), b"original");
+        assert_eq!(fs::read(overlay.join("keep.rb")).unwrap(), b"previous build");
+        assert_eq!(fs::read(overlay.join(fractal::MANIFEST)).unwrap(), b"previous manifest");
     }
 }

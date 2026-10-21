@@ -8,16 +8,16 @@ use crate::emit::fractal;
 use crate::ingest::ingest_app;
 
 const USAGE: &str = "\
-Usage: fractal emit [--class NAME]... [--whole-app] [--survey] [--report PATH] [APP] [-o OUT]
+Usage: fractal emit [--file PATH]... [--whole-app] [--survey] [--report PATH] [APP] [-o OUT]
        fractal apply [OVERLAY] [APP]
 
-emit   Write only generated files in the app's directory structure.
+emit   Write only changed files in the app's directory structure.
        APP defaults to .; OUT defaults to out/fractal.
-       --class NAME selects a class or module; repeat it for more classes.
+       --file PATH selects an app-relative Ruby file; repeat it for more files.
        --whole-app analyzes the whole app instead of the selected files.
        --survey records unsupported input instead of stopping at the first gap.
        --report PATH writes the build decisions as JSON outside the overlay.
-       No registered pass currently changes methods, so emit produces no files.
+       The overlay includes a build manifest; apply does not copy it to APP.
 apply  Copy overlay files onto APP, replacing matching files and adding new files.
        OVERLAY defaults to out/fractal; APP defaults to .
        Files absent from the overlay stay unchanged. Apply never deletes files.
@@ -28,7 +28,7 @@ The shipped roundhouse binary also accepts: roundhouse fractal emit|apply.
 
 #[derive(Default)]
 struct Emit {
-    classes: Vec<String>,
+    files: Vec<String>,
     input: Option<PathBuf>,
     out: Option<PathBuf>,
     survey: bool,
@@ -57,7 +57,7 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Command::Emit(options) => emit(
-            &options.classes,
+            &options.files,
             options.input.as_deref().unwrap_or(Path::new(".")),
             options.out.as_deref().unwrap_or(Path::new("out/fractal")),
             options.survey,
@@ -107,12 +107,12 @@ fn parse(args: &[String]) -> Result<Command, String> {
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "-h" | "--help" => return Ok(Command::Help),
-                    "--class" => options.classes.push(args.next().ok_or("--class requires a name")?.clone()),
+                    "--file" => options.files.push(args.next().ok_or("--file requires a path")?.clone()),
                     "--whole-app" => options.whole_app = true,
                     "--survey" => options.survey = true,
                     "--report" => options.report = Some(PathBuf::from(args.next().ok_or("--report requires a path")?)),
                     "-o" | "--output" => options.out = Some(PathBuf::from(args.next().ok_or("--output requires a path")?)),
-                    s if s.starts_with("--class=") => options.classes.push(s["--class=".len()..].to_string()),
+                    s if s.starts_with("--file=") => options.files.push(s["--file=".len()..].to_string()),
                     s if s.starts_with("--report=") => options.report = Some(PathBuf::from(&s["--report=".len()..])),
                     s if s.starts_with("--output=") => options.out = Some(PathBuf::from(&s["--output=".len()..])),
                     s if s.starts_with('-') => return Err(format!("unknown emit flag: {s}")),
@@ -128,7 +128,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
 
 /// Decide what to ingest, analyze it, and emit only the generated files.
 pub fn emit(
-    classes: &[String],
+    files: &[String],
     input: &Path,
     out: &Path,
     survey: bool,
@@ -141,7 +141,8 @@ pub fn emit(
     let passes = fractal::pass::registered();
     let passes: Vec<&dyn fractal::Pass> = passes.iter().map(|p| p.as_ref()).collect();
     let root = input.canonicalize().map_err(|e| format!("input {}: {e}", input.display()))?;
-    let ingest = fractal::scope::decide(&root, classes, &passes, whole_app)?;
+    let files = fractal::scope::normalize_files(&root, files)?;
+    let ingest = fractal::scope::decide(&root, &files, &passes, whole_app)?;
     if survey {
         crate::ingest::survey::activate();
     }
@@ -152,7 +153,7 @@ pub fn emit(
         }
         fractal::Ingest::Files { files, indexed } => {
             eprintln!(
-                "roundhouse: fractal: ingesting {} file(s) the selection and passes need (Rubydex indexed {indexed}); --whole-app reads everything",
+                "roundhouse: fractal: ingesting {} file(s) the compiled files and passes need (Rubydex indexed {indexed}); --whole-app reads everything",
                 files.len()
             );
             let fs = crate::vfs::FsVfs::new();
@@ -177,7 +178,7 @@ pub fn emit(
         }
     };
     // A file with a syntax error or a recorded gap keeps the app's code.
-    // Its IR holds placeholders, so none of its methods gets a variant.
+    // Its IR holds placeholders, so no pass rewrites it.
     let mut untrusted: Vec<String> = Vec::new();
     for d in parse_diags.iter().filter(|d| d.severity == Severity::Error) {
         eprintln!("roundhouse: {}", d.render(&app.sources));
@@ -196,7 +197,7 @@ pub fn emit(
         }
     }
     crate::analyze::Analyzer::new(&app).analyze(&mut app);
-    let plan = fractal::plan(&app, input, classes, &untrusted, &passes)?;
+    let plan = fractal::plan(&app, input, &files, &untrusted, &passes)?;
     for line in plan.report.render().lines() {
         eprintln!("roundhouse: {line}");
     }
@@ -204,7 +205,7 @@ pub fn emit(
         let json = serde_json::to_string_pretty(&plan.report).map_err(|e| format!("report: {e}"))?;
         std::fs::write(path, json + "\n").map_err(|e| format!("write {}: {e}", path.display()))?;
     }
-    let written = fractal::write(out, &plan)?;
-    eprintln!("roundhouse: emitted {written} file(s) to {} (fractal overlay; every other file is the app's own)", out.display());
+    let written = fractal::write(input, out, &plan)?;
+    eprintln!("roundhouse: emitted {} changed file(s) to {} (fractal overlay; every other file stays in the base app)", written.rewritten, out.display());
     Ok(())
 }
