@@ -51,7 +51,7 @@ GEM
       activesupport
     concurrent-ruby (1.3.8)
     connection_pool (3.0.2)
-    crass (1.0.7)
+    crass (1.0.8)
     drb (2.2.3)
     dry-configurable (1.4.0)
       dry-core (~> 1.0)
